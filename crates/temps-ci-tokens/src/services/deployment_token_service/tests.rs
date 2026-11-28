@@ -196,6 +196,25 @@ async fn test_list_deployment_tokens() {
 }
 
 #[tokio::test]
+async fn listing_tokens_of_a_missing_project_is_project_not_found() {
+    let Some((_db, service, _project)) = setup_test_env().await else {
+        return;
+    };
+
+    let result = service.list_tokens(999_999, 1, 10).await;
+
+    assert!(
+        matches!(
+            result,
+            Err(DeploymentTokenServiceError::ProjectNotFound {
+                project_id: 999_999
+            })
+        ),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_get_deployment_token() {
     let Some((_db, service, project)) = setup_test_env().await else {
         return;

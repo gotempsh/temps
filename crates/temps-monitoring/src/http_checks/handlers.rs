@@ -11,10 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
-use temps_core::{
-    problemdetails::{self, Problem},
-    AuditContext, AuditOperation, RequestMetadata,
-};
+use temps_core::{problemdetails::Problem, AuditContext, AuditOperation, RequestMetadata};
 use temps_credential_checks::{provider_presets, ProviderPreset};
 use utoipa::{IntoParams, OpenApi};
 
@@ -25,24 +22,53 @@ pub struct HttpChecksState {
 }
 impl From<HttpChecksError> for Problem {
     fn from(error: HttpChecksError) -> Self {
-        let status = match &error {
-            HttpChecksError::NotFound { .. } | HttpChecksError::SecretNotFound { .. } => {
-                StatusCode::NOT_FOUND
+        let (status, problem_type, title) = match &error {
+            HttpChecksError::ProjectNotFound { project_id } => {
+                return temps_core::api_problems::project_not_found(*project_id);
             }
-            HttpChecksError::Invalid { .. } => StatusCode::BAD_REQUEST,
-            HttpChecksError::Busy { .. } => StatusCode::CONFLICT,
+            HttpChecksError::NotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                "https://temps.sh/probs/http-check-not-found",
+                "HTTP Check Not Found",
+            ),
+            HttpChecksError::SecretNotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                "https://temps.sh/probs/secret-not-found",
+                "Secret Not Found",
+            ),
+            HttpChecksError::Invalid { .. } | HttpChecksError::InvalidField { .. } => (
+                StatusCode::BAD_REQUEST,
+                "https://temps.sh/probs/invalid-http-check",
+                "Invalid HTTP Check",
+            ),
+            HttpChecksError::Busy { .. } => (
+                StatusCode::CONFLICT,
+                "https://temps.sh/probs/http-check-busy",
+                "HTTP Check Busy",
+            ),
             HttpChecksError::Database { .. }
             | HttpChecksError::Encryption { .. }
             | HttpChecksError::SecretDecryption { .. }
             | HttpChecksError::Stored { .. }
             | HttpChecksError::HistoryStored { .. }
-            | HttpChecksError::SecretHistoryStored { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            | HttpChecksError::SecretHistoryStored { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "https://temps.sh/probs/http-check-failed",
+                "HTTP check failed",
+            ),
         };
-        problemdetails::new(status)
-            .with_title("HTTP check failed")
-            .with_detail(error.to_string())
+        let mut builder = temps_core::error_builder::ErrorBuilder::new(status)
+            .type_(problem_type)
+            .title(title)
+            .detail(error.to_string());
+        if let HttpChecksError::InvalidField { field, .. } = &error {
+            builder = builder.value("field", *field);
+        }
+        builder.build()
     }
 }
+/// `page` is 1-indexed; `0` is read as the first page. `page_size` defaults
+/// to 20 and is clamped to 1-100.
 #[derive(Deserialize, IntoParams)]
 pub struct ListQuery {
     pub page: Option<u64>,
@@ -438,7 +464,7 @@ pub fn routes() -> Router<Arc<HttpChecksState>> {
         )
 }
 #[derive(OpenApi)]
-#[openapi(paths(list,get_one,presets,detect,create,update,run,delete,capabilities,set_enabled,history,detect_secret,secret_history),components(schemas(VariableHistoryDetails,VariableHistoryList,VariableHistoryEntry,HttpChecksCapabilities,SetHttpCheckEnabled,HttpCheckView,HttpCheckList,SaveHttpCheck,DetectionView,SecretDetectionView,temps_credential_checks::Candidate,temps_credential_checks::ProviderPreset,temps_credential_checks::HttpCheckSpec,temps_credential_checks::LocalCheckSpec,temps_credential_checks::ExpiringArtifact,temps_credential_checks::ArtifactKind,temps_credential_checks::CheckKind,temps_credential_checks::VerificationResult)),tags((name="HTTP Checks",description="Credential checks for environment variables and secrets: provider HTTP verification and local expiry of certificates, SSH certificates, OpenPGP keys, kubeconfigs and JWTs")))]
+#[openapi(paths(list,get_one,presets,detect,create,update,run,delete,capabilities,set_enabled,history,detect_secret,secret_history),components(schemas(VariableHistoryDetails,VariableHistoryList,VariableHistoryEntry,HttpChecksCapabilities,SetHttpCheckEnabled,HttpCheckView,super::HttpCheckSpecView,HttpCheckList,SaveHttpCheck,DetectionView,SecretDetectionView,temps_credential_checks::Candidate,temps_credential_checks::ProviderPreset,temps_credential_checks::HttpCheckSpec,temps_credential_checks::LocalCheckSpec,temps_credential_checks::ExpiringArtifact,temps_credential_checks::ArtifactKind,temps_credential_checks::CheckKind,temps_credential_checks::VerificationResult)),tags((name="HTTP Checks",description="Credential checks for environment variables and secrets: provider HTTP verification and local expiry of certificates, SSH certificates, OpenPGP keys, kubeconfigs and JWTs")))]
 pub struct HttpChecksApiDoc;
 
 fn authorize_check_toggle(auth: &temps_authz::AuthContext, enabled: bool) -> Result<(), Problem> {
@@ -574,8 +600,13 @@ mod tests {
             .unwrap();
         (status, String::from_utf8_lossy(&body).into_owned())
     }
+    /// The recipe [`check_row`] stores, encrypted the way the service stores it.
+    fn stored_spec() -> temps_credential_checks::HttpCheckSpec {
+        temps_credential_checks::provider_presets().remove(0).spec
+    }
     fn check_row(id: i32) -> temps_entities::http_checks::Model {
         let now = Utc::now();
+        let encryption = EncryptionService::new_from_password(TEST_KEY);
         temps_entities::http_checks::Model {
             id,
             project_id: 10,
@@ -584,8 +615,10 @@ mod tests {
             kind: "http".into(),
             name: "Example endpoint".into(),
             automatic_provider: None,
-            encrypted_spec: "ciphertext".into(),
-            encrypted_credential: Some("ciphertext".into()),
+            encrypted_spec: encryption
+                .encrypt_string(&serde_json::to_string(&stored_spec()).unwrap())
+                .unwrap(),
+            encrypted_credential: Some(encryption.encrypt_string("credential-value").unwrap()),
             enabled: true,
             interval_seconds: 86400,
             next_check_at: now,
@@ -637,7 +670,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let view: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(view["id"], 1);
-        assert!(!body.contains("ciphertext"), "{body}");
+        // #2113: the recipe reads back, the credential does not.
+        assert_eq!(view["spec"]["url"], stored_spec().url, "{body}");
+        assert_eq!(view["has_credential"], true, "{body}");
+        assert!(!body.contains("credential-value"), "{body}");
 
         let (status, body) = call(
             MockDatabase::new(DatabaseBackend::Postgres)

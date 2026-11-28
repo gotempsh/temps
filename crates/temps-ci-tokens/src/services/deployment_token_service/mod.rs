@@ -517,6 +517,11 @@ impl DeploymentTokenService {
         page: u64,
         page_size: u64,
     ) -> Result<DeploymentTokenListResponse, DeploymentTokenServiceError> {
+        // A missing project is a 404, like a create under it, not an empty
+        // list a client cannot tell apart from "no tokens yet".
+        if !temps_entities::projects::live_project_exists(self.db.as_ref(), project_id).await? {
+            return Err(DeploymentTokenServiceError::ProjectNotFound { project_id });
+        }
         let paginator = DeploymentTokenEntity::find()
             .filter(temps_entities::deployment_tokens::Column::ProjectId.eq(project_id))
             .order_by_desc(temps_entities::deployment_tokens::Column::CreatedAt)

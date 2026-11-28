@@ -311,7 +311,7 @@ Update a Cloudflare Email Sending notification provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--config <json>` | Configuration for a Cloudflare Email Sending notification provider (JSON) [required] | - | No |
+| `--config <json>` | Replacement configuration; omit to keep the stored one (JSON) | - | No |
 | `--enabled` | Body field enabled | - | No |
 | `--no-enabled` | Set enabled to false | - | No |
 | `--name <value>` | Body field name | - | No |
@@ -361,7 +361,7 @@ Update a Webhook notification provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--config <json>` | Configuration for a generic webhook notification provider (JSON) [required] | - | No |
+| `--config <json>` | Replacement configuration; omit to keep the stored one (JSON) | - | No |
 | `--enabled` | Body field enabled | - | No |
 | `--no-enabled` | Set enabled to false | - | No |
 | `--name <value>` | Body field name | - | No |

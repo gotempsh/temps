@@ -290,6 +290,9 @@ pub struct FlagSnapshotResponse {
 pub struct ArchiveFlagResponse {
     pub key: String,
     pub archived_at: Option<String>,
+    /// True when the flag was deleted for good (`purge=true`) and its key is
+    /// free again; false when it was archived and can be restored.
+    pub purged: bool,
 }
 
 #[cfg(test)]

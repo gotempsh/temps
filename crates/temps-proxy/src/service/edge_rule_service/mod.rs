@@ -237,9 +237,11 @@ pub struct UpdateEdgeRuleRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub mode: Option<Mode>,
-    /// `null` applies the rule to every environment.
+    /// `null` applies the rule to every environment; omit to keep the current
+    /// one. A new environment must be one of the project's; the current one
+    /// is kept as is, even if it has since been deleted.
     #[serde(default, deserialize_with = "double_option")]
-    #[schema(value_type = Option<i32>)]
+    #[schema(value_type = Option<i32>, nullable)]
     pub environment_id: Option<Option<i32>>,
     #[serde(default)]
     pub expression: Option<Group>,
@@ -784,8 +786,14 @@ impl EdgeRuleService {
             .await?;
         }
         let environment_id = request.environment_id.unwrap_or(current.environment_id);
-        self.ensure_environment(&txn, project_id, environment_id)
-            .await?;
+        // Only an environment this request moves the rule to is checked. A
+        // rule whose environment was deleted keeps that binding (it matches
+        // no traffic) and can still be renamed, disabled or edited (#2111);
+        // a client that sends the stored value back unchanged is not refused.
+        if environment_id != current.environment_id {
+            self.ensure_environment(&txn, project_id, environment_id)
+                .await?;
+        }
 
         let mut active: project_edge_rules::ActiveModel = current.clone().into();
         active.name = Set(prepared.name);

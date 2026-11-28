@@ -74,15 +74,25 @@ pub struct AlertRuleResponse {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateAlertRuleRequest {
+    /// Unique within the project (case-insensitive), trimmed, 1-255 characters.
+    #[schema(min_length = 1, max_length = 255)]
     pub name: String,
     /// Trigger type: new_issue, regression, frequency, new_user, user_count, status_change
     pub trigger_type: String,
-    /// Trigger-specific configuration (e.g., {"count": 100, "window_minutes": 60} for frequency)
+    /// Trigger-specific configuration. `frequency`: `{"count": 100,
+    /// "window_minutes": 60}`; `user_count`: `{"count": 10}` (the user
+    /// threshold); `status_change`: `{"statuses": ["resolved"]}`; the other
+    /// types take `{}`. Unknown keys are refused.
     #[serde(default = "default_trigger_config")]
     pub trigger_config: serde_json::Value,
-    /// Optional environment ID to filter alerts
+    /// Only alert on errors in this environment of the project. It must be one
+    /// of the project's environments; omit or `null` for every environment.
     pub environment_filter: Option<i32>,
-    /// Optional error type/level filter
+    /// Only alert on errors of this exception type (for example `TypeError`),
+    /// compared case-insensitively with the error group's type. Despite the
+    /// name it does not match a severity level. Omit, `null` or `""` for
+    /// every type.
+    #[schema(max_length = 255)]
     pub error_level_filter: Option<String>,
     /// Notification priority: Low, Normal, High, Critical
     #[serde(default = "default_priority")]
@@ -94,12 +104,24 @@ pub struct CreateAlertRuleRequest {
     pub enabled: bool,
 }
 
+/// A partial update: an omitted field keeps its value.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateAlertRuleRequest {
+    /// Unique within the project (case-insensitive), trimmed, 1-255 characters.
+    #[schema(min_length = 1, max_length = 255)]
     pub name: Option<String>,
     pub trigger_type: Option<String>,
+    /// See `CreateAlertRuleRequest.trigger_config`; unknown keys are refused.
     pub trigger_config: Option<serde_json::Value>,
+    /// One of the project's environments, or `null` to alert on every
+    /// environment again. Omit to keep the current filter.
+    #[serde(default, deserialize_with = "temps_core::nullable::deserialize")]
+    #[schema(value_type = Option<i32>, nullable)]
     pub environment_filter: Option<Option<i32>>,
+    /// Exception type to match (for example `TypeError`), or `null` / `""` to
+    /// alert on every type again. Omit to keep the current filter.
+    #[serde(default, deserialize_with = "temps_core::nullable::deserialize")]
+    #[schema(value_type = Option<String>, nullable, max_length = 255)]
     pub error_level_filter: Option<Option<String>>,
     pub notification_priority: Option<String>,
     pub cooldown_minutes: Option<i32>,
@@ -144,11 +166,17 @@ impl From<error_alert_rules::Model> for AlertRuleResponse {
 // ===== Handlers =====
 
 /// List all alert rules for a project
+///
+/// Every new project starts with two rules, "New issue detected"
+/// (`new_issue`) and "Regression detected" (`regression`), both High
+/// priority with a 30-minute cooldown; they can be changed or deleted like
+/// any other rule.
 #[utoipa::path(
     get,
     path = "/projects/{project_id}/error-alert-rules",
     responses(
-        (status = 200, description = "List of alert rules", body = Vec<AlertRuleResponse>),
+        (status = 200, description = "List of alert rules, including the two default rules every project starts with", body = Vec<AlertRuleResponse>),
+        (status = 404, description = "Project not found"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -204,10 +232,9 @@ pub async fn get_alert_rule(
     request_body = CreateAlertRuleRequest,
     responses(
         (status = 201, description = "Alert rule created", body = AlertRuleResponse),
-        (status = 409, description = "The project already has the maximum number of error alert rules"),
-        (status = 400, description = "Validation error"),
+        (status = 400, description = "Invalid field (the problem names it), including an environment_filter that is not one of the project's environments"),
         (status = 404, description = "Project not found"),
-        (status = 409, description = "Project already holds the maximum number of error alert rules"),
+        (status = 409, description = "Another rule of the project has this name, or the project already holds the maximum number of error alert rules"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -267,8 +294,9 @@ pub async fn create_alert_rule(
     request_body = UpdateAlertRuleRequest,
     responses(
         (status = 200, description = "Alert rule updated", body = AlertRuleResponse),
-        (status = 400, description = "Validation error"),
-        (status = 404, description = "Alert rule not found"),
+        (status = 400, description = "Invalid field (the problem names it), including an environment_filter that is not one of the project's environments"),
+        (status = 404, description = "Project not found, or the rule is not one of the project's"),
+        (status = 409, description = "Another rule of the project has this name"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -482,6 +510,208 @@ mod tests {
             cooldown_minutes: default_cooldown(),
             enabled: default_enabled(),
         }
+    }
+
+    /// #2110: null clears a filter on update; absent keeps it.
+    #[test]
+    fn an_update_tells_null_from_absent_for_both_filters() {
+        let cleared: UpdateAlertRuleRequest = serde_json::from_value(serde_json::json!({
+            "environment_filter": null,
+            "error_level_filter": null,
+        }))
+        .unwrap();
+        assert_eq!(cleared.environment_filter, Some(None));
+        assert_eq!(cleared.error_level_filter, Some(None));
+        let kept: UpdateAlertRuleRequest =
+            serde_json::from_value(serde_json::json!({"enabled": false})).unwrap();
+        assert_eq!(kept.environment_filter, None);
+        assert_eq!(kept.error_level_filter, None);
+    }
+
+    async fn seed_environment(db: &sea_orm::DatabaseConnection, project_id: i32) -> i32 {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+        let host = format!("alert-env-{}", uuid::Uuid::new_v4());
+        let row = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"INSERT INTO environments (name, slug, subdomain, host, upstreams, project_id,
+                     is_preview, created_at, updated_at)
+                   VALUES ('production', 'production', $1, $1, '[]'::json, $2, FALSE, NOW(), NOW())
+                   RETURNING id"#,
+                [host.into(), project_id.into()],
+            ))
+            .await
+            .expect("insert environment")
+            .expect("a returned row");
+        row.try_get::<i32>("", "id").expect("environment id")
+    }
+
+    /// #2110: filters are validated and clearable, another project's rule is
+    /// a 404, and names are required, bounded and unique.
+    #[tokio::test]
+    async fn alert_rule_filters_names_and_scope_are_checked() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping alert-rule validation test: {error}");
+                return;
+            }
+            Err(error) => panic!("alert-rule validation test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let project_id = seed_project(db.as_ref()).await;
+        let other_project = seed_project(db.as_ref()).await;
+        let environment = seed_environment(db.as_ref(), project_id).await;
+        let other_environment = seed_environment(db.as_ref(), other_project).await;
+        let state = Arc::new(AppState {
+            error_tracking_service: Arc::new(ErrorTrackingService::new(db.clone())),
+            alert_service: Arc::new(ErrorAlertService::new(db.clone())),
+            audit_service: Arc::new(RecordingAuditLogger::default()),
+            project_access_checker: None,
+        });
+        let auth = AuthContext::new_session(test_user(5), Role::Admin);
+        let create = |project: i32, request: CreateAlertRuleRequest| {
+            create_alert_rule(
+                State(state.clone()),
+                RequireAuth(auth.clone()),
+                Path(project),
+                Extension(metadata()),
+                Json(request),
+            )
+        };
+        let update = |rule_id: i32, body: serde_json::Value| {
+            update_alert_rule(
+                State(state.clone()),
+                RequireAuth(auth.clone()),
+                Path((project_id, rule_id)),
+                Extension(metadata()),
+                Json(serde_json::from_value(body).expect("update body")),
+            )
+        };
+
+        // An environment that does not exist, or is another project's.
+        for missing in [987_654, other_environment] {
+            let mut request = create_request("any-env");
+            request.environment_filter = Some(missing);
+            let problem = create(project_id, request).await.expect_err("refused");
+            assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                problem.body["type"],
+                "https://temps.sh/probs/invalid-alert-rule"
+            );
+            assert_eq!(problem.body["environment_id"], missing);
+            assert!(
+                problem.body["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains(&format!("Environment {missing} not found"))),
+                "{:?}",
+                problem.body
+            );
+        }
+
+        let mut request = create_request("  filtered  ");
+        request.environment_filter = Some(environment);
+        request.error_level_filter = Some("TypeError".to_string());
+        let (_, Json(rule)) = create(project_id, request).await.expect("created");
+        assert_eq!(rule.name, "filtered");
+        assert_eq!(rule.environment_filter, Some(environment));
+        assert_eq!(rule.error_level_filter.as_deref(), Some("TypeError"));
+
+        // Absent keeps both filters; null clears them.
+        let Json(kept) = update(rule.id, serde_json::json!({"enabled": false}))
+            .await
+            .expect("update");
+        assert_eq!(kept.environment_filter, Some(environment));
+        assert_eq!(kept.error_level_filter.as_deref(), Some("TypeError"));
+        let Json(cleared) = update(
+            rule.id,
+            serde_json::json!({"environment_filter": null, "error_level_filter": null}),
+        )
+        .await
+        .expect("update");
+        assert_eq!(cleared.environment_filter, None);
+        assert_eq!(cleared.error_level_filter, None);
+        // An empty filter is no filter, not one that matches nothing.
+        let Json(blank) = update(rule.id, serde_json::json!({"error_level_filter": "  "}))
+            .await
+            .expect("update");
+        assert_eq!(blank.error_level_filter, None);
+        let problem = update(
+            rule.id,
+            serde_json::json!({"environment_filter": other_environment}),
+        )
+        .await
+        .expect_err("another project's environment");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+
+        // Another project's rule is not found there.
+        let problem = get_alert_rule(
+            State(state.clone()),
+            RequireAuth(auth.clone()),
+            Path((other_project, rule.id)),
+        )
+        .await
+        .expect_err("not this project's rule");
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+        assert_eq!(
+            problem.body["type"],
+            "https://temps.sh/probs/alert-rule-not-found"
+        );
+        assert_eq!(problem.body["rule_id"], rule.id);
+
+        // Names: required, bounded, unique per project (case-insensitive).
+        for (name, field_reason) in [
+            ("   ".to_string(), "must not be empty"),
+            ("x".repeat(256), "at most 255 characters"),
+        ] {
+            let problem = create(project_id, create_request(&name))
+                .await
+                .expect_err("bad name");
+            assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+            assert_eq!(problem.body["field"], "name");
+            assert!(
+                problem.body["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains(field_reason)),
+                "{:?}",
+                problem.body
+            );
+        }
+        let problem = create(project_id, create_request("FILTERED"))
+            .await
+            .expect_err("duplicate name");
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(problem.body["rule_id"], rule.id);
+        let (status, _) = create(other_project, create_request("filtered"))
+            .await
+            .expect("names are per project");
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Unknown trigger config keys, and the user_count threshold message.
+        let mut request = create_request("typo");
+        request.trigger_type = "frequency".to_string();
+        request.trigger_config = serde_json::json!({"count": 5, "window_minutes": 10, "windw": 1});
+        let problem = create(project_id, request).await.expect_err("unknown key");
+        assert!(
+            problem.body["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("unknown key(s) windw")),
+            "{:?}",
+            problem.body
+        );
+        let mut request = create_request("users");
+        request.trigger_type = "user_count".to_string();
+        request.trigger_config = serde_json::json!({"count": 0});
+        let problem = create(project_id, request)
+            .await
+            .expect_err("zero threshold");
+        assert!(
+            problem.body["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("threshold")),
+            "{:?}",
+            problem.body
+        );
     }
 
     #[tokio::test]

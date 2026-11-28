@@ -25,8 +25,8 @@ use utoipa::{IntoParams, OpenApi};
 
 use super::audit::{
     AuditContext, FeatureFlagArchivedAudit, FeatureFlagCreatedAudit,
-    FeatureFlagEnvironmentValueSetAudit, FeatureFlagReshuffledAudit, FeatureFlagRestoredAudit,
-    FeatureFlagRulesSetAudit, FeatureFlagUpdatedAudit,
+    FeatureFlagEnvironmentValueSetAudit, FeatureFlagPurgedAudit, FeatureFlagReshuffledAudit,
+    FeatureFlagRestoredAudit, FeatureFlagRulesSetAudit, FeatureFlagUpdatedAudit,
 };
 use super::public::{
     ofrep_server_bulk, ofrep_server_single, OfrepBulkResponse, OfrepEvaluationFailure,
@@ -154,6 +154,13 @@ pub fn configure_routes() -> Router<Arc<FlagsAppState>> {
 // Error mapping
 // =============================================================================
 
+/// A create whose key is used by a live flag.
+pub const FLAG_EXISTS_PROBLEM_TYPE: &str = "https://temps.sh/probs/feature-flag-exists";
+/// A create whose key is held by an archived flag (restore or purge it).
+pub const FLAG_ARCHIVED_PROBLEM_TYPE: &str = "https://temps.sh/probs/feature-flag-archived";
+/// A purge of a flag that has not been archived first.
+pub const FLAG_NOT_ARCHIVED_PROBLEM_TYPE: &str = "https://temps.sh/probs/feature-flag-not-archived";
+
 impl From<FlagError> for Problem {
     fn from(error: FlagError) -> Self {
         match error {
@@ -161,12 +168,27 @@ impl From<FlagError> for Problem {
                 .with_title("Feature Flag Not Found")
                 .with_detail(error.to_string()),
 
+            FlagError::ProjectNotFound { project_id } => {
+                temps_core::api_problems::project_not_found(project_id)
+            }
+
             FlagError::EnvironmentNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Environment Not Found")
                 .with_detail(error.to_string()),
 
             FlagError::DuplicateKey { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type(FLAG_EXISTS_PROBLEM_TYPE)
                 .with_title("Feature Flag Already Exists")
+                .with_detail(error.to_string()),
+
+            FlagError::ArchivedKey { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type(FLAG_ARCHIVED_PROBLEM_TYPE)
+                .with_title("Feature Flag Is Archived")
+                .with_detail(error.to_string()),
+
+            FlagError::PurgeRequiresArchive { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type(FLAG_NOT_ARCHIVED_PROBLEM_TYPE)
+                .with_title("Feature Flag Is Not Archived")
                 .with_detail(error.to_string()),
 
             FlagError::StaleWrite { .. } => problemdetails::new(StatusCode::CONFLICT)
@@ -233,6 +255,15 @@ pub struct ListFlagsQuery {
     pub page: Option<u64>,
     /// Items per page. Defaults to 20, capped at 100.
     pub page_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ArchiveFlagQuery {
+    /// Delete an already archived flag for good, with its per-environment
+    /// values, freeing its key for a new flag of any `value_type`. Refused
+    /// (409) for a flag that is not archived. Defaults to false (archive).
+    #[serde(default)]
+    pub purge: bool,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -550,13 +581,15 @@ pub async fn update_flag(
     path = "/projects/{project_id}/flags/{key}",
     params(
         ("project_id" = i32, Path, description = "Project ID"),
-        ("key" = String, Path, description = "Flag key")
+        ("key" = String, Path, description = "Flag key"),
+        ArchiveFlagQuery
     ),
     responses(
-        (status = 200, description = "Flag archived", body = ArchiveFlagResponse),
+        (status = 200, description = "Flag archived, or purged with `purge=true`", body = ArchiveFlagResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Flag not found"),
+        (status = 409, description = "`purge=true` on a flag that is not archived, or one restored concurrently"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -566,9 +599,29 @@ pub async fn archive_flag(
     State(state): State<Arc<FlagsAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path((project_id, key)): Path<(i32, String)>,
+    Query(query): Query<ArchiveFlagQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     project_scope_guard!(auth, project_id);
     project_permission_guard!(auth, FlagsDelete, project_id, &state.project_access_checker);
+
+    if query.purge {
+        let flag = state.flag_service.purge(project_id, &key).await?;
+        let audit = FeatureFlagPurgedAudit {
+            context: audit_context(&auth, &metadata),
+            project_id,
+            flag_id: flag.id,
+            key: flag.key.clone(),
+            value_type: flag.value_type.clone(),
+        };
+        if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+            error!("Failed to create audit log for feature flag purge: {}", e);
+        }
+        return Ok(Json(ArchiveFlagResponse {
+            key: flag.key,
+            archived_at: flag.archived_at.map(super::types::iso),
+            purged: true,
+        }));
+    }
 
     let flag = state.flag_service.archive(project_id, &key).await?;
 
@@ -585,6 +638,7 @@ pub async fn archive_flag(
     Ok(Json(ArchiveFlagResponse {
         key: flag.key,
         archived_at: flag.archived_at.map(super::types::iso),
+        purged: false,
     }))
 }
 
@@ -1151,11 +1205,16 @@ mod tests {
     }
 
     async fn archive_rejection(auth: AuthContext) -> Option<StatusCode> {
+        delete_rejection(auth, false).await
+    }
+
+    async fn delete_rejection(auth: AuthContext, purge: bool) -> Option<StatusCode> {
         archive_flag(
             RequireAuth(auth),
             State(app_state()),
             Extension(test_metadata()),
             Path((1, "checkout.v2".to_string())),
+            Query(ArchiveFlagQuery { purge }),
         )
         .await
         .err()
@@ -1169,6 +1228,40 @@ mod tests {
             Some(StatusCode::FORBIDDEN),
             "flags:delete must not be implied by a read-only role"
         );
+    }
+
+    #[tokio::test]
+    async fn reader_cannot_purge_a_flag() {
+        assert_eq!(
+            delete_rejection(AuthContext::new_session(test_user(), Role::Reader), true).await,
+            Some(StatusCode::FORBIDDEN),
+            "purging is a delete and needs flags:delete"
+        );
+    }
+
+    /// #2102: an archived key is a distinct conflict from a live one.
+    #[test]
+    fn an_archived_key_is_a_distinct_conflict() {
+        let archived = Problem::from(FlagError::ArchivedKey {
+            project_id: 12,
+            key: "ratio".to_string(),
+        });
+        assert_eq!(archived.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_value(&archived.body).expect("problem body");
+        assert_eq!(body["type"], FLAG_ARCHIVED_PROBLEM_TYPE);
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("/projects/12/flags/ratio/restore")),
+            "{body}"
+        );
+
+        let live = Problem::from(FlagError::DuplicateKey {
+            project_id: 12,
+            key: "ratio".to_string(),
+        });
+        let body = serde_json::to_value(&live.body).expect("problem body");
+        assert_eq!(body["type"], FLAG_EXISTS_PROBLEM_TYPE);
     }
 
     #[tokio::test]

@@ -4698,7 +4698,7 @@ Update a Cloudflare Email Sending notification provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--config <json>` | Configuration for a Cloudflare Email Sending notification provider (JSON) [required] | - | No |
+| `--config <json>` | Replacement configuration; omit to keep the stored one (JSON) | - | No |
 | `--enabled` | Body field enabled | - | No |
 | `--no-enabled` | Set enabled to false | - | No |
 | `--name <value>` | Body field name | - | No |
@@ -4748,7 +4748,7 @@ Update a Webhook notification provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--config <json>` | Configuration for a generic webhook notification provider (JSON) [required] | - | No |
+| `--config <json>` | Replacement configuration; omit to keep the stored one (JSON) | - | No |
 | `--enabled` | Body field enabled | - | No |
 | `--no-enabled` | Set enabled to false | - | No |
 | `--name <value>` | Body field name | - | No |
@@ -7153,6 +7153,8 @@ Manage which teams can reach a project
 
 - `list` (`ls`) - List the teams granted access to a project
 - `grant` - Grant a team access to a project
+- `show` (`get`) - Show a team's grant on a project
+- `set-role` - Change the role of a team's existing grant on a project
 - `revoke` - Revoke a team's access to a project
 
 ### `access list` (alias: `ls`)
@@ -7180,6 +7182,33 @@ Grant a team access to a project
 | `-r, --role <role>` | Role the team holds on the project (owner\|admin\|deployer\|viewer) | - | No |
 | `--json` | Output in JSON format | - | No |
 
+### `access show` (alias: `get`)
+
+Show a team's grant on a project
+
+**Usage:** `access show <team> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `access set-role`
+
+Change the role of a team's existing grant on a project
+
+**Usage:** `access set-role <team> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-r, --role <role>` | New role (owner\|admin\|deployer\|viewer) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ### `access revoke`
 
 Revoke a team's access to a project
@@ -7204,7 +7233,7 @@ Manage Projects (what the console calls a Project): groups of services that ship
 - `create` (`new`) - Create a project (group), optionally with services
 - `update` (`edit`) - Rename a project (group) or change its description
 - `delete` (`rm`) - Delete a project (group); its services keep running as standalone services
-- `add` - Add services to a project (group), by slug or id as listed by `projects list`; moves them out of any other project
+- `add` - Add services to a project (group), by slug or id as listed by `projects list`
 - `remove` - Remove a service (slug or id) from a project (group); it becomes a standalone service
 - `repo` - The repository a project deploys its services from (monorepos)
 - `import` - Scan the project's repository and add its apps as services that follow it
@@ -7249,6 +7278,7 @@ Create a project (group), optionally with services
 | `-s, --slug <slug>` | URL slug (derived from the name when omitted) | - | No |
 | `-d, --description <text>` | What the services do together | - | No |
 | `--service <service...>` | Services to put in the project, by slug or id as listed by `projects list` (apps, not the databases of the `services` command) | - | No |
+| `--move` | Move a listed service that is already in another project (group) out of it | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `project-groups update` (alias: `edit`)
@@ -7280,9 +7310,15 @@ Delete a project (group); its services keep running as standalone services
 
 ### `project-groups add`
 
-Add services to a project (group), by slug or id as listed by `projects list`; moves them out of any other project
+Add services to a project (group), by slug or id as listed by `projects list`
 
-**Usage:** `project-groups add <group> <services...>`
+**Usage:** `project-groups add <group> <services...> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--move` | Move a service that is already in another project (group) out of it | - | No |
 
 ### `project-groups remove`
 
@@ -7423,6 +7459,7 @@ Variables shared by every service in a project (group)
 **Subcommands:**
 
 - `get` - Show one shared variable (a secret value is never shown)
+- `reveal` - Show the value of a non-secret shared variable (audited; secret values stay write-only)
 - `list` (`ls`) - List shared variables (secret values are never shown)
 - `set` - Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or read it with --value-file or --value-stdin (keeps secrets out of shell history)
 - `inherited` - Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
@@ -7433,6 +7470,18 @@ Variables shared by every service in a project (group)
 Show one shared variable (a secret value is never shown)
 
 **Usage:** `project-groups vars get <group-id> <var-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups vars reveal`
+
+Show the value of a non-secret shared variable (audited; secret values stay write-only)
+
+**Usage:** `project-groups vars reveal <group-id> <var-id> [options]`
 
 **Options:**
 
@@ -12408,6 +12457,8 @@ Archive a flag (callers fall back to their own default)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
+| `--purge` | Delete an already archived flag for good, freeing its key | - | No |
+| `-y, --yes` | Skip the confirmation for --purge | - | No |
 
 ### `flags record-exposure`
 

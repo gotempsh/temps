@@ -1118,6 +1118,17 @@ impl PluginManager {
         admin_router = apply_route_overrides(admin_router, admin_overrides);
         public_router = apply_route_overrides(public_router, public_overrides);
 
+        // A NUL in a JSON string cannot be stored in PostgreSQL `text` or
+        // `jsonb`; refuse it once for every management route (overrides
+        // included) instead of letting each handler fail with a 500 carrying
+        // the database error. Layered before the plugin middleware, so it
+        // runs after authentication: an unauthenticated caller still gets
+        // its 401 first. Public ingest routes are not covered; they carry
+        // client payloads with their own sanitising.
+        admin_router = admin_router.layer(axum::middleware::from_fn(
+            crate::json_body_guard::reject_nul_in_json_body,
+        ));
+
         let middleware = self.collect_middleware(&plugin_context);
 
         // Middleware that opts into `apply_to_public` (e.g. request metadata
@@ -1676,6 +1687,57 @@ mod split_application_tests {
             probe_status(split.admin.clone(), "/public-marker").await,
             axum::http::StatusCode::NOT_FOUND
         );
+    }
+
+    /// Registers a JSON-echoing POST handler on both routers.
+    struct JsonEchoPlugin;
+
+    impl TempsPlugin for JsonEchoPlugin {
+        fn name(&self) -> &'static str {
+            "json-echo"
+        }
+
+        fn register_services<'a>(
+            &'a self,
+            _ctx: &'a ServiceRegistrationContext,
+        ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn configure_routes(&self, _ctx: &PluginContext) -> Option<PluginRoutes> {
+            let router = Router::new().route(
+                "/teams",
+                axum::routing::post(|_: axum::Json<serde_json::Value>| async { "stored" }),
+            );
+            Some(PluginRoutes::new(router))
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_routes_refuse_a_nul_in_a_json_string_before_the_handler() {
+        use tower::ServiceExt;
+        let mut manager = PluginManager::default();
+        manager.register_plugin(Box::new(JsonEchoPlugin));
+        let split = manager.build_split_application().unwrap();
+
+        let response = split
+            .admin
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/teams")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"name":"a\u0000b","slug":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["field"], "name");
     }
 
     /// Plugin used to verify that shared middleware (`apply_to_public = true`)

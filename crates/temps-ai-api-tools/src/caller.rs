@@ -1734,6 +1734,11 @@ fn required_read_permission(op: &ApiOperation) -> Option<Permission> {
         Permission::DeploymentsRead
     } else if tag.contains("environment") {
         Permission::EnvironmentsRead
+    } else if tag.contains("custom domain") {
+        // A project's custom domains are project settings: their handlers
+        // are guarded by `projects:*`, not by `domains:*` (which governs
+        // the instance's domains and certificates).
+        Permission::ProjectsRead
     } else if tag.contains("domain") {
         Permission::DomainsRead
     } else if tag.contains("external") || tag.contains("static bundle") || tag.contains("image") {
@@ -1791,6 +1796,12 @@ pub(crate) fn required_write_permission(op: &ApiOperation) -> Option<Permission>
             "POST" => Permission::EnvironmentsCreate,
             // No EnvironmentsDelete variant — fall back to Write.
             _ => Permission::EnvironmentsWrite,
+        }
+    } else if tag.contains("custom domain") {
+        // Same guards as the custom-domain handlers (see the read mapping).
+        match method {
+            "DELETE" => Permission::ProjectsDelete,
+            _ => Permission::ProjectsWrite,
         }
     } else if tag.contains("domain") {
         match method {
@@ -3129,6 +3140,25 @@ mod tests {
             required_write_permission(&op),
             Some(Permission::DeploymentsWrite)
         );
+    }
+
+    /// #2103: the assistant must filter custom-domain tools by the
+    /// permissions their handlers check (`projects:*`), or the two disagree.
+    #[test]
+    fn custom_domain_tools_map_to_the_project_permissions_their_handlers_check() {
+        let read = op_tagged_with_method("Custom Domains", "GET");
+        assert_eq!(
+            required_read_permission(&read),
+            Some(Permission::ProjectsRead)
+        );
+        for (method, expected) in [
+            ("POST", Permission::ProjectsWrite),
+            ("PUT", Permission::ProjectsWrite),
+            ("DELETE", Permission::ProjectsDelete),
+        ] {
+            let op = op_tagged_with_method("Custom Domains", method);
+            assert_eq!(required_write_permission(&op), Some(expected), "{method}");
+        }
     }
 
     #[test]

@@ -31,8 +31,8 @@ use temps_core::notifications::{
 use temps_core::url_validation::{resolve_and_validate_domain, validate_external_url};
 use temps_entities::types::RoleType;
 use temps_entities::{
-    notification_preferences, notification_providers, notification_routes, notifications, roles,
-    user_roles, users,
+    notification_preferences, notification_providers, notification_route_providers,
+    notification_routes, notifications, roles, user_roles, users,
 };
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
@@ -136,10 +136,42 @@ pub enum NotificationProviderConfigError {
         provider_type: String,
         reason: String,
     },
+
+    /// Not a config problem strictly, but refused on the same paths and for
+    /// the same reason: a blank name is stored but useless (and the catch-all
+    /// route built from it reads "All notifications -  (provider N)").
+    #[error("A notification provider name must not be empty or only whitespace")]
+    BlankName,
+}
+
+/// Shortest delivery timeout a webhook provider may configure. `0` would make
+/// every delivery time out before it is sent.
+pub const MIN_WEBHOOK_TIMEOUT_SECS: u64 = 1;
+
+/// Longest delivery timeout a webhook provider may configure. One slow
+/// endpoint must not hold a delivery task for longer than this.
+pub const MAX_WEBHOOK_TIMEOUT_SECS: u64 = 120;
+
+/// HTTP methods a webhook provider can deliver with.
+const WEBHOOK_METHODS: [&str; 3] = ["POST", "PUT", "PATCH"];
+
+/// Refuse a provider name that is empty or only whitespace.
+pub fn validate_provider_name(
+    name: &str,
+) -> std::result::Result<(), NotificationProviderConfigError> {
+    if name.trim().is_empty() {
+        return Err(NotificationProviderConfigError::BlankName);
+    }
+    Ok(())
 }
 
 /// Validate the shape of a provider configuration for the provider types that
 /// define one. Other types are accepted as before.
+///
+/// Every rule delivery applies without the network is applied here too, so a
+/// config that could never deliver is refused when it is saved instead of
+/// failing at send time. [`validate_provider_destination`] adds the checks that
+/// need DNS.
 pub fn validate_provider_config(
     provider_type: &str,
     config: &serde_json::Value,
@@ -149,6 +181,55 @@ pub fn validate_provider_config(
         reason,
     };
     match provider_type {
+        "slack" => {
+            let provider: SlackProvider = serde_json::from_value(config.clone()).map_err(|e| {
+                invalid(format!(
+                    "expected webhook_url and optional channel: {}",
+                    config_parse_reason(&e)
+                ))
+            })?;
+            // The same check `SlackProvider::initialize` makes before sending.
+            if !provider.webhook_url.starts_with(SLACK_WEBHOOK_PREFIX) {
+                return Err(invalid(format!(
+                    "webhook_url must be a Slack incoming-webhook URL starting with \
+                     {SLACK_WEBHOOK_PREFIX}"
+                )));
+            }
+            validate_external_url(&provider.webhook_url)
+                .map_err(|e| invalid(format!("webhook_url is not allowed: {e}")))?;
+            Ok(())
+        }
+        "webhook" => {
+            let provider: WebhookProvider =
+                serde_json::from_value(config.clone()).map_err(|e| {
+                    invalid(format!(
+                        "expected url and optional method, headers and timeout_secs: {}",
+                        config_parse_reason(&e)
+                    ))
+                })?;
+            validate_external_url(&provider.url).map_err(|e| {
+                invalid(format!(
+                    "url '{}' is not allowed: {e}",
+                    webhook_url_display(&provider.url)
+                ))
+            })?;
+            if !WEBHOOK_METHODS.contains(&provider.method.to_uppercase().as_str()) {
+                return Err(invalid(format!(
+                    "method '{}' is not supported; use POST, PUT or PATCH",
+                    provider.method
+                )));
+            }
+            if !(MIN_WEBHOOK_TIMEOUT_SECS..=MAX_WEBHOOK_TIMEOUT_SECS)
+                .contains(&provider.timeout_secs)
+            {
+                return Err(invalid(format!(
+                    "timeout_secs is {}; it must be between {MIN_WEBHOOK_TIMEOUT_SECS} and \
+                     {MAX_WEBHOOK_TIMEOUT_SECS} seconds",
+                    provider.timeout_secs
+                )));
+            }
+            Ok(())
+        }
         TELEGRAM_PROVIDER_TYPE => {
             let provider: TelegramProvider =
                 serde_json::from_value(config.clone()).map_err(|e| {
@@ -165,6 +246,67 @@ pub fn validate_provider_config(
         }
         _ => Ok(()),
     }
+}
+
+/// The part of delivery's URL check that needs DNS: a webhook host that
+/// resolves to a loopback, private, link-local or metadata address is refused
+/// when it is saved, as project webhooks are, instead of only failing later at
+/// delivery ("Loopback addresses are not allowed").
+///
+/// A name that does not resolve right now is accepted: DNS may be published
+/// after the provider is configured, and every delivery resolves and checks
+/// it again, so `POST /notification-providers/{id}/test` reports it.
+/// Call after [`validate_provider_config`], which has checked the URL's shape.
+pub async fn validate_provider_destination(
+    provider_type: &str,
+    config: &serde_json::Value,
+) -> std::result::Result<(), NotificationProviderConfigError> {
+    if provider_type != "webhook" {
+        // Slack only accepts hooks.slack.com, a public host; the other types
+        // have no URL a caller chooses.
+        return Ok(());
+    }
+    let Some(url) = config.get("url").and_then(serde_json::Value::as_str) else {
+        return Ok(());
+    };
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return Ok(());
+    };
+    // IP literals were checked by `validate_provider_config`; only names
+    // need resolving.
+    let Some(domain) = parsed
+        .host_str()
+        .filter(|host| host.parse::<std::net::IpAddr>().is_err())
+    else {
+        return Ok(());
+    };
+    let Some(port) = parsed.port_or_known_default() else {
+        return Ok(());
+    };
+    match resolve_and_validate_domain(domain, port).await {
+        Ok(_) => Ok(()),
+        Err(temps_core::url_validation::UrlValidationError::DnsResolutionFailed(reason)) => {
+            tracing::debug!(
+                host = %domain,
+                reason = %reason,
+                "Webhook provider host does not resolve yet; delivery will check it again"
+            );
+            Ok(())
+        }
+        Err(error) => Err(NotificationProviderConfigError::Invalid {
+            provider_type: provider_type.to_string(),
+            reason: format!("url '{}' is not allowed: {error}", webhook_url_display(url)),
+        }),
+    }
+}
+
+/// Every check a config must pass before it is stored.
+async fn validate_provider_config_for_storage(
+    provider_type: &str,
+    config: &serde_json::Value,
+) -> std::result::Result<(), NotificationProviderConfigError> {
+    validate_provider_config(provider_type, config)?;
+    validate_provider_destination(provider_type, config).await
 }
 
 const MASKED_CONFIG_VALUE: &str = "***";
@@ -2891,12 +3033,18 @@ impl NotificationService {
                 source,
             }
         })?;
-        validate_provider_config(&p_provider_type, &config_value).map_err(|source| {
+        validate_provider_name(&p_name).map_err(|source| {
             NotificationProviderCreateError::InvalidConfig {
                 provider_name: p_name.clone(),
                 source,
             }
         })?;
+        validate_provider_config_for_storage(&p_provider_type, &config_value)
+            .await
+            .map_err(|source| NotificationProviderCreateError::InvalidConfig {
+                provider_name: p_name.clone(),
+                source,
+            })?;
         let config_json = serde_json::to_string(&config_value).map_err(|source| {
             NotificationProviderCreateError::Serialization {
                 provider_name: p_name.clone(),
@@ -3027,6 +3175,7 @@ impl NotificationService {
 
             // Update fields if provided
             if let Some(new_name) = update.name {
+                validate_provider_name(&new_name)?;
                 active_model.name = Set(new_name);
             }
             if let Some(mut new_config) = update.config {
@@ -3040,7 +3189,7 @@ impl NotificationService {
                 Self::merge_masked_values(&decrypted_existing, &mut new_config, "")?;
                 // Validate after the merge, so an unchanged masked secret is
                 // checked as the stored value it stands for.
-                validate_provider_config(&provider_type, &new_config)?;
+                validate_provider_config_for_storage(&provider_type, &new_config).await?;
                 let config_json = serde_json::to_string(&new_config).map_err(|e| {
                     NotificationError::ConfigSerialization {
                         provider_id,
@@ -3118,27 +3267,128 @@ impl NotificationService {
         }
     }
 
+    /// Delete a provider. Refused with [`NotificationError::ProviderInUse`]
+    /// when a route lists only this provider: the cascade would leave it
+    /// enabled with no provider, a state the route endpoints themselves
+    /// refuse, and its alerts would go nowhere without anything saying so.
+    ///
+    /// The provider row is locked for the check and the delete, so a route
+    /// assigned to it concurrently waits (its `notification_route_providers`
+    /// insert needs the row) and then fails on the deleted provider instead of
+    /// slipping in between.
     pub async fn delete_provider(&self, provider_id: i32) -> Result<bool> {
+        let transaction = self
+            .db
+            .begin()
+            .await
+            .map_err(NotificationError::provider_database(
+                provider_id,
+                "start the delete",
+            ))?;
         let provider = notification_providers::Entity::find_by_id(provider_id)
-            .one(self.db.as_ref())
+            .lock_exclusive()
+            .one(&transaction)
             .await
             .map_err(NotificationError::provider_database(
                 provider_id,
                 "load the configuration",
             ))?;
 
-        if let Some(provider) = provider {
-            // The provider's auto-generated catch-all route (if any) is
-            // removed automatically via the `catch_all_provider_id` FK's
-            // ON DELETE CASCADE — no orphaned "All notifications - <name>
-            // (provider <id>)" route is left behind.
-            provider.delete(self.db.as_ref()).await.map_err(
-                NotificationError::provider_database(provider_id, "delete the configuration"),
-            )?;
-            Ok(true)
-        } else {
-            Ok(false)
+        let Some(provider) = provider else {
+            return Ok(false);
+        };
+
+        let stranded = Self::routes_only_served_by(&transaction, provider_id).await?;
+        if !stranded.is_empty() {
+            let routes = stranded
+                .iter()
+                .map(|(id, name)| format!("{id} '{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(NotificationError::ProviderInUse {
+                provider_id,
+                routes,
+            });
         }
+
+        // The provider's auto-generated catch-all route (if any) is
+        // removed automatically via the `catch_all_provider_id` FK's
+        // ON DELETE CASCADE — no orphaned "All notifications - <name>
+        // (provider <id>)" route is left behind.
+        provider
+            .delete(&transaction)
+            .await
+            .map_err(NotificationError::provider_database(
+                provider_id,
+                "delete the configuration",
+            ))?;
+        transaction
+            .commit()
+            .await
+            .map_err(NotificationError::provider_database(
+                provider_id,
+                "commit the delete",
+            ))?;
+        Ok(true)
+    }
+
+    /// Routes (id, name) whose only provider is `provider_id`, other than the
+    /// provider's own catch-all route, sorted by id. Three queries, whatever
+    /// the number of routes.
+    ///
+    /// The routes using the provider are locked (in id order, so overlapping
+    /// deletes cannot deadlock) before their other providers are read. Two
+    /// providers of one route deleted at once would otherwise each count the
+    /// other as the route's remaining provider and both succeed, leaving the
+    /// route with none: with the lock, the second waits for the first to
+    /// commit, then reads the route without it and refuses (#2109).
+    async fn routes_only_served_by<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        provider_id: i32,
+    ) -> Result<Vec<(i32, String)>> {
+        let lookup = NotificationError::provider_database(provider_id, "load the routes using");
+        let route_ids: Vec<i32> = notification_route_providers::Entity::find()
+            .filter(notification_route_providers::Column::ProviderId.eq(provider_id))
+            .all(db)
+            .await
+            .map_err(lookup)?
+            .into_iter()
+            .map(|assignment| assignment.route_id)
+            .collect();
+        if route_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let routes = notification_routes::Entity::find()
+            .filter(notification_routes::Column::Id.is_in(route_ids.iter().copied()))
+            .order_by_asc(notification_routes::Column::Id)
+            .lock_exclusive()
+            .all(db)
+            .await
+            .map_err(NotificationError::provider_database(
+                provider_id,
+                "lock the routes using",
+            ))?;
+
+        let shared: std::collections::HashSet<i32> = notification_route_providers::Entity::find()
+            .filter(notification_route_providers::Column::RouteId.is_in(route_ids.iter().copied()))
+            .filter(notification_route_providers::Column::ProviderId.ne(provider_id))
+            .all(db)
+            .await
+            .map_err(NotificationError::provider_database(
+                provider_id,
+                "load the other providers of the routes using",
+            ))?
+            .into_iter()
+            .map(|assignment| assignment.route_id)
+            .collect();
+        Ok(routes
+            .into_iter()
+            .filter(|route| !shared.contains(&route.id))
+            // Its catch-all route is deleted with it (ON DELETE CASCADE).
+            .filter(|route| route.catch_all_provider_id != Some(provider_id))
+            .map(|route| (route.id, route.name))
+            .collect())
     }
 
     /// Sends a real test notification through one provider. A delivery
@@ -3154,7 +3404,33 @@ impl NotificationService {
             ))?;
 
         if let Some(provider) = provider {
-            let notification_provider = self.load_provider(&provider).await?;
+            let notification_provider = match self.load_provider(&provider).await {
+                Ok(loaded) => loaded,
+                // The stored config cannot be read: a server-side fault.
+                Err(
+                    error @ (NotificationError::ConfigDecryption { .. }
+                    | NotificationError::ConfigParse { .. }
+                    | NotificationError::UnsupportedProviderType { .. }
+                    | NotificationError::Database { .. }
+                    | NotificationError::ProviderDatabase { .. }),
+                ) => return Err(error),
+                // Preparing the delivery failed on the destination (a host
+                // that does not resolve or resolves to a blocked address, a
+                // rejected SMTP sender...): the test ran and its answer is
+                // "not delivered", exactly as when the send itself fails.
+                Err(error) => {
+                    tracing::warn!(
+                        provider_id,
+                        provider_type = %provider.provider_type,
+                        error = %error,
+                        "Provider test notification could not be prepared"
+                    );
+                    return Ok(ProviderTestOutcome {
+                        success: false,
+                        message: format!("Test notification was not delivered: {error}"),
+                    });
+                }
+            };
             let notification = Notification::new(
                 "Temps test notification",
                 "This is a test alert from your Temps notification settings. No action is required.",
@@ -6691,6 +6967,99 @@ mod tests {
         assert!(validate_provider_config("custom", &serde_json::json!({"x": 1})).is_ok());
     }
 
+    #[test]
+    fn slack_and_webhook_configs_are_checked_like_delivery_checks_them() {
+        let slack = |url: &str| serde_json::json!({"webhook_url": url, "channel": null});
+        assert!(validate_provider_config(
+            "slack",
+            &slack("https://hooks.slack.com/services/T000/B000/XXXX")
+        )
+        .is_ok());
+        let error = validate_provider_config("slack", &slack("https://example.com/not-slack"))
+            .expect_err("only Slack's incoming-webhook host can deliver");
+        assert!(error.to_string().contains(SLACK_WEBHOOK_PREFIX), "{error}");
+        assert!(!error.to_string().contains("not-slack"), "{error}");
+
+        let webhook = |extra: serde_json::Value| {
+            let mut config = serde_json::json!({"url": "https://hooks.example.com/n"});
+            for (key, value) in extra.as_object().cloned().unwrap_or_default() {
+                config[key] = value;
+            }
+            config
+        };
+        assert!(validate_provider_config("webhook", &webhook(serde_json::json!({}))).is_ok());
+        for timeout in [MIN_WEBHOOK_TIMEOUT_SECS, MAX_WEBHOOK_TIMEOUT_SECS] {
+            assert!(validate_provider_config(
+                "webhook",
+                &webhook(serde_json::json!({"timeout_secs": timeout}))
+            )
+            .is_ok());
+        }
+        for timeout in [0, MAX_WEBHOOK_TIMEOUT_SECS + 1, 999_999] {
+            let error = validate_provider_config(
+                "webhook",
+                &webhook(serde_json::json!({"timeout_secs": timeout})),
+            )
+            .expect_err("the timeout is bounded");
+            assert!(error.to_string().contains("between 1 and 120"), "{error}");
+        }
+        let error =
+            validate_provider_config("webhook", &webhook(serde_json::json!({"method": "DELETE"})))
+                .expect_err("only POST, PUT and PATCH deliver");
+        assert!(error.to_string().contains("DELETE"), "{error}");
+        assert!(
+            validate_provider_config("webhook", &webhook(serde_json::json!({"method": "patch"})))
+                .is_ok(),
+            "delivery upper-cases the method"
+        );
+        for url in [
+            "http://127.0.0.1:9/",
+            "http://localhost/x",
+            "http://10.0.0.5/x",
+            "ftp://hooks.example.com/",
+        ] {
+            let error = validate_provider_config("webhook", &serde_json::json!({"url": url}))
+                .expect_err("delivery would refuse this URL");
+            assert!(error.to_string().contains("not allowed"), "{url}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_blank_provider_name_is_refused() {
+        assert!(validate_provider_name("ops").is_ok());
+        for name in ["", " ", "\t\n"] {
+            assert!(matches!(
+                validate_provider_name(name),
+                Err(NotificationProviderConfigError::BlankName)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_webhook_host_resolving_to_a_blocked_address_is_refused_but_an_unresolved_one_is_not()
+    {
+        // `localhost` resolves through the hosts file, without a network.
+        let error = validate_provider_destination(
+            "webhook",
+            &serde_json::json!({"url": "https://localhost/hook"}),
+        )
+        .await
+        .expect_err("a name resolving to loopback cannot be delivered to");
+        assert!(error.to_string().contains("https://localhost"), "{error}");
+
+        // `.invalid` never resolves (RFC 6761): accepted now, checked again
+        // at every delivery.
+        validate_provider_destination(
+            "webhook",
+            &serde_json::json!({"url": "https://unresolvable.invalid/x"}),
+        )
+        .await
+        .expect("a name that does not resolve yet is not refused");
+        validate_provider_destination("slack", &serde_json::json!({}))
+            .await
+            .expect("only webhook URLs are resolved");
+    }
+
     #[tokio::test]
     async fn telegram_update_refuses_a_provider_of_another_type() {
         let test_db = test_database_or_skip!();
@@ -6704,7 +7073,7 @@ mod tests {
                 "Team Slack".to_string(),
                 "slack".to_string(),
                 serde_json::json!({
-                    "webhook_url": "https://hooks.slack.example/services/T0/B0/x",
+                    "webhook_url": "https://hooks.slack.com/services/T0/B0/x",
                     "channel": null,
                 }),
                 true,
@@ -6749,7 +7118,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             stored["webhook_url"],
-            "https://hooks.slack.example/services/T0/B0/x"
+            "https://hooks.slack.com/services/T0/B0/x"
         );
         assert!(stored.get("bot_token").is_none());
 

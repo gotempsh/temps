@@ -23,8 +23,9 @@ use temps_core::{
 };
 use temps_credential_checks::{
     Candidate, CatalogDetector, CheckKind, CheckStatus, CredentialDetector, CredentialVerifier,
-    ExpiringArtifact, HttpCheckSpec, HttpCheckTransport, HttpCredentialVerifier, LocalCheckSpec,
-    LocalVerifier, VerificationResult, MAX_LOCAL_INPUT_BYTES,
+    ExpirationRule, ExpiringArtifact, HttpCheckMethod, HttpCheckSpec, HttpCheckTransport,
+    HttpCredentialVerifier, LocalCheckSpec, LocalVerifier, NumericRule, VerificationResult,
+    MAX_LOCAL_INPUT_BYTES,
 };
 use temps_entities::{env_vars, http_checks, projects, secrets};
 use utoipa::ToSchema;
@@ -34,8 +35,13 @@ pub use variable_history::{VariableHistoryDetails, VariableHistoryEntry, Variabl
 pub enum HttpChecksError {
     #[error("HTTP check {id} was not found in project {project_id}")]
     NotFound { project_id: i32, id: i32 },
+    #[error("Project {project_id} not found")]
+    ProjectNotFound { project_id: i32 },
     #[error("Invalid HTTP check: {reason}")]
     Invalid { reason: String },
+    /// One field of a check is invalid; the message names it and its value.
+    #[error("Invalid HTTP check {field}: {reason}")]
+    InvalidField { field: &'static str, reason: String },
     #[error("HTTP check {id} is already running or was checked within the last 30 seconds")]
     Busy { id: i32 },
     #[error("Database operation '{operation}' failed for HTTP checks in project {project_id}")]
@@ -76,14 +82,26 @@ fn db_error(project_id: i32, operation: &'static str, source: DbErr) -> HttpChec
 
 /// Credentials and recipe headers are write-only and encrypted at rest.
 /// A check reads at most one of `env_var_id`, `secret_id` and `credential`.
+///
+/// On update (`PUT`) the recipe, kind and credential source are replaced as
+/// sent, while an omitted `enabled` or `interval_seconds` keeps its current
+/// value. A change to the recipe, kind or credential runs the check again; a
+/// change to anything else keeps its last result.
 #[derive(Deserialize, ToSchema)]
 pub struct SaveHttpCheck {
+    /// 1-120 characters (counted as characters, not bytes), trimmed.
+    #[schema(min_length = 1, max_length = 120)]
     pub name: String,
     pub env_var_id: Option<i32>,
     /// Project secret to check. HTTP checks may only send a secret to the
     /// provider its value is recognized as; local checks never send it.
     pub secret_id: Option<i32>,
-    pub credential: Option<String>,
+    /// Inline credential, write-only. On update: omit to keep the stored one
+    /// (for the same kind of check), `null` to remove it, or a value to
+    /// replace it. `has_credential` in the view says whether one is stored.
+    #[serde(default, deserialize_with = "temps_core::nullable::deserialize")]
+    #[schema(value_type = Option<String>, nullable)]
+    pub credential: Option<Option<String>>,
     /// `http` (default) calls an endpoint; `local` reads expiring items
     /// (certificates, SSH certificates, OpenPGP keys, kubeconfigs, JWTs) on this host.
     #[serde(default)]
@@ -92,16 +110,91 @@ pub struct SaveHttpCheck {
     pub spec: Option<HttpCheckSpec>,
     /// Expiry thresholds for `local` checks; defaults to 30, 7 and 1 days.
     pub local: Option<LocalCheckSpec>,
-    #[serde(default = "daily")]
-    pub interval_seconds: i32,
-    #[serde(default = "enabled")]
-    pub enabled: bool,
+    /// Seconds between checks, 300-604800. Defaults to 86400 on create; an
+    /// update that omits it keeps the current interval.
+    #[schema(minimum = 300, maximum = 604800)]
+    pub interval_seconds: Option<i32>,
+    /// Defaults to `true` on create; an update that omits it keeps the
+    /// current state.
+    pub enabled: Option<bool>,
 }
-fn daily() -> i32 {
-    86400
+/// Interval of a check created without one.
+const DEFAULT_INTERVAL_SECONDS: i32 = 86400;
+const MIN_INTERVAL_SECONDS: i32 = 300;
+const MAX_INTERVAL_SECONDS: i32 = 604800;
+const MAX_NAME_CHARS: usize = 120;
+
+/// An HTTP recipe as returned. Header values may hold secrets and are
+/// write-only, so only their names are listed; resend them on update.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HttpCheckSpecView {
+    /// The URL called. The value of a query parameter whose name suggests a
+    /// credential (`api_key`, `token`, `sig`, ...) is shown as `***`, like a
+    /// header value: resend the real URL on update.
+    pub url: String,
+    pub method: HttpCheckMethod,
+    /// Names of the headers the recipe sends (values are write-only).
+    pub header_names: Vec<String>,
+    pub credential_header: Option<String>,
+    pub credential_prefix: String,
+    pub accepted_statuses: Vec<u16>,
+    pub expiration: Option<ExpirationRule>,
+    pub numeric_rules: Vec<NumericRule>,
 }
-fn enabled() -> bool {
-    true
+impl From<HttpCheckSpec> for HttpCheckSpecView {
+    fn from(spec: HttpCheckSpec) -> Self {
+        Self {
+            url: redact_query_credentials(&spec.url),
+            method: spec.method,
+            header_names: spec.headers.into_keys().collect(),
+            credential_header: spec.credential_header,
+            credential_prefix: spec.credential_prefix,
+            accepted_statuses: spec.accepted_statuses,
+            expiration: spec.expiration,
+            numeric_rules: spec.numeric_rules,
+        }
+    }
+}
+/// Fragments of a query parameter name that mark its value as a credential.
+const CREDENTIAL_QUERY_NAME_PARTS: [&str; 9] = [
+    "key",
+    "token",
+    "secret",
+    "pass",
+    "pwd",
+    "auth",
+    "sig",
+    "credential",
+    "session",
+];
+/// `url` with the value of every credential-like query parameter replaced by
+/// `***`. A URL that does not parse loses its whole query instead, since
+/// which part of it is secret cannot be told.
+fn redact_query_credentials(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return url.split('?').next().unwrap_or_default().to_string();
+    };
+    if parsed.query().is_none() {
+        return url.to_string();
+    }
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(name, value)| {
+            let lower = name.to_ascii_lowercase();
+            let secret = !value.is_empty()
+                && CREDENTIAL_QUERY_NAME_PARTS
+                    .iter()
+                    .any(|part| lower.contains(part));
+            let value = if secret {
+                "***".into()
+            } else {
+                value.into_owned()
+            };
+            (name.into_owned(), value)
+        })
+        .collect();
+    parsed.query_pairs_mut().clear().extend_pairs(pairs);
+    parsed.to_string()
 }
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HttpCheckView {
@@ -119,10 +212,17 @@ pub struct HttpCheckView {
     #[schema(value_type=Option<String>,format=DateTime)]
     pub last_checked_at: Option<DateTime<Utc>>,
     pub result: Option<VerificationResult>,
+    /// The HTTP recipe of an `http` check (header values omitted).
+    pub spec: Option<HttpCheckSpecView>,
+    /// The expiry thresholds of a `local` check.
+    pub local: Option<LocalCheckSpec>,
+    /// Whether an inline credential is stored (it is never returned).
+    pub has_credential: bool,
 }
-impl TryFrom<http_checks::Model> for HttpCheckView {
-    type Error = HttpChecksError;
-    fn try_from(m: http_checks::Model) -> Result<Self, Self::Error> {
+impl HttpCheckView {
+    /// The view of a row without its recipe; [`HttpChecksService::view`]
+    /// adds the decrypted recipe.
+    fn from_row(m: http_checks::Model) -> Result<Self, HttpChecksError> {
         let result = m
             .last_result
             .map(serde_json::from_value)
@@ -142,6 +242,9 @@ impl TryFrom<http_checks::Model> for HttpCheckView {
             next_check_at: m.next_check_at,
             last_checked_at: m.last_checked_at,
             result,
+            spec: None,
+            local: None,
+            has_credential: m.encrypted_credential.is_some(),
         })
     }
 }
@@ -211,6 +314,16 @@ impl HttpChecksService {
             permits: Arc::new(tokio::sync::Semaphore::new(4)),
         })
     }
+    /// A row as the API returns it, with its recipe (header values omitted).
+    fn view(&self, row: http_checks::Model) -> Result<HttpCheckView, HttpChecksError> {
+        let recipe = self.stored_spec(&row)?;
+        let mut view = HttpCheckView::from_row(row)?;
+        match recipe {
+            StoredSpec::Http(spec) => view.spec = Some(spec.into()),
+            StoredSpec::Local(local) => view.local = Some(local),
+        }
+        Ok(view)
+    }
     pub async fn capabilities(&self) -> HttpChecksCapabilities {
         HttpChecksCapabilities {
             detection_rule_count: self.detector.rule_count(),
@@ -238,7 +351,8 @@ impl HttpChecksService {
             .exec(self.db.as_ref())
             .await
             .map_err(|e| db_error(project_id, "set enabled", e))?;
-        self.row(project_id, id).await?.try_into()
+        let row = self.row(project_id, id).await?;
+        self.view(row)
     }
     pub async fn list(
         &self,
@@ -248,6 +362,7 @@ impl HttpChecksService {
     ) -> Result<HttpCheckList, HttpChecksError> {
         let page = page.max(1);
         let page_size = page_size.clamp(1, 100);
+        self.require_project(project_id).await?;
         let query = http_checks::Entity::find()
             .filter(http_checks::Column::ProjectId.eq(project_id))
             .order_by_desc(http_checks::Column::CreatedAt)
@@ -262,7 +377,7 @@ impl HttpChecksService {
             .await
             .map_err(|e| db_error(project_id, "list", e))?
             .into_iter()
-            .map(HttpCheckView::try_from)
+            .map(|row| self.view(row))
             .collect::<Result<_, _>>()?;
         Ok(HttpCheckList {
             items,
@@ -271,9 +386,22 @@ impl HttpChecksService {
             page_size,
         })
     }
+    /// A missing (or deleted) project is a 404 naming it, for a listing as
+    /// for a create: not an empty page or a 400.
+    async fn require_project(&self, project_id: i32) -> Result<(), HttpChecksError> {
+        if projects::live_project_exists(self.db.as_ref(), project_id)
+            .await
+            .map_err(|e| db_error(project_id, "find project", e))?
+        {
+            Ok(())
+        } else {
+            Err(HttpChecksError::ProjectNotFound { project_id })
+        }
+    }
     /// One check of a project, as listed.
     pub async fn get(&self, project_id: i32, id: i32) -> Result<HttpCheckView, HttpChecksError> {
-        self.row(project_id, id).await?.try_into()
+        let row = self.row(project_id, id).await?;
+        self.view(row)
     }
     async fn row(&self, project_id: i32, id: i32) -> Result<http_checks::Model, HttpChecksError> {
         http_checks::Entity::find_by_id(id)
@@ -491,23 +619,35 @@ impl HttpChecksService {
         id: Option<i32>,
         input: SaveHttpCheck,
     ) -> Result<HttpCheckView, HttpChecksError> {
-        if input.name.trim().is_empty()
-            || input.name.len() > 120
-            || !(300..=604800).contains(&input.interval_seconds)
-        {
-            return Err(HttpChecksError::Invalid {reason:"Name must contain 1–120 characters; interval must be between 300 and 604800 seconds.".into()});
+        let name_chars = input.name.trim().chars().count();
+        if name_chars == 0 || name_chars > MAX_NAME_CHARS {
+            return Err(HttpChecksError::InvalidField {
+                field: "name",
+                reason: format!("must contain 1-{MAX_NAME_CHARS} characters, got {name_chars}"),
+            });
+        }
+        if let Some(interval) = input.interval_seconds {
+            if !(MIN_INTERVAL_SECONDS..=MAX_INTERVAL_SECONDS).contains(&interval) {
+                return Err(HttpChecksError::InvalidField {
+                    field: "interval_seconds",
+                    reason: format!(
+                        "must be between {MIN_INTERVAL_SECONDS} and {MAX_INTERVAL_SECONDS} \
+                         seconds, got {interval}"
+                    ),
+                });
+            }
         }
         let sources = [
             input.env_var_id.is_some(),
             input.secret_id.is_some(),
-            input.credential.is_some(),
+            matches!(input.credential, Some(Some(_))),
         ];
         if sources.iter().filter(|set| **set).count() > 1 {
             return Err(HttpChecksError::Invalid {
                 reason: "Choose one credential source: an environment variable, a secret, or an inline credential.".into(),
             });
         }
-        if let Some(secret) = &input.credential {
+        if let Some(Some(secret)) = &input.credential {
             let acceptable = match input.kind {
                 CheckKind::Http => secret.len() <= 16_384 && !secret.contains(['\r', '\n']),
                 // Certificates, keys and kubeconfigs are multi-line.
@@ -519,18 +659,24 @@ impl HttpChecksService {
                 });
             }
         }
+        // A missing project is its 404 (#2097) before the recipe's variable or
+        // secret is looked up in it, which would otherwise report a 400.
+        self.require_project(project_id).await?;
         let spec = self.validated_spec(project_id, &input).await?;
         let existing = match id {
             Some(id) => Some(self.row(project_id, id).await?),
             None => None,
         };
         let stored_source = input.env_var_id.is_some() || input.secret_id.is_some();
+        let credential_changed = input.credential.is_some();
         let credential = match input.credential {
-            Some(value) => Some(
+            Some(Some(value)) => Some(
                 self.encryption
                     .encrypt_string(&value)
                     .map_err(|_| HttpChecksError::Encryption { project_id })?,
             ),
+            // An explicit null removes a stored inline credential.
+            Some(None) => None,
             None if stored_source => None,
             // A retained credential was supplied for one kind of check; switching
             // kind (e.g. a pasted certificate bundle into an HTTP recipe) must not
@@ -552,21 +698,51 @@ impl HttpChecksService {
                 reason: "This check requires a credential source.".into(),
             });
         }
-        if projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await
-            .map_err(|e| db_error(project_id, "find project", e))?
-            .is_none()
-        {
-            return Err(HttpChecksError::Invalid {
-                reason: "Project does not exist.".into(),
-            });
-        }
         let encrypted_spec = self
             .encryption
             .encrypt_string(&spec)
             .map_err(|_| HttpChecksError::Encryption { project_id })?;
         let now = Utc::now();
+        // Whether what the check calls, or with what, changed. Only then is
+        // the last result stale; a rename or a new interval keeps it (#2113).
+        let rerun = match &existing {
+            None => true,
+            Some(m) => {
+                m.kind != input.kind.as_str()
+                    || m.env_var_id != input.env_var_id
+                    || m.secret_id != input.secret_id
+                    || credential_changed
+                    || credential.is_some() != m.encrypted_credential.is_some()
+                    || self
+                        .encryption
+                        .decrypt_string(&m.encrypted_spec)
+                        .map_or(true, |stored| stored != spec)
+            }
+        };
+        let enabled = input
+            .enabled
+            .or(existing.as_ref().map(|m| m.enabled))
+            .unwrap_or(true);
+        let interval_seconds = input
+            .interval_seconds
+            .or(existing.as_ref().map(|m| m.interval_seconds))
+            .unwrap_or(DEFAULT_INTERVAL_SECONDS);
+        // `Some(reschedule)` for a metadata-only save: the schedule moves only
+        // when re-enabled or given a new interval, otherwise it stays as stored.
+        let kept = existing.as_ref().filter(|_| !rerun).map(|m| {
+            if enabled && !m.enabled {
+                // Re-enabled: check now, as `PATCH {"enabled": true}` does.
+                Some(now)
+            } else if interval_seconds != m.interval_seconds {
+                Some(
+                    m.last_checked_at
+                        .map(|at| at + Duration::seconds(i64::from(interval_seconds)))
+                        .unwrap_or(now),
+                )
+            } else {
+                None
+            }
+        });
         let mut model: http_checks::ActiveModel = existing.map(Into::into).unwrap_or_default();
         model.project_id = Set(project_id);
         model.automatic_provider = Set(None);
@@ -576,17 +752,26 @@ impl HttpChecksService {
         model.name = Set(input.name.trim().into());
         model.encrypted_spec = Set(encrypted_spec);
         model.encrypted_credential = Set(credential);
-        model.enabled = Set(input.enabled);
-        model.interval_seconds = Set(input.interval_seconds);
-        model.next_check_at = Set(now);
-        model.lease_until = Set(None);
-        model.lease_token = Set(None);
-        model.last_result = Set(None);
-        model.last_checked_at = Set(None);
+        model.enabled = Set(enabled);
+        model.interval_seconds = Set(interval_seconds);
+        if let Some(reschedule) = kept {
+            // Metadata only: the last result, and any run in progress, stand.
+            // The lease columns are left out of the update entirely, so a
+            // claim made since the row was read is not overwritten.
+            if let Some(next_check_at) = reschedule {
+                model.next_check_at = Set(next_check_at);
+            }
+        } else {
+            model.next_check_at = Set(now);
+            model.lease_until = Set(None);
+            model.lease_token = Set(None);
+            model.last_result = Set(None);
+            model.last_checked_at = Set(None);
+            model.consecutive_unknowns = Set(0);
+        }
         if id.is_none() {
             model.last_notified_fingerprint = Set(String::new());
         }
-        model.consecutive_unknowns = Set(0);
         model.updated_at = Set(now);
         let saved = if id.is_some() {
             model.update(self.db.as_ref()).await
@@ -595,7 +780,7 @@ impl HttpChecksService {
             model.insert(self.db.as_ref()).await
         }
         .map_err(|e| db_error(project_id, "save", e))?;
-        saved.try_into()
+        self.view(saved)
     }
     pub async fn delete(&self, project_id: i32, id: i32) -> Result<(), HttpChecksError> {
         let deleted = self
@@ -654,7 +839,8 @@ impl HttpChecksService {
             .map_err(|e| db_error(project_id, "claim", e))?
             .ok_or(HttpChecksError::Busy { id })?;
         self.execute(row).await?;
-        self.row(project_id, id).await?.try_into()
+        let row = self.row(project_id, id).await?;
+        self.view(row)
     }
     async fn execute(&self, row: http_checks::Model) -> Result<(), HttpChecksError> {
         let now = Utc::now();
@@ -788,27 +974,42 @@ impl HttpChecksService {
                 }
             }
         }
-        let next = now
-            + Duration::seconds(
-                if retry || (result.status == CheckStatus::Unknown && unknowns < 2) {
-                    300
-                } else {
-                    row.interval_seconds as i64
-                },
-            );
+        let regular = !(retry || (result.status == CheckStatus::Unknown && unknowns < 2));
+        self.finish_run(&row, notified, regular, now).await
+    }
+    /// Releases the lease of the run that `row` was claimed for and schedules
+    /// the next one: a regular run one interval from `now`, a retry (or an
+    /// early unknown) in five minutes. The interval is read from the row as
+    /// it is when the result is recorded, not as it was when the run was
+    /// claimed: one saved while this run held the lease applies at once.
+    async fn finish_run(
+        &self,
+        row: &http_checks::Model,
+        notified: String,
+        regular: bool,
+        now: DateTime<Utc>,
+    ) -> Result<(), HttpChecksError> {
+        let next = if regular {
+            Expr::cust_with_values(
+                r#"$1 + make_interval(secs => "interval_seconds")"#,
+                [sea_orm::Value::from(now)],
+            )
+        } else {
+            Expr::value(now + Duration::seconds(300))
+        };
         http_checks::Entity::update_many()
             .col_expr(
                 http_checks::Column::LastNotifiedFingerprint,
                 Expr::value(notified),
             )
-            .col_expr(http_checks::Column::NextCheckAt, Expr::value(next))
+            .col_expr(http_checks::Column::NextCheckAt, next)
             .col_expr(
                 http_checks::Column::LeaseUntil,
                 Expr::value(None::<DateTime<Utc>>),
             )
             .col_expr(http_checks::Column::LeaseToken, Expr::value(None::<String>))
             .filter(http_checks::Column::Id.eq(row.id))
-            .filter(http_checks::Column::LeaseToken.eq(row.lease_token))
+            .filter(http_checks::Column::LeaseToken.eq(row.lease_token.clone()))
             .exec(self.db.as_ref())
             .await
             .map_err(|e| db_error(row.project_id, "finish check", e))?;
@@ -959,6 +1160,10 @@ mod tests {
         };
         let s = service(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![crate::outage::tests::make_project_model(
+                    10,
+                    "checkout-api",
+                )]])
                 .append_query_results([vec![env.clone()], vec![env.clone()]]),
         );
         let mut spec = temps_credential_checks::provider_presets().remove(0).spec;
@@ -1005,8 +1210,8 @@ mod tests {
             kind: CheckKind::Http,
             spec: Some(spec),
             local: None,
-            interval_seconds: 86400,
-            enabled: true,
+            interval_seconds: Some(86400),
+            enabled: Some(true),
         }
     }
     fn local_request() -> SaveHttpCheck {
@@ -1042,7 +1247,12 @@ mod tests {
     }
     #[tokio::test]
     async fn save_requires_one_credential_source_and_a_recipe_matching_its_kind() {
-        let s = service(MockDatabase::new(DatabaseBackend::Postgres));
+        // Each save first finds its project, then rejects the request.
+        let s = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results(
+                (0..7).map(|_| vec![crate::outage::tests::make_project_model(10, "checkout-api")]),
+            ),
+        );
         let spec = temps_credential_checks::provider_presets().remove(0).spec;
         for request in [
             SaveHttpCheck {
@@ -1052,7 +1262,7 @@ mod tests {
             },
             SaveHttpCheck {
                 secret_id: Some(2),
-                credential: Some("inline".into()),
+                credential: Some(Some("inline".into())),
                 ..http_request(spec.clone())
             },
             SaveHttpCheck {
@@ -1074,7 +1284,7 @@ mod tests {
                 ..local_request()
             },
             SaveHttpCheck {
-                credential: Some("x".repeat(MAX_LOCAL_INPUT_BYTES + 1)),
+                credential: Some(Some("x".repeat(MAX_LOCAL_INPUT_BYTES + 1))),
                 ..local_request()
             },
         ] {
@@ -1092,6 +1302,10 @@ mod tests {
         let s = HttpChecksService {
             db: Arc::new(
                 MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![crate::outage::tests::make_project_model(
+                        10,
+                        "checkout-api",
+                    )]])
                     .append_query_results([vec![stored.clone()], vec![stored]])
                     .into_connection(),
             ),
@@ -1128,7 +1342,12 @@ mod tests {
         let mut existing = row();
         existing.kind = "local".into();
         let s = service(
-            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![existing]]),
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![crate::outage::tests::make_project_model(
+                    10,
+                    "checkout-api",
+                )]])
+                .append_query_results([vec![existing]]),
         );
         let spec = temps_credential_checks::provider_presets().remove(0).spec;
         assert!(spec.credential_header.is_some());
@@ -1245,12 +1464,12 @@ mod tests {
         record.kind = "local".into();
         record.secret_id = Some(5);
         record.encrypted_credential = None;
-        let view = HttpCheckView::try_from(record.clone()).unwrap();
+        let view = HttpCheckView::from_row(record.clone()).unwrap();
         assert_eq!(view.kind, CheckKind::Local);
         assert_eq!(view.secret_id, Some(5));
         record.kind = "ping".into();
         assert!(matches!(
-            HttpCheckView::try_from(record),
+            HttpCheckView::from_row(record),
             Err(HttpChecksError::Stored { id: 1 })
         ));
     }
@@ -1307,6 +1526,21 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn a_missing_project_lists_as_project_not_found() {
+        let s = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([
+                    Vec::<std::collections::BTreeMap<String, sea_orm::Value>>::new(),
+                ]),
+        );
+        assert!(matches!(
+            s.list(999_999, 1, 20).await,
+            Err(HttpChecksError::ProjectNotFound {
+                project_id: 999_999
+            })
+        ));
+    }
+    #[tokio::test]
     async fn missing_and_database_failures_remain_typed() {
         let s = service(
             MockDatabase::new(DatabaseBackend::Postgres)
@@ -1355,6 +1589,332 @@ mod tests {
             })
         ));
     }
+    #[test]
+    fn credential_query_values_are_redacted_in_the_view() {
+        assert_eq!(
+            redact_query_credentials(
+                "https://status.example.com/health?region=eu&api_key=s3cret&X-Amz-Signature=abc&page=2"
+            ),
+            "https://status.example.com/health?region=eu&api_key=***&X-Amz-Signature=***&page=2"
+        );
+        assert_eq!(
+            redact_query_credentials("https://status.example.com/health"),
+            "https://status.example.com/health"
+        );
+        assert_eq!(
+            redact_query_credentials("https://status.example.com/health?token="),
+            "https://status.example.com/health?token=",
+            "an empty value has nothing to hide"
+        );
+        assert_eq!(
+            redact_query_credentials("not a url?token=s3cret"),
+            "not a url"
+        );
+        let mut spec = temps_credential_checks::provider_presets().remove(0).spec;
+        spec.url = "https://status.example.com/health?access_token=s3cret".into();
+        let view = HttpCheckSpecView::from(spec);
+        assert!(!view.url.contains("s3cret"), "{}", view.url);
+    }
+    /// A migrated database, or `None` (the test is skipped) only when no
+    /// container runtime is available; any other setup failure fails the test.
+    async fn test_database() -> Option<temps_test_utils::TestDatabase> {
+        match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => Some(db),
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!(
+                    "Docker/TimescaleDB unavailable, skipping http check database test: {error}"
+                );
+                None
+            }
+            Err(error) => panic!("failed to start the http check test database: {error}"),
+        }
+    }
+    /// A save that lands while a run holds the lease leaves that lease alone,
+    /// and the run, when it finishes, schedules from the interval just saved
+    /// rather than the one it read when it was claimed.
+    #[tokio::test]
+    async fn a_save_during_a_run_keeps_its_lease_and_the_new_interval_applies() {
+        let Some(db) = test_database().await else {
+            return;
+        };
+        let conn = db.connection_arc();
+        let now = Utc::now();
+        let project_id = projects::ActiveModel {
+            name: Set("checks".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(format!("checks-{}", uuid::Uuid::new_v4())),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn.as_ref())
+        .await
+        .expect("insert project")
+        .id;
+        let s = HttpChecksService::new(
+            conn.clone(),
+            Arc::new(EncryptionService::new_from_password(
+                "test-only-not-a-live-credential",
+            )),
+            Arc::new(Notifications),
+        )
+        .unwrap();
+        let spec = temps_credential_checks::provider_presets().remove(0).spec;
+        let request = |interval: i32| SaveHttpCheck {
+            name: "issuer".into(),
+            credential: None,
+            interval_seconds: Some(interval),
+            enabled: None,
+            ..http_request(spec.clone())
+        };
+        let created = s
+            .save(
+                project_id,
+                None,
+                SaveHttpCheck {
+                    credential: Some(Some("inline-credential".into())),
+                    ..request(86_400)
+                },
+            )
+            .await
+            .expect("create");
+        let id = created.id;
+
+        // A run claims the check: this row is what that run holds.
+        http_checks::Entity::update_many()
+            .col_expr(
+                http_checks::Column::LeaseToken,
+                Expr::value(Some("run-in-progress".to_string())),
+            )
+            .col_expr(
+                http_checks::Column::LeaseUntil,
+                Expr::value(Some(now + Duration::seconds(60))),
+            )
+            .col_expr(http_checks::Column::LastCheckedAt, Expr::value(Some(now)))
+            .filter(http_checks::Column::Id.eq(id))
+            .exec(conn.as_ref())
+            .await
+            .unwrap();
+        let claimed = s.row(project_id, id).await.expect("claimed row");
+
+        // While it runs, the interval is changed (metadata only).
+        s.save(project_id, Some(id), request(300))
+            .await
+            .expect("interval change");
+        let during = s.row(project_id, id).await.expect("row during the run");
+        assert_eq!(
+            during.lease_token.as_deref(),
+            Some("run-in-progress"),
+            "a metadata-only save leaves the run's lease alone"
+        );
+        assert_eq!(during.interval_seconds, 300);
+
+        // The run finishes with the row it claimed (interval 86400).
+        s.finish_run(&claimed, String::new(), true, now)
+            .await
+            .expect("finish");
+        let after = s.row(project_id, id).await.expect("row after the run");
+        assert!(after.lease_token.is_none(), "the run released its lease");
+        let delay = (after.next_check_at - now).num_seconds();
+        assert!(
+            (299..=301).contains(&delay),
+            "next run follows the saved 300s interval, not the claimed 86400s: {delay}s"
+        );
+    }
+    /// #2113: the view returns the recipe without header values; a PUT that
+    /// omits `enabled`/`interval_seconds` keeps them; a metadata-only save
+    /// keeps the last result; `credential: null` removes the inline one.
+    #[tokio::test]
+    async fn saves_keep_omitted_settings_and_results_and_views_show_the_recipe() {
+        let Some(db) = test_database().await else {
+            return;
+        };
+        let conn = db.connection_arc();
+        let now = Utc::now();
+        let project_id = projects::ActiveModel {
+            name: Set("checks".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(format!("checks-{}", uuid::Uuid::new_v4())),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(conn.as_ref())
+        .await
+        .expect("insert project")
+        .id;
+        let s = HttpChecksService::new(
+            conn.clone(),
+            Arc::new(EncryptionService::new_from_password(
+                "test-only-not-a-live-credential",
+            )),
+            Arc::new(Notifications),
+        )
+        .unwrap();
+        let mut spec = temps_credential_checks::provider_presets().remove(0).spec;
+        spec.headers
+            .insert("X-Api-Version".into(), "write-only-header-value".into());
+        let request = |name: &str, credential: Option<Option<String>>| SaveHttpCheck {
+            name: name.into(),
+            credential,
+            interval_seconds: None,
+            enabled: None,
+            ..http_request(spec.clone())
+        };
+
+        let created = s
+            .save(
+                project_id,
+                None,
+                SaveHttpCheck {
+                    interval_seconds: Some(3600),
+                    ..request("issuer", Some(Some("inline-credential".into())))
+                },
+            )
+            .await
+            .expect("create");
+        assert!(created.has_credential);
+        let recipe = created.spec.as_ref().expect("the recipe is returned");
+        assert_eq!(recipe.url, spec.url);
+        assert_eq!(recipe.header_names, vec!["X-Api-Version".to_string()]);
+        let json = serde_json::to_string(&created).unwrap();
+        assert!(!json.contains("write-only-header-value"), "{json}");
+        assert!(!json.contains("inline-credential"), "{json}");
+        let id = created.id;
+
+        // As if the check had run.
+        let result = serde_json::to_value(VerificationResult::single(
+            CheckStatus::Healthy,
+            "ok",
+            "Credential accepted",
+            now,
+        ))
+        .unwrap();
+        http_checks::Entity::update_many()
+            .col_expr(http_checks::Column::LastResult, Expr::value(result.clone()))
+            .col_expr(http_checks::Column::LastCheckedAt, Expr::value(now))
+            .filter(http_checks::Column::Id.eq(id))
+            .exec(conn.as_ref())
+            .await
+            .unwrap();
+        s.set_enabled(project_id, id, false).await.expect("disable");
+
+        // A rename that omits enabled, interval and credential keeps them all,
+        // and keeps the last result.
+        let renamed = s
+            .save(project_id, Some(id), request("renamed", None))
+            .await
+            .expect("rename");
+        assert_eq!(renamed.name, "renamed");
+        assert!(!renamed.enabled, "omitted enabled is kept");
+        assert_eq!(renamed.interval_seconds, 3600, "omitted interval is kept");
+        assert!(renamed.has_credential);
+        assert!(renamed.result.is_some(), "a rename keeps the last result");
+        assert!(renamed.last_checked_at.is_some());
+
+        // Changing the recipe runs it again.
+        let mut moved = spec.clone();
+        moved.accepted_statuses = vec![200, 204];
+        let changed = s
+            .save(
+                project_id,
+                Some(id),
+                SaveHttpCheck {
+                    spec: Some(moved.clone()),
+                    ..request("renamed", None)
+                },
+            )
+            .await
+            .expect("recipe change");
+        assert!(changed.result.is_none(), "a new recipe clears the result");
+
+        // null removes the inline credential, which this recipe needs.
+        let refused = s
+            .save(
+                project_id,
+                Some(id),
+                SaveHttpCheck {
+                    spec: Some(moved.clone()),
+                    ..request("renamed", Some(None))
+                },
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(HttpChecksError::Invalid { .. })),
+            "{refused:?}"
+        );
+        let mut no_credential = moved;
+        no_credential.credential_header = None;
+        let cleared = s
+            .save(
+                project_id,
+                Some(id),
+                SaveHttpCheck {
+                    spec: Some(no_credential),
+                    ..request("renamed", Some(None))
+                },
+            )
+            .await
+            .expect("clear the credential");
+        assert!(!cleared.has_credential);
+    }
+    /// #2113: names count characters, and each invalid field is named with
+    /// its value.
+    #[tokio::test]
+    async fn name_and_interval_errors_name_their_field() {
+        let s = service(MockDatabase::new(DatabaseBackend::Postgres));
+        let spec = temps_credential_checks::provider_presets().remove(0).spec;
+        for (name, interval, field, needle) in [
+            ("", 86400, "name", "got 0"),
+            (&*"é".repeat(121), 86400, "name", "got 121"),
+            ("check", 1, "interval_seconds", "got 1"),
+        ] {
+            match s
+                .save(
+                    10,
+                    None,
+                    SaveHttpCheck {
+                        name: name.into(),
+                        interval_seconds: Some(interval),
+                        ..http_request(spec.clone())
+                    },
+                )
+                .await
+            {
+                Err(error @ HttpChecksError::InvalidField { field: f, .. }) => {
+                    assert_eq!(f, field);
+                    assert!(error.to_string().contains(needle), "{error}");
+                }
+                other => panic!("{name:?}/{interval}: {other:?}"),
+            }
+        }
+        // 61 two-byte characters fit: the limit is in characters.
+        let error = s
+            .save(
+                10,
+                None,
+                SaveHttpCheck {
+                    name: "é".repeat(61),
+                    ..http_request(spec.clone())
+                },
+            )
+            .await
+            .expect_err("refused later, for the missing credential");
+        assert!(
+            !matches!(error, HttpChecksError::InvalidField { .. }),
+            "{error:?}"
+        );
+    }
     #[tokio::test]
     async fn save_rejects_invalid_input_before_database_or_network_access() {
         let s = service(MockDatabase::new(DatabaseBackend::Postgres));
@@ -1366,25 +1926,25 @@ mod tests {
                     None,
                     SaveHttpCheck {
                         name: name.into(),
-                        interval_seconds: interval,
+                        interval_seconds: Some(interval),
                         ..http_request(spec.clone())
                     }
                 )
                 .await,
-                Err(HttpChecksError::Invalid { .. })
+                Err(HttpChecksError::InvalidField { .. })
             ));
         }
     }
     #[test]
     fn responses_never_serialize_secrets_and_corrupt_results_fail_closed() {
-        let view = HttpCheckView::try_from(row()).unwrap();
+        let view = HttpCheckView::from_row(row()).unwrap();
         let json = serde_json::to_string(&view).unwrap();
         assert!(!json.contains("ciphertext"));
         assert!(!json.contains("encrypted"));
         let mut record = row();
         record.last_result = Some(serde_json::json!({"unexpected":"value"}));
         assert!(matches!(
-            HttpCheckView::try_from(record),
+            HttpCheckView::from_row(record),
             Err(HttpChecksError::Stored { .. })
         ));
     }

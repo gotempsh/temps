@@ -268,6 +268,8 @@ Archive a flag (callers fall back to their own default)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
+| `--purge` | Delete an already archived flag for good, freeing its key | - | No |
+| `-y, --yes` | Skip the confirmation for --purge | - | No |
 
 ### `flags record-exposure`
 

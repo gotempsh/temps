@@ -122,7 +122,10 @@ impl AuthMiddleware {
         // unreachable from a hostile page, so neither is affected.
         let mut cookie_session = false;
 
-        // Extract auth context - simplified to avoid Send issues
+        // Extract auth context. Each lookup answers valid, rejected or
+        // unavailable: a credential the database could not be asked about is
+        // not a wrong credential, and must not be answered with a 401 the
+        // client reads as "your key is revoked" (a 401 is not retryable).
         let auth_context = if let Some(auth_header) = req.headers().get("authorization") {
             if let Ok(auth_str) = auth_header.to_str() {
                 if auth_str.starts_with("Bearer ") {
@@ -130,31 +133,45 @@ impl AuthMiddleware {
 
                     // Try API key first (they have a specific format: tk_...)
                     if token.starts_with("tk_") || token.starts_with("tkp_") {
-                        if let Ok(validated) = self
-                            .api_key_service
-                            .validate_api_key_with_scope(token)
-                            .await
-                        {
-                            user = Some(validated.user.clone());
-                            Some(validated.into_auth_context())
-                        } else {
-                            None
+                        let lookup =
+                            bounded_lookup(self.api_key_service.validate_api_key_with_scope(token))
+                                .await;
+                        match classify_api_key_lookup(lookup) {
+                            CredentialLookup::Valid(validated) => {
+                                user = Some(validated.user.clone());
+                                Some(validated.into_auth_context())
+                            }
+                            CredentialLookup::Rejected => None,
+                            CredentialLookup::Unavailable(reason) => {
+                                return Ok(credential_check_unavailable(
+                                    CredentialKind::ApiKey,
+                                    &reason,
+                                ));
+                            }
                         }
                     } else if token.starts_with("dt_") {
                         // Try deployment token (they have a specific format: dt_...)
-                        if let Ok(validated) =
-                            self.deployment_token_service.validate_token(token).await
-                        {
-                            Some(crate::context::AuthContext::new_deployment_token(
-                                validated.project_id,
-                                validated.environment_id,
-                                validated.deployment_id,
-                                validated.token_id,
-                                validated.name,
-                                validated.permissions,
-                            ))
-                        } else {
-                            None
+                        let lookup =
+                            bounded_lookup(self.deployment_token_service.validate_token(token))
+                                .await;
+                        match classify_deployment_token_lookup(lookup) {
+                            CredentialLookup::Valid(validated) => {
+                                Some(crate::context::AuthContext::new_deployment_token(
+                                    validated.project_id,
+                                    validated.environment_id,
+                                    validated.deployment_id,
+                                    validated.token_id,
+                                    validated.name,
+                                    validated.permissions,
+                                ))
+                            }
+                            CredentialLookup::Rejected => None,
+                            CredentialLookup::Unavailable(reason) => {
+                                return Ok(credential_check_unavailable(
+                                    CredentialKind::DeploymentToken,
+                                    &reason,
+                                ));
+                            }
                         }
                     } else {
                         None
@@ -181,31 +198,36 @@ impl AuthMiddleware {
                 secure_cookies,
                 &self.cookie_crypto,
             ) {
-                if let Ok(verified) = self
-                    .auth_service
-                    .verify_session_details(&session_token)
-                    .await
-                {
-                    let session_user = verified.user;
-                    // Resolved from the database on every request (never
-                    // cached on the session), so a role removal applies to
-                    // this session's very next request. A lookup failure
-                    // degrades to the least-privileged session role.
-                    let user_role = self
-                        .user_service
-                        .current_session_role(session_user.id)
-                        .await
-                        .unwrap_or(crate::permissions::Role::User);
-                    user = Some(session_user.clone());
-                    cookie_session = true;
+                let lookup =
+                    bounded_lookup(self.auth_service.verify_session_details(&session_token)).await;
+                match classify_session_lookup(lookup) {
+                    CredentialLookup::Valid(verified) => {
+                        let session_user = verified.user;
+                        // Resolved from the database on every request (never
+                        // cached on the session), so a role removal applies to
+                        // this session's very next request. A lookup failure
+                        // degrades to the least-privileged session role.
+                        let user_role = self
+                            .user_service
+                            .current_session_role(session_user.id)
+                            .await
+                            .unwrap_or(crate::permissions::Role::User);
+                        user = Some(session_user.clone());
+                        cookie_session = true;
 
-                    Some(crate::context::AuthContext::new_persisted_session(
-                        session_user,
-                        user_role,
-                        verified.session_id,
-                    ))
-                } else {
-                    None
+                        Some(crate::context::AuthContext::new_persisted_session(
+                            session_user,
+                            user_role,
+                            verified.session_id,
+                        ))
+                    }
+                    CredentialLookup::Rejected => None,
+                    CredentialLookup::Unavailable(reason) => {
+                        return Ok(credential_check_unavailable(
+                            CredentialKind::Session,
+                            &reason,
+                        ));
+                    }
                 }
             } else {
                 None
@@ -306,6 +328,148 @@ impl AuthMiddleware {
     ) -> Option<String> {
         crate::auth_cookies::read_sealed(headers, crate::auth_cookies::SESSION, secure, crypto)
     }
+}
+
+/// How long one credential lookup may take before the request is answered
+/// with a 503. The lookups are a few indexed reads that take milliseconds; a
+/// lookup still waiting after this long is queued on a database that cannot
+/// be reached, and holding the request for the pool's acquire timeout on
+/// every query (minutes in total) only delays the same answer.
+const CREDENTIAL_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Seconds a client is asked to wait before retrying a credential check the
+/// server could not complete.
+const CREDENTIAL_CHECK_RETRY_AFTER_SECS: u64 = 5;
+
+/// Problem `type` of the 503 answered when a credential could not be checked.
+pub const CREDENTIAL_CHECK_UNAVAILABLE_PROBLEM_TYPE: &str =
+    "https://temps.sh/probs/credential-check-unavailable";
+
+/// The outcome of looking one credential up.
+#[derive(Debug)]
+enum CredentialLookup<T> {
+    /// The credential is valid.
+    Valid(T),
+    /// The credential is unknown, revoked, expired or otherwise refused: the
+    /// request is anonymous, and a protected route answers 401.
+    Rejected,
+    /// The lookup itself failed (the database could not be reached or timed
+    /// out): nothing is known about the credential.
+    Unavailable(String),
+}
+
+/// A lookup that timed out, as distinct from one that returned an error.
+#[derive(Debug)]
+struct LookupTimedOut;
+
+async fn bounded_lookup<T, E>(
+    lookup: impl Future<Output = Result<T, E>>,
+) -> Result<Result<T, E>, LookupTimedOut> {
+    tokio::time::timeout(CREDENTIAL_LOOKUP_TIMEOUT, lookup)
+        .await
+        .map_err(|_| LookupTimedOut)
+}
+
+fn timed_out_reason() -> String {
+    format!(
+        "the credential lookup did not finish within {}s",
+        CREDENTIAL_LOOKUP_TIMEOUT.as_secs()
+    )
+}
+
+fn classify_api_key_lookup<T>(
+    lookup: Result<Result<T, crate::apikey_service::ApiKeyServiceError>, LookupTimedOut>,
+) -> CredentialLookup<T> {
+    use crate::apikey_service::ApiKeyServiceError as E;
+    match lookup {
+        Ok(Ok(validated)) => CredentialLookup::Valid(validated),
+        Ok(Err(E::DatabaseError(error))) => CredentialLookup::Unavailable(error.to_string()),
+        // Unknown, inactive, expired or mis-scoped keys, and a key whose
+        // stored permissions cannot be read: the key itself is refused.
+        Ok(Err(
+            E::NotFound(_)
+            | E::ValidationError(_)
+            | E::Unauthorized(_)
+            | E::Conflict(_)
+            | E::InternalServerError(_)
+            | E::InvalidName { .. }
+            | E::ExpiryInPast { .. }
+            | E::PermissionsNeedCustomRole { .. }
+            | E::PermissionsImmutable { .. }
+            | E::ExpiryRequired { .. },
+        )) => CredentialLookup::Rejected,
+        Err(LookupTimedOut) => CredentialLookup::Unavailable(timed_out_reason()),
+    }
+}
+
+fn classify_deployment_token_lookup<T>(
+    lookup: Result<
+        Result<T, crate::deployment_token_service::DeploymentTokenValidationError>,
+        LookupTimedOut,
+    >,
+) -> CredentialLookup<T> {
+    use crate::deployment_token_service::DeploymentTokenValidationError as E;
+    match lookup {
+        Ok(Ok(validated)) => CredentialLookup::Valid(validated),
+        Ok(Err(E::DatabaseError(error))) => CredentialLookup::Unavailable(error.to_string()),
+        Ok(Err(E::InvalidToken | E::TokenExpired | E::TokenInactive)) => CredentialLookup::Rejected,
+        Err(LookupTimedOut) => CredentialLookup::Unavailable(timed_out_reason()),
+    }
+}
+
+fn classify_session_lookup<T>(
+    lookup: Result<Result<T, crate::auth_service::AuthError>, LookupTimedOut>,
+) -> CredentialLookup<T> {
+    use crate::auth_service::AuthError as E;
+    match lookup {
+        Ok(Ok(verified)) => CredentialLookup::Valid(verified),
+        Ok(Err(E::DatabaseError { reason })) => CredentialLookup::Unavailable(reason),
+        Ok(Err(E::DatabaseConnectionError(reason))) => CredentialLookup::Unavailable(reason),
+        // Session verification only reads two rows; every other variant
+        // (not found, expired, deleted user) means the session is refused.
+        Ok(Err(_)) => CredentialLookup::Rejected,
+        Err(LookupTimedOut) => CredentialLookup::Unavailable(timed_out_reason()),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CredentialKind {
+    ApiKey,
+    DeploymentToken,
+    Session,
+}
+
+impl CredentialKind {
+    fn label(self) -> &'static str {
+        match self {
+            CredentialKind::ApiKey => "API key",
+            CredentialKind::DeploymentToken => "deployment token",
+            CredentialKind::Session => "session",
+        }
+    }
+}
+
+/// The 503 for a credential the server could not check. The database
+/// error stays in the log; the client is told only that the check, not its
+/// credential, failed, and when to try again.
+fn credential_check_unavailable(kind: CredentialKind, reason: &str) -> Response {
+    tracing::error!(
+        credential = kind.label(),
+        reason = %reason,
+        "Could not check the request's credential: the database lookup failed; \
+         answering 503 instead of treating the request as unauthenticated"
+    );
+    temps_core::problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+        .with_type(CREDENTIAL_CHECK_UNAVAILABLE_PROBLEM_TYPE)
+        .with_title("Credential Check Unavailable")
+        .with_detail(format!(
+            "The server could not check this request's {} because its database is \
+             unavailable. The credential was not rejected; retry after {} seconds",
+            kind.label(),
+            CREDENTIAL_CHECK_RETRY_AFTER_SECS
+        ))
+        .with_retry_after(CREDENTIAL_CHECK_RETRY_AFTER_SECS)
+        .into_response()
 }
 
 /// The console's answer to a cookie-authenticated request from another
@@ -731,6 +895,183 @@ mod tests {
     /// this middleware. `/logout` stands in for the ~150 session-reachable
     /// writes: the decision is made here, before routing, so it does not
     /// depend on the handler, its body or its content type.
+    /// A credential the database could not be asked about is a 503, not the
+    /// 401 a client reads as "your key is wrong".
+    mod database_unavailable {
+        use super::super::{
+            classify_api_key_lookup, classify_deployment_token_lookup, classify_session_lookup,
+            CredentialLookup, LookupTimedOut, CREDENTIAL_CHECK_UNAVAILABLE_PROBLEM_TYPE,
+        };
+        use crate::http_test_support::{auth_state, router};
+        use axum::http::StatusCode;
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase, RuntimeErr};
+        use std::sync::Arc;
+
+        fn unreachable_db() -> Arc<sea_orm::DatabaseConnection> {
+            let error = || DbErr::Conn(RuntimeErr::Internal("connection refused".to_string()));
+            Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_errors(vec![error(), error(), error(), error()])
+                    .into_connection(),
+            )
+        }
+
+        fn empty_db() -> Arc<sea_orm::DatabaseConnection> {
+            Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![Vec::<temps_entities::api_keys::Model>::new()])
+                    .append_query_results(vec![
+                        Vec::<temps_entities::deployment_tokens::Model>::new(),
+                    ])
+                    .append_query_results(vec![Vec::<temps_entities::sessions::Model>::new()])
+                    .into_connection(),
+            )
+        }
+
+        async fn get_me(
+            db: Arc<sea_orm::DatabaseConnection>,
+            header: (&str, &str),
+        ) -> (StatusCode, serde_json::Value, Option<String>) {
+            let app = router(auth_state(db.clone()), db);
+            let request = axum::http::Request::builder()
+                .method("GET")
+                .uri("/user/me")
+                .header(header.0, header.1)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let response = tower::ServiceExt::oneshot(app, request)
+                .await
+                .expect("router answers");
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, body, retry_after)
+        }
+
+        fn assert_unavailable(
+            status: StatusCode,
+            body: &serde_json::Value,
+            retry_after: Option<String>,
+            credential: &str,
+        ) {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(body["type"], CREDENTIAL_CHECK_UNAVAILABLE_PROBLEM_TYPE);
+            let detail = body["detail"].as_str().expect("detail");
+            assert!(detail.contains(credential), "{detail}");
+            assert!(
+                !detail.contains("connection refused"),
+                "the database error stays in the log: {detail}"
+            );
+            assert_eq!(retry_after.as_deref(), Some("5"));
+        }
+
+        #[tokio::test]
+        async fn an_api_key_the_database_cannot_check_is_a_503_with_retry_after() {
+            let (status, body, retry_after) = get_me(
+                unreachable_db(),
+                (
+                    "authorization",
+                    "Bearer tk_0123456789abcdef0123456789abcdef",
+                ),
+            )
+            .await;
+            assert_unavailable(status, &body, retry_after, "API key");
+        }
+
+        #[tokio::test]
+        async fn a_deployment_token_the_database_cannot_check_is_a_503() {
+            let (status, body, retry_after) = get_me(
+                unreachable_db(),
+                (
+                    "authorization",
+                    "Bearer dt_0123456789abcdef0123456789abcdef",
+                ),
+            )
+            .await;
+            assert_unavailable(status, &body, retry_after, "deployment token");
+        }
+
+        #[tokio::test]
+        async fn a_session_the_database_cannot_check_is_a_503() {
+            let db = unreachable_db();
+            let state = auth_state(db.clone());
+            let sealed = state
+                .cookie_crypto
+                .encrypt("some-session-token")
+                .expect("seal");
+            let (status, body, retry_after) =
+                get_me(db, ("cookie", &format!("session={sealed}"))).await;
+            assert_unavailable(status, &body, retry_after, "session");
+        }
+
+        #[tokio::test]
+        async fn an_unknown_api_key_is_still_a_401() {
+            let (status, _, retry_after) = get_me(
+                empty_db(),
+                (
+                    "authorization",
+                    "Bearer tk_0123456789abcdef0123456789abcdef",
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(retry_after, None);
+        }
+
+        #[test]
+        fn refused_credentials_are_rejected_not_unavailable() {
+            use crate::apikey_service::ApiKeyServiceError;
+            use crate::auth_service::AuthError;
+            use crate::deployment_token_service::DeploymentTokenValidationError;
+
+            assert!(matches!(
+                classify_api_key_lookup::<()>(Ok(Err(ApiKeyServiceError::Unauthorized(
+                    "API key has expired".into()
+                )))),
+                CredentialLookup::Rejected
+            ));
+            assert!(matches!(
+                classify_deployment_token_lookup::<()>(Ok(Err(
+                    DeploymentTokenValidationError::TokenInactive
+                ))),
+                CredentialLookup::Rejected
+            ));
+            assert!(matches!(
+                classify_session_lookup::<()>(Ok(Err(AuthError::NotFound(
+                    "Session not found or expired".into()
+                )))),
+                CredentialLookup::Rejected
+            ));
+        }
+
+        #[test]
+        fn a_lookup_that_timed_out_is_unavailable() {
+            assert!(matches!(
+                classify_api_key_lookup::<()>(Err(LookupTimedOut)),
+                CredentialLookup::Unavailable(_)
+            ));
+            assert!(matches!(
+                classify_session_lookup::<()>(Err(LookupTimedOut)),
+                CredentialLookup::Unavailable(_)
+            ));
+            assert!(matches!(
+                classify_session_lookup::<()>(Ok(Err(
+                    crate::auth_service::AuthError::DatabaseError {
+                        reason: "pool timed out".into()
+                    }
+                ))),
+                CredentialLookup::Unavailable(_)
+            ));
+        }
+    }
+
     mod same_origin_http {
         use crate::apikey_service::CreateApiKeyRequest;
         use crate::http_test_support::{

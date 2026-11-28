@@ -37,6 +37,7 @@ pub mod gate_access;
 /// Internal access grants on the route-sync wire (ADR 101).
 pub mod internal_access;
 pub mod jobs;
+pub mod json_body_guard;
 pub mod known_proxies;
 pub mod log_series;
 pub mod log_storage_config;
@@ -49,6 +50,7 @@ pub mod managed_service_pki;
 pub mod node_address;
 pub mod node_pki;
 pub mod notifications;
+pub mod nullable;
 pub mod on_demand;
 pub mod openapi;
 pub mod pagination;

@@ -31,6 +31,7 @@ const check = (overrides: Partial<HttpCheckView>): HttpCheckView => ({
   next_check_at: '2026-10-03T00:00:00Z',
   last_checked_at: null,
   result: null,
+  has_credential: false,
   ...overrides,
 })
 

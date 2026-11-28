@@ -324,6 +324,36 @@ impl Model {
     }
 }
 
+/// Whether a live project with this id exists: present and not soft-deleted.
+///
+/// The check project-scoped API endpoints run before they list or create
+/// children, so a missing (or mistyped) project is a 404 rather than an
+/// empty list or a foreign-key violation surfaced as a 500. One indexed
+/// primary-key read.
+pub async fn live_project_exists<C: ConnectionTrait>(
+    db: &C,
+    project_id: i32,
+) -> Result<bool, DbErr> {
+    use sea_orm::QuerySelect;
+
+    /// Read by column name, so a row carrying more columns decodes too.
+    #[derive(sea_orm::FromQueryResult)]
+    struct ProjectId {
+        #[allow(dead_code, reason = "only the row's presence is used")]
+        id: i32,
+    }
+
+    let found = Entity::find_by_id(project_id)
+        .filter(Column::IsDeleted.eq(false))
+        .filter(Column::DeletedAt.is_null())
+        .select_only()
+        .column(Column::Id)
+        .into_model::<ProjectId>()
+        .one(db)
+        .await?;
+    Ok(found.is_some())
+}
+
 /// The ownership token stored in [`Model::instantiation_token`] for the
 /// project created for `template_service` by instantiation `instantiation_id`.
 ///

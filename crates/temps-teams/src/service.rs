@@ -6,9 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use sea_orm::{
-    sea_query::{LockType, OnConflict},
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    sea_query::LockType, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use temps_auth::permissions::Permission;
@@ -46,10 +45,17 @@ pub struct CreateTeamRequest {
     pub description: Option<String>,
 }
 
+/// Changes to a team; omitted fields are kept. Unknown fields (a team's slug
+/// cannot change) are refused rather than ignored.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateTeamRequest {
     pub name: Option<String>,
-    pub description: Option<String>,
+    /// New description; `null` (or an empty string) clears it. Omit it to
+    /// keep the current one.
+    #[serde(default, deserialize_with = "temps_core::nullable::deserialize")]
+    #[schema(value_type = Option<String>, nullable)]
+    pub description: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -61,6 +67,20 @@ pub struct CreateTeamMemberRequest {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateProjectAccessRequest {
     pub team_id: i32,
+    pub role: TeamRole,
+}
+
+/// Whether a grant write creates a grant or changes an existing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrantWrite {
+    Create,
+    Update,
+}
+
+/// The new role of an existing project grant.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateProjectAccessRequest {
     pub role: TeamRole,
 }
 
@@ -267,6 +287,25 @@ pub trait TeamService: Send + Sync {
         authz: &GrantAuthz,
     ) -> Result<project_team_access::Model, TeamError>;
 
+    /// Change the role of an existing grant; [`TeamError::ProjectAccessNotFound`]
+    /// when the team has none on the project. Same authorization rules as a
+    /// grant.
+    async fn update_project_access(
+        &self,
+        actor_user_id: i32,
+        project_id: i32,
+        team_id: i32,
+        role: TeamRole,
+        authz: &GrantAuthz,
+    ) -> Result<project_team_access::Model, TeamError>;
+
+    /// One team's grant on a project.
+    async fn get_project_access(
+        &self,
+        project_id: i32,
+        team_id: i32,
+    ) -> Result<project_team_access::Model, TeamError>;
+
     async fn list_project_access(
         &self,
         project_id: i32,
@@ -357,6 +396,183 @@ impl DefaultTeamService {
             });
         }
         Ok(())
+    }
+
+    /// Create a grant ([`GrantWrite::Create`]: refused with
+    /// [`TeamError::DuplicateProjectAccess`] when the team already has one) or
+    /// change its role ([`GrantWrite::Update`]: refused with
+    /// [`TeamError::ProjectAccessNotFound`] when it has none). Both run every
+    /// authorization rule against the project's grants locked in one
+    /// transaction.
+    async fn write_project_access(
+        &self,
+        actor_user_id: i32,
+        project_id: i32,
+        team_id: i32,
+        role: TeamRole,
+        authz: &GrantAuthz,
+        mode: GrantWrite,
+    ) -> Result<project_team_access::Model, TeamError> {
+        let txn = self.db.begin().await?;
+
+        // A missing project is a 404 for it before any rule below runs:
+        // with no grants it would otherwise read as "restricting an open
+        // project" (403), or, for an admin, as a foreign-key violation.
+        // Existence is no secret here: the route's access guard already let
+        // this caller address the project id.
+        if !projects::live_project_exists(&txn, project_id).await? {
+            return Err(TeamError::ProjectNotFound { project_id });
+        }
+
+        // Lock this project's grants for the duration. Every rule below is
+        // evaluated against the locked set, so a concurrent mutation can't
+        // change the answer between the check and the write.
+        let grants = project_team_access::Entity::find()
+            .filter(project_team_access::Column::ProjectId.eq(project_id))
+            .lock(LockType::Update)
+            .all(&txn)
+            .await?;
+
+        // Resolved on `txn`, from the rows just locked above — so the
+        // permissions this decision rests on and the rows it is about to
+        // write are the same snapshot.
+        let authz = ResolvedAuthz::resolve(
+            &txn,
+            self.checker.as_deref(),
+            authz,
+            actor_user_id,
+            project_id,
+            &grants,
+        )
+        .await?;
+
+        let existing = grants.iter().find(|g| g.team_id == team_id);
+        if !authz.is_instance_admin {
+            // Adding the first grant gates a previously-open project and
+            // locks out everyone who isn't in the named team. (An update
+            // needs an existing grant, so it is never the first one.)
+            if grants.is_empty() && mode == GrantWrite::Create {
+                return Err(TeamError::GatingRequiresAdmin);
+            }
+            if !authz.holds(&Permission::ProjectsWrite) {
+                return Err(TeamError::ProjectPermissionDenied {
+                    project_id,
+                    required: Permission::ProjectsWrite.to_string(),
+                });
+            }
+            // The role being written...
+            authz.check_role_ceiling(role)?;
+            // ...and the role being overwritten, if this replaces a grant.
+            // Without this a project-admin could demote an `owner` team to
+            // `viewer` and become the highest authority on the project.
+            if let Some(existing) = existing {
+                authz.check_role_ceiling(parse_stored_role(
+                    "project_team_access",
+                    existing.id,
+                    &existing.role,
+                )?)?;
+            }
+        }
+
+        // Only now, with every rule that could deny checked, say whether the
+        // grant exists: a create must not silently replace one, and an
+        // update needs one to change.
+        match (mode, existing) {
+            (GrantWrite::Create, Some(_)) => {
+                return Err(TeamError::DuplicateProjectAccess {
+                    project_id,
+                    team_id,
+                })
+            }
+            (GrantWrite::Update, None) => {
+                return Err(TeamError::ProjectAccessNotFound {
+                    project_id,
+                    team_id,
+                })
+            }
+            _ => {}
+        }
+
+        // Reporting "no such team" here is not the enumeration oracle that
+        // `list_team_projects` was: every check that could deny is above
+        // this line, so only an instance admin or someone who already holds
+        // `projects:write` on this project gets here — and they can tell an
+        // existing team from a missing one anyway, because for an existing
+        // one the grant simply succeeds. Answering generically would buy no
+        // secrecy and would tell a project admin they lack a permission they
+        // hold, sending them to look for a problem that isn't there.
+        // Keep this lookup last.
+        let written = match (mode, existing) {
+            (GrantWrite::Update, Some(existing)) => {
+                let mut active: project_team_access::ActiveModel = existing.clone().into();
+                active.role = Set(role.to_string());
+                active.granted_by = Set(actor_user_id);
+                active.updated_at = Set(Utc::now());
+                active.update(&txn).await?
+            }
+            _ => {
+                if teams::Entity::find_by_id(team_id)
+                    .one(&txn)
+                    .await?
+                    .is_none()
+                {
+                    return Err(TeamError::NotFound { team_id });
+                }
+                let now = Utc::now();
+                let model = project_team_access::ActiveModel {
+                    project_id: Set(project_id),
+                    team_id: Set(team_id),
+                    role: Set(role.to_string()),
+                    granted_by: Set(actor_user_id),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                    ..Default::default()
+                };
+                // A concurrent create of the same grant is caught by the
+                // unique index; it is the same conflict as the check above.
+                match model.insert(&txn).await {
+                    Ok(inserted) => inserted,
+                    Err(e) if is_unique_violation(&e) => {
+                        return Err(TeamError::DuplicateProjectAccess {
+                            project_id,
+                            team_id,
+                        })
+                    }
+                    Err(e) => return Err(TeamError::Database(e)),
+                }
+            }
+        };
+
+        // Gating a previously open project locks out everyone outside the
+        // team, and replacing a team's role can demote its members; either
+        // way grants minted under the old access are revoked. Adding a team
+        // to an already gated project only widens access.
+        let replaces_role = existing.is_some();
+        if grants.is_empty() || replaces_role {
+            temps_auth::ingress_grants::revoke_for_project(&txn, project_id)
+                .await
+                .map_err(|e| TeamError::IngressGrantRevocation {
+                    scope: format!("project {project_id} (team access changed)"),
+                    reason: e.to_string(),
+                })?;
+        }
+
+        txn.commit().await?;
+
+        // Granting access changes which users may reach this project.
+        //
+        // Deliberately after the commit and outside the transaction: the
+        // cache is not a source of truth, so it must never be invalidated
+        // for a write that then rolls back. The cost is that a crash in
+        // this window leaves the read caches stale until the 60 s TTL
+        // expires. That is bounded and read-only — and the *write* gate
+        // does not consult the cache at all (see `ResolvedAuthz::resolve`),
+        // so a stale entry cannot be escalated into a privilege change.
+        if let Some(ref checker) = self.checker {
+            checker.invalidate_project(project_id).await;
+        }
+
+        Ok(written)
     }
 
     fn normalize_page(page: Option<u64>, page_size: Option<u64>) -> (u64, u64) {
@@ -454,7 +670,8 @@ impl TeamService for DefaultTeamService {
             active.name = Set(name.trim().to_string());
         }
         if let Some(description) = req.description {
-            active.description = Set(Some(description));
+            active.description =
+                Set(description.filter(|description| !description.trim().is_empty()));
         }
         active.updated_at = Set(Utc::now());
 
@@ -758,152 +975,63 @@ impl TeamService for DefaultTeamService {
         req: CreateProjectAccessRequest,
         authz: &GrantAuthz,
     ) -> Result<project_team_access::Model, TeamError> {
-        let txn = self.db.begin().await?;
-
-        // Lock this project's grants for the duration. Every rule below is
-        // evaluated against the locked set, so a concurrent mutation can't
-        // change the answer between the check and the write.
-        let grants = project_team_access::Entity::find()
-            .filter(project_team_access::Column::ProjectId.eq(project_id))
-            .lock(LockType::Update)
-            .all(&txn)
-            .await?;
-
-        // Resolved on `txn`, from the rows just locked above — so the
-        // permissions this decision rests on and the rows it is about to
-        // write are the same snapshot.
-        let authz = ResolvedAuthz::resolve(
-            &txn,
-            self.checker.as_deref(),
-            authz,
+        self.write_project_access(
             actor_user_id,
             project_id,
-            &grants,
+            req.team_id,
+            req.role,
+            authz,
+            GrantWrite::Create,
         )
-        .await?;
+        .await
+    }
 
-        if !authz.is_instance_admin {
-            // Adding the first grant gates a previously-open project and
-            // locks out everyone who isn't in the named team.
-            if grants.is_empty() {
-                return Err(TeamError::GatingRequiresAdmin);
-            }
-            if !authz.holds(&Permission::ProjectsWrite) {
-                return Err(TeamError::ProjectPermissionDenied {
-                    project_id,
-                    required: Permission::ProjectsWrite.to_string(),
-                });
-            }
-            // The role being written...
-            authz.check_role_ceiling(req.role)?;
-            // ...and the role being overwritten, if this replaces a grant.
-            // Without this a project-admin could demote an `owner` team to
-            // `viewer` and become the highest authority on the project.
-            if let Some(existing) = grants.iter().find(|g| g.team_id == req.team_id) {
-                authz.check_role_ceiling(parse_stored_role(
-                    "project_team_access",
-                    existing.id,
-                    &existing.role,
-                )?)?;
-            }
+    async fn update_project_access(
+        &self,
+        actor_user_id: i32,
+        project_id: i32,
+        team_id: i32,
+        role: TeamRole,
+        authz: &GrantAuthz,
+    ) -> Result<project_team_access::Model, TeamError> {
+        self.write_project_access(
+            actor_user_id,
+            project_id,
+            team_id,
+            role,
+            authz,
+            GrantWrite::Update,
+        )
+        .await
+    }
+
+    async fn get_project_access(
+        &self,
+        project_id: i32,
+        team_id: i32,
+    ) -> Result<project_team_access::Model, TeamError> {
+        if !projects::live_project_exists(self.db.as_ref(), project_id).await? {
+            return Err(TeamError::ProjectNotFound { project_id });
         }
-
-        // Reporting "no such team" here is not the enumeration oracle that
-        // `list_team_projects` was: every check that could deny is above
-        // this line, so only an instance admin or someone who already holds
-        // `projects:write` on this project gets here — and they can tell an
-        // existing team from a missing one anyway, because for an existing
-        // one the grant simply succeeds. Answering generically would buy no
-        // secrecy and would tell a project admin they lack a permission they
-        // hold, sending them to look for a problem that isn't there.
-        // Keep this lookup last.
-        if teams::Entity::find_by_id(req.team_id)
-            .one(&txn)
+        project_team_access::Entity::find()
+            .filter(project_team_access::Column::ProjectId.eq(project_id))
+            .filter(project_team_access::Column::TeamId.eq(team_id))
+            .one(self.db.as_ref())
             .await?
-            .is_none()
-        {
-            return Err(TeamError::NotFound {
-                team_id: req.team_id,
-            });
-        }
-        // A non-existent project_id violates `fk_project_team_access_project`
-        // and would otherwise surface as an opaque 500.
-        if projects::Entity::find_by_id(project_id)
-            .one(&txn)
-            .await?
-            .is_none()
-        {
-            return Err(TeamError::Validation {
-                message: format!("Project {project_id} does not exist"),
-            });
-        }
-
-        let now = Utc::now();
-        let model = project_team_access::ActiveModel {
-            project_id: Set(project_id),
-            team_id: Set(req.team_id),
-            role: Set(req.role.to_string()),
-            granted_by: Set(actor_user_id),
-            created_at: Set(now),
-            updated_at: Set(now),
-            ..Default::default()
-        };
-
-        // Upsert: if a grant already exists, update the role instead of
-        // failing. "Set team X to deployer on this project" should be
-        // idempotent.
-        let inserted = project_team_access::Entity::insert(model)
-            .on_conflict(
-                OnConflict::columns([
-                    project_team_access::Column::ProjectId,
-                    project_team_access::Column::TeamId,
-                ])
-                .update_columns([
-                    project_team_access::Column::Role,
-                    project_team_access::Column::GrantedBy,
-                    project_team_access::Column::UpdatedAt,
-                ])
-                .to_owned(),
-            )
-            .exec_with_returning(&txn)
-            .await?;
-
-        // Gating a previously open project locks out everyone outside the
-        // team, and replacing a team's role can demote its members; either
-        // way grants minted under the old access are revoked. Adding a team
-        // to an already gated project only widens access.
-        let replaces_role = grants.iter().any(|g| g.team_id == req.team_id);
-        if grants.is_empty() || replaces_role {
-            temps_auth::ingress_grants::revoke_for_project(&txn, project_id)
-                .await
-                .map_err(|e| TeamError::IngressGrantRevocation {
-                    scope: format!("project {project_id} (team access changed)"),
-                    reason: e.to_string(),
-                })?;
-        }
-
-        txn.commit().await?;
-
-        // Granting access changes which users may reach this project.
-        //
-        // Deliberately after the commit and outside the transaction: the
-        // cache is not a source of truth, so it must never be invalidated
-        // for a write that then rolls back. The cost is that a crash in
-        // this window leaves the read caches stale until the 60 s TTL
-        // expires. That is bounded and read-only — and the *write* gate
-        // does not consult the cache at all (see `ResolvedAuthz::resolve`),
-        // so a stale entry cannot be escalated into a privilege change.
-        if let Some(ref checker) = self.checker {
-            checker.invalidate_project(project_id).await;
-        }
-
-        Ok(inserted)
+            .ok_or(TeamError::ProjectAccessNotFound {
+                project_id,
+                team_id,
+            })
     }
 
     async fn list_project_access(
         &self,
         project_id: i32,
     ) -> Result<Vec<project_team_access::Model>, TeamError> {
+        // A missing project is a 404, not an empty list of grants.
+        if !projects::live_project_exists(self.db.as_ref(), project_id).await? {
+            return Err(TeamError::ProjectNotFound { project_id });
+        }
         Ok(project_team_access::Entity::find()
             .filter(project_team_access::Column::ProjectId.eq(project_id))
             .order_by_asc(project_team_access::Column::CreatedAt)
@@ -1413,6 +1541,59 @@ mod tests {
         }
     }
 
+    /// The row `live_project_exists` selects (only the id column).
+    fn project_id_row(id: i32) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([("id".to_string(), sea_orm::Value::from(id))])
+    }
+
+    #[tokio::test]
+    async fn granting_on_a_missing_project_is_project_not_found_before_any_rule() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<
+                std::collections::BTreeMap<String, sea_orm::Value>,
+            >::new()])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .grant_project_access(
+                ACTOR,
+                999_999,
+                grant_req(7, TeamRole::Viewer),
+                &GrantAuthz::instance_admin(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TeamError::ProjectNotFound {
+                    project_id: 999_999
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_grants_of_a_missing_project_is_project_not_found() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<
+                std::collections::BTreeMap<String, sea_orm::Value>,
+            >::new()])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc.list_project_access(999_999).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TeamError::ProjectNotFound {
+                    project_id: 999_999
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
     fn grant_req(team_id: i32, role: TeamRole) -> CreateProjectAccessRequest {
         CreateProjectAccessRequest { team_id, role }
     }
@@ -1448,6 +1629,8 @@ mod tests {
         // Resolution short-circuits on the empty grant set, so no
         // membership query is issued.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The project exists.
+            .append_query_results(vec![vec![project_id_row(42)]])
             .append_query_results(vec![Vec::<project_team_access::Model>::new()])
             .into_connection();
         let svc = DefaultTeamService::new(Arc::new(db));
@@ -1468,6 +1651,8 @@ mod tests {
         // Instance-level ProjectsWrite got them into the handler; within
         // the project they are only a viewer.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The project exists.
+            .append_query_results(vec![vec![project_id_row(42)]])
             .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Viewer)]])
             .append_query_results(vec![vec![member_row(1, 7, TeamRole::Viewer)]])
             .into_connection();
@@ -1490,6 +1675,8 @@ mod tests {
     #[tokio::test]
     async fn grant_cannot_write_a_role_above_the_callers_ceiling() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The project exists.
+            .append_query_results(vec![vec![project_id_row(42)]])
             .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Admin)]])
             .append_query_results(vec![vec![member_row(1, 7, TeamRole::Admin)]])
             .into_connection();
@@ -1515,6 +1702,8 @@ mod tests {
     #[tokio::test]
     async fn grant_cannot_overwrite_a_grant_above_the_callers_ceiling() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The project exists.
+            .append_query_results(vec![vec![project_id_row(42)]])
             .append_query_results(vec![vec![
                 grant_row(1, 7, TeamRole::Owner),
                 grant_row(2, 9, TeamRole::Admin),
@@ -1546,6 +1735,8 @@ mod tests {
     #[tokio::test]
     async fn grant_reports_an_unknown_team_only_after_every_denial() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The project exists.
+            .append_query_results(vec![vec![project_id_row(42)]])
             .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Owner)]])
             .append_query_results(vec![vec![member_row(1, 7, TeamRole::Owner)]])
             .append_query_results(vec![Vec::<teams::Model>::new()])
@@ -1571,6 +1762,8 @@ mod tests {
         // pinned: a caller who cannot manage the project never learns
         // whether the team exists.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The project exists.
+            .append_query_results(vec![vec![project_id_row(42)]])
             .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Admin)]])
             .append_query_results(vec![vec![member_row(1, 7, TeamRole::Viewer)]])
             .into_connection();
@@ -1595,6 +1788,8 @@ mod tests {
     #[tokio::test]
     async fn grant_role_caps_the_member_role() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The project exists.
+            .append_query_results(vec![vec![project_id_row(42)]])
             .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Viewer)]])
             .append_query_results(vec![vec![member_row(1, 7, TeamRole::Owner)]])
             .into_connection();
@@ -1613,6 +1808,183 @@ mod tests {
         assert!(matches!(
             err,
             TeamError::ProjectPermissionDenied { project_id: 42, .. }
+        ));
+    }
+
+    /// #2104: a second grant for the same team used to be a silent upsert
+    /// answered with 201.
+    /// #2104: `{"slug": ...}` used to be ignored with a 200, and a null
+    /// description was kept.
+    #[test]
+    fn a_team_update_refuses_unknown_fields_and_null_clears_the_description() {
+        let error = serde_json::from_str::<UpdateTeamRequest>(r#"{"slug":"new-slug"}"#)
+            .expect_err("slug is not updatable");
+        assert!(
+            error.to_string().contains("unknown field `slug`"),
+            "{error}"
+        );
+
+        let clear: UpdateTeamRequest =
+            serde_json::from_str(r#"{"description":null}"#).expect("null parses");
+        assert_eq!(clear.description, Some(None));
+        let keep: UpdateTeamRequest = serde_json::from_str(r#"{"name":"x"}"#).expect("parses");
+        assert_eq!(keep.description, None);
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_null_description_is_stored_as_none() {
+        let now = Utc::now();
+        let team = teams::Model {
+            id: 3,
+            name: "Platform".into(),
+            slug: "platform".into(),
+            description: Some("old".into()),
+            created_by: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        for description in [None, Some(String::new()), Some("  ".to_string())] {
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![team.clone()]])
+                    .append_query_results(vec![vec![teams::Model {
+                        description: None,
+                        ..team.clone()
+                    }]])
+                    .into_connection(),
+            );
+            DefaultTeamService::new(db.clone())
+                .update_team(
+                    3,
+                    UpdateTeamRequest {
+                        name: None,
+                        description: Some(description.clone()),
+                    },
+                )
+                .await
+                .expect("update");
+            let log = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log())
+                .replace('\\', "");
+            assert!(log.contains("\"description\" = $"), "{log}");
+            assert!(
+                log.contains("String(None)"),
+                "{description:?} must clear: {log}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn granting_a_team_that_already_has_a_grant_is_a_conflict() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project_id_row(42)]])
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Deployer)]])
+            .into_connection();
+        let err = DefaultTeamService::new(Arc::new(db))
+            .grant_project_access(
+                ACTOR,
+                42,
+                grant_req(7, TeamRole::Viewer),
+                &GrantAuthz::instance_admin(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TeamError::DuplicateProjectAccess {
+                    project_id: 42,
+                    team_id: 7
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Project 42 already grants access to team 7; change its role with \
+             PATCH /projects/42/access/7"
+        );
+        let problem = temps_core::problemdetails::Problem::from(err);
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("type").and_then(|v| v.as_str()),
+            Some("https://temps.sh/probs/project-access-exists")
+        );
+    }
+
+    #[tokio::test]
+    async fn updating_a_grant_changes_its_role_and_needs_one_to_exist() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project_id_row(42)]])
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Deployer)]])
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Viewer)]])
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .into_connection();
+        let updated = DefaultTeamService::new(Arc::new(db))
+            .update_project_access(
+                ACTOR,
+                42,
+                7,
+                TeamRole::Viewer,
+                &GrantAuthz::instance_admin(),
+            )
+            .await
+            .expect("an existing grant is updated");
+        assert_eq!(updated.role, "viewer");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project_id_row(42)]])
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Deployer)]])
+            .into_connection();
+        let err = DefaultTeamService::new(Arc::new(db))
+            .update_project_access(
+                ACTOR,
+                42,
+                9,
+                TeamRole::Viewer,
+                &GrantAuthz::instance_admin(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TeamError::ProjectAccessNotFound {
+                    project_id: 42,
+                    team_id: 9
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// The update path keeps the grant path's ceiling: a project admin may
+    /// not demote an `owner` team.
+    #[tokio::test]
+    async fn updating_cannot_overwrite_a_grant_above_the_callers_ceiling() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project_id_row(42)]])
+            .append_query_results(vec![vec![
+                grant_row(1, 7, TeamRole::Owner),
+                grant_row(2, 9, TeamRole::Admin),
+            ]])
+            .append_query_results(vec![vec![member_row(1, 9, TeamRole::Admin)]])
+            .into_connection();
+        let err = DefaultTeamService::new(Arc::new(db))
+            .update_project_access(
+                ACTOR,
+                42,
+                7,
+                TeamRole::Viewer,
+                &GrantAuthz::project_scoped(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TeamError::RoleCeilingExceeded { ref role, .. } if role == "owner"
         ));
     }
 

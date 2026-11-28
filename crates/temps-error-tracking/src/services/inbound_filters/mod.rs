@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use temps_entities::error_inbound_filters;
 
@@ -64,6 +64,7 @@ impl InboundFilterService {
     /// Every rule of a project, oldest first. At most
     /// [`MAX_FILTERS_PER_PROJECT`] rows.
     pub async fn list(&self, project_id: i32) -> Result<Vec<InboundFilter>, ErrorTrackingError> {
+        self.require_project(project_id).await?;
         let pending = self.registry.pending_drops();
         error_inbound_filters::Entity::find()
             .filter(error_inbound_filters::Column::ProjectId.eq(project_id))
@@ -93,9 +94,15 @@ impl InboundFilterService {
         enabled: bool,
     ) -> Result<InboundFilter, ErrorTrackingError> {
         let pattern = validate_pattern(kind, pattern)?;
+        // The limit and duplicate checks run in the transaction that inserts,
+        // under a lock on the project row, so concurrent creates for one
+        // project serialize and cannot overshoot the limit (#2112). Dropping
+        // the transaction on an early return rolls it back.
+        let txn = self.db.begin().await?;
+        lock_project(&txn, project_id).await?;
         let existing = error_inbound_filters::Entity::find()
             .filter(error_inbound_filters::Column::ProjectId.eq(project_id))
-            .count(self.db.as_ref())
+            .count(&txn)
             .await?;
         if existing >= MAX_FILTERS_PER_PROJECT {
             return Err(ErrorTrackingError::InboundFilterLimit {
@@ -107,7 +114,7 @@ impl InboundFilterService {
             let duplicate = error_inbound_filters::Entity::find()
                 .filter(error_inbound_filters::Column::ProjectId.eq(project_id))
                 .filter(error_inbound_filters::Column::Kind.eq(kind.as_str()))
-                .count(self.db.as_ref())
+                .count(&txn)
                 .await?;
             if duplicate > 0 {
                 return Err(ErrorTrackingError::InboundFilterExists {
@@ -115,6 +122,9 @@ impl InboundFilterService {
                     kind: kind.as_str().to_string(),
                 });
             }
+        }
+        if let Some(pattern) = pattern.as_deref() {
+            ensure_pattern_free(&txn, project_id, kind, pattern, None).await?;
         }
         let now = Utc::now();
         let row = error_inbound_filters::ActiveModel {
@@ -128,7 +138,7 @@ impl InboundFilterService {
             updated_at: Set(now),
             ..Default::default()
         }
-        .insert(self.db.as_ref())
+        .insert(&txn)
         .await
         .map_err(|error| match error.sql_err() {
             // A concurrent create of the same built-in kind.
@@ -140,6 +150,7 @@ impl InboundFilterService {
             }
             _ => error.into(),
         })?;
+        txn.commit().await?;
         self.reload().await;
         to_filter(row, &Default::default())
     }
@@ -152,17 +163,25 @@ impl InboundFilterService {
         pattern: Option<String>,
         enabled: Option<bool>,
     ) -> Result<InboundFilter, ErrorTrackingError> {
-        let row = self.find(project_id, filter_id).await?;
+        let txn = self.db.begin().await?;
+        let row = Self::find_in(&txn, project_id, filter_id).await?;
         let kind = parse_kind(&row)?;
         let mut active: error_inbound_filters::ActiveModel = row.into();
         if pattern.is_some() {
-            active.pattern = Set(validate_pattern(kind, pattern)?);
+            let pattern = validate_pattern(kind, pattern)?;
+            if let Some(pattern) = pattern.as_deref() {
+                // Same lock as create, so two edits cannot race to one pattern.
+                lock_project(&txn, project_id).await?;
+                ensure_pattern_free(&txn, project_id, kind, pattern, Some(filter_id)).await?;
+            }
+            active.pattern = Set(pattern);
         }
         if let Some(enabled) = enabled {
             active.enabled = Set(enabled);
         }
         active.updated_at = Set(Utc::now());
-        let row = active.update(self.db.as_ref()).await?;
+        let row = active.update(&txn).await?;
+        txn.commit().await?;
         self.reload().await;
         to_filter(row, &self.registry.pending_drops())
     }
@@ -180,14 +199,32 @@ impl InboundFilterService {
         to_filter(row, &Default::default())
     }
 
+    /// A missing (or deleted) project is a 404 naming it: not an empty
+    /// listing, and not a foreign-key violation surfaced as a 500 on create.
+    async fn require_project(&self, project_id: i32) -> Result<(), ErrorTrackingError> {
+        if temps_entities::projects::live_project_exists(self.db.as_ref(), project_id).await? {
+            Ok(())
+        } else {
+            Err(ErrorTrackingError::ProjectNotFound { project_id })
+        }
+    }
+
     async fn find(
         &self,
         project_id: i32,
         filter_id: i32,
     ) -> Result<error_inbound_filters::Model, ErrorTrackingError> {
+        Self::find_in(self.db.as_ref(), project_id, filter_id).await
+    }
+
+    async fn find_in<C: ConnectionTrait>(
+        conn: &C,
+        project_id: i32,
+        filter_id: i32,
+    ) -> Result<error_inbound_filters::Model, ErrorTrackingError> {
         error_inbound_filters::Entity::find_by_id(filter_id)
             .filter(error_inbound_filters::Column::ProjectId.eq(project_id))
-            .one(self.db.as_ref())
+            .one(conn)
             .await?
             .ok_or(ErrorTrackingError::InboundFilterNotFound {
                 project_id,
@@ -206,6 +243,54 @@ impl InboundFilterService {
             );
         }
     }
+}
+
+/// Locks a live project's row for the rest of the transaction, or reports it
+/// missing (a 404 naming it, not a foreign-key violation on insert).
+async fn lock_project<C: ConnectionTrait>(
+    conn: &C,
+    project_id: i32,
+) -> Result<(), ErrorTrackingError> {
+    temps_entities::projects::Entity::find_by_id(project_id)
+        .filter(temps_entities::projects::Column::DeletedAt.is_null())
+        .lock_exclusive()
+        .one(conn)
+        .await?
+        .map(|_| ())
+        .ok_or(ErrorTrackingError::ProjectNotFound { project_id })
+}
+
+/// Refuses a pattern the project already has for `kind`, compared ignoring
+/// case as matching does. Reads at most [`MAX_FILTERS_PER_PROJECT`] rows.
+async fn ensure_pattern_free<C: ConnectionTrait>(
+    conn: &C,
+    project_id: i32,
+    kind: InboundFilterKind,
+    pattern: &str,
+    except_filter_id: Option<i32>,
+) -> Result<(), ErrorTrackingError> {
+    let existing: Vec<(i32, Option<String>)> = error_inbound_filters::Entity::find()
+        .select_only()
+        .column(error_inbound_filters::Column::Id)
+        .column(error_inbound_filters::Column::Pattern)
+        .filter(error_inbound_filters::Column::ProjectId.eq(project_id))
+        .filter(error_inbound_filters::Column::Kind.eq(kind.as_str()))
+        .into_tuple()
+        .all(conn)
+        .await?;
+    let wanted = pattern.to_lowercase();
+    if let Some((filter_id, Some(stored))) = existing.into_iter().find(|(id, stored)| {
+        Some(*id) != except_filter_id
+            && stored.as_deref().map(str::to_lowercase).as_deref() == Some(wanted.as_str())
+    }) {
+        return Err(ErrorTrackingError::InboundPatternFilterExists {
+            project_id,
+            kind: kind.as_str().to_string(),
+            pattern: stored,
+            filter_id,
+        });
+    }
+    Ok(())
 }
 
 fn parse_kind(row: &error_inbound_filters::Model) -> Result<InboundFilterKind, ErrorTrackingError> {
@@ -262,6 +347,16 @@ fn validate_pattern(
         (true, Some(pattern)) if pattern.contains('\0') => Err(ErrorTrackingError::Validation(
             "inbound filter pattern contains a NUL character".into(),
         )),
+        // Usually a pattern built from an empty variable; it would drop every
+        // event of the project (#2112).
+        (true, Some(pattern)) if pattern.chars().all(|c| c == '*') => {
+            Err(ErrorTrackingError::Validation(format!(
+                "inbound filter pattern '{pattern}' matches every event of kind '{}' and would \
+                 drop them all; disable error tracking for the project instead, or use a more \
+                 specific pattern",
+                kind.as_str()
+            )))
+        }
         (true, Some(pattern)) => Ok(Some(pattern)),
         (false, Some(_)) => Err(ErrorTrackingError::Validation(format!(
             "an inbound filter of kind '{}' takes no pattern",

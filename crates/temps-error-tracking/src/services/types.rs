@@ -139,6 +139,19 @@ pub enum ErrorTrackingError {
     #[error("Project {project_id} already has a '{kind}' inbound filter")]
     InboundFilterExists { project_id: i32, kind: String },
 
+    /// A pattern rule the project already has: same kind and the same
+    /// pattern ignoring case, which is how patterns match. Maps to HTTP 409.
+    #[error(
+        "Project {project_id} already has a '{kind}' inbound filter with pattern '{pattern}' \
+         (filter {filter_id}); patterns match case-insensitively"
+    )]
+    InboundPatternFilterExists {
+        project_id: i32,
+        kind: String,
+        pattern: String,
+        filter_id: i32,
+    },
+
     /// The project holds as many inbound filters as it may.
     /// Maps to HTTP 400 Bad Request.
     #[error("Project {project_id} already has the maximum of {limit} inbound filters")]
@@ -211,8 +224,8 @@ pub enum ErrorTrackingError {
     #[error("Validation error: {0}")]
     Validation(String),
 
-    #[error("Project not found")]
-    ProjectNotFound,
+    #[error("Project {project_id} not found")]
+    ProjectNotFound { project_id: i32 },
 
     /// The project already has the maximum number of error alert rules.
     /// Maps to HTTP 409 Conflict.
@@ -224,6 +237,33 @@ pub enum ErrorTrackingError {
         existing: u64,
         limit: u64,
     },
+
+    /// An alert rule id that is not a rule of the project. Maps to HTTP 404.
+    #[error("Alert rule {rule_id} not found in project {project_id}")]
+    AlertRuleNotFound { project_id: i32, rule_id: i32 },
+
+    /// An alert rule's `environment_filter` names an environment the project
+    /// does not have, so the rule could never match. Maps to HTTP 400.
+    #[error(
+        "Environment {environment_id} not found in project {project_id}; an alert rule's \
+         environment_filter must be one of the project's environments (or null for all)"
+    )]
+    AlertRuleEnvironmentNotFound {
+        project_id: i32,
+        environment_id: i32,
+    },
+
+    /// Another rule of the project already has this name. Maps to HTTP 409.
+    #[error("Project {project_id} already has an alert rule named '{name}' (rule {rule_id})")]
+    AlertRuleNameTaken {
+        project_id: i32,
+        name: String,
+        rule_id: i32,
+    },
+
+    /// A field of an alert rule is invalid. Maps to HTTP 400.
+    #[error("Invalid alert rule {field}: {reason}")]
+    InvalidAlertRule { field: &'static str, reason: String },
 
     /// Returned when an uploaded file or request body exceeds the allowed size.
     ///

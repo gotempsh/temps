@@ -282,6 +282,7 @@ impl FlagService {
         page_size: Option<u64>,
     ) -> Result<(Vec<FlagWithEnvironments>, u64), FlagError> {
         let (page, page_size) = normalize_pagination(page, page_size);
+        self.require_project(project_id).await?;
 
         let mut query =
             feature_flags::Entity::find().filter(feature_flags::Column::ProjectId.eq(project_id));
@@ -323,6 +324,16 @@ impl FlagService {
             .collect();
 
         Ok((entries, total))
+    }
+
+    /// A missing (or deleted) project is [`FlagError::ProjectNotFound`]: a
+    /// 404, not an empty listing or a foreign-key violation on insert.
+    async fn require_project(&self, project_id: i32) -> Result<(), FlagError> {
+        if temps_entities::projects::live_project_exists(self.db.as_ref(), project_id).await? {
+            Ok(())
+        } else {
+            Err(FlagError::ProjectNotFound { project_id })
+        }
     }
 
     pub async fn get(&self, project_id: i32, key: &str) -> Result<FlagWithEnvironments, FlagError> {
@@ -369,15 +380,23 @@ impl FlagService {
                 reason: e.to_string(),
             })?;
 
+        self.require_project(project_id).await?;
         let existing = feature_flags::Entity::find()
             .filter(feature_flags::Column::ProjectId.eq(project_id))
             .filter(feature_flags::Column::Key.eq(&request.key))
             .one(self.db.as_ref())
             .await?;
-        if existing.is_some() {
-            return Err(FlagError::DuplicateKey {
-                project_id,
-                key: request.key,
+        if let Some(existing) = existing {
+            return Err(if existing.archived_at.is_some() {
+                FlagError::ArchivedKey {
+                    project_id,
+                    key: request.key,
+                }
+            } else {
+                FlagError::DuplicateKey {
+                    project_id,
+                    key: request.key,
+                }
             });
         }
 
@@ -586,6 +605,53 @@ impl FlagService {
         info!(project_id, flag_key = %key, "Archived feature flag");
 
         Ok(model)
+    }
+
+    /// Delete an archived flag for good, with its per-environment values
+    /// (ON DELETE CASCADE), freeing its key for a new flag of any type.
+    ///
+    /// Only an archived flag can be purged: it already evaluates as not found,
+    /// so purging changes no running application. The delete is conditional
+    /// on the flag still being archived, so a concurrent restore wins and the
+    /// purge reports [`FlagError::StaleWrite`] instead of deleting a live flag.
+    pub async fn purge(
+        &self,
+        project_id: i32,
+        key: &str,
+    ) -> Result<feature_flags::Model, FlagError> {
+        let existing = feature_flags::Entity::find()
+            .filter(feature_flags::Column::ProjectId.eq(project_id))
+            .filter(feature_flags::Column::Key.eq(key))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| FlagError::NotFound {
+                project_id,
+                key: key.to_string(),
+            })?;
+        if existing.archived_at.is_none() {
+            return Err(FlagError::PurgeRequiresArchive {
+                project_id,
+                key: key.to_string(),
+            });
+        }
+
+        let deleted = feature_flags::Entity::delete_many()
+            .filter(feature_flags::Column::Id.eq(existing.id))
+            .filter(feature_flags::Column::ArchivedAt.is_not_null())
+            .exec(self.db.as_ref())
+            .await?;
+        if deleted.rows_affected == 0 {
+            return Err(FlagError::StaleWrite {
+                project_id,
+                key: key.to_string(),
+                environment_id: None,
+            });
+        }
+        self.delivery.invalidate_project(project_id);
+
+        info!(project_id, flag_key = %key, "Purged archived feature flag");
+
+        Ok(existing)
     }
 
     /// Bring an archived flag back.
@@ -1312,6 +1378,51 @@ mod tests {
         }
     }
 
+    /// The row `live_project_exists` selects (only the id column).
+    fn project_id_row(id: i32) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([("id".to_string(), sea_orm::Value::from(id))])
+    }
+
+    fn no_project() -> Vec<std::collections::BTreeMap<String, sea_orm::Value>> {
+        Vec::new()
+    }
+
+    #[tokio::test]
+    async fn listing_a_missing_project_is_project_not_found() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).append_query_results([no_project()]);
+        assert!(matches!(
+            service_with(db).list(999_999, false, None, None).await,
+            Err(FlagError::ProjectNotFound {
+                project_id: 999_999
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn creating_under_a_missing_project_is_project_not_found_before_inserting() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).append_query_results([no_project()]);
+        let result = service_with(db)
+            .create(
+                999_999,
+                CreateFlag {
+                    key: "new-checkout".to_string(),
+                    value_type: FlagValueType::Bool,
+                    default_value: serde_json::json!(false),
+                    description: None,
+                    client_visible: false,
+                    variants: Vec::new(),
+                    exposure_sample_rate: 0.0,
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(FlagError::ProjectNotFound {
+                project_id: 999_999
+            })
+        ));
+    }
+
     fn service_with(db: MockDatabase) -> FlagService {
         FlagService::new(Arc::new(db.into_connection()))
     }
@@ -1419,6 +1530,7 @@ mod tests {
     #[tokio::test]
     async fn create_rejects_a_duplicate_key() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![project_id_row(1)]])
             // The existence probe finds a flag already using this key.
             .append_query_results([vec![flag_model(1, 1, "checkout.v2", "bool")]]);
 
@@ -1438,6 +1550,100 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(FlagError::DuplicateKey { .. })));
+    }
+
+    /// #2102: the key of an archived flag is refused with a message saying
+    /// it is archived and how to restore or free it, not "already exists".
+    #[tokio::test]
+    async fn create_with_an_archived_flags_key_says_it_is_archived() {
+        let mut archived = flag_model(1, 12, "ratio", "number");
+        archived.archived_at = Some(now());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![project_id_row(12)]])
+            .append_query_results([vec![archived]]);
+
+        let error = service_with(db)
+            .create(
+                12,
+                CreateFlag {
+                    key: "ratio".to_string(),
+                    value_type: FlagValueType::Bool,
+                    default_value: serde_json::json!(true),
+                    description: None,
+                    client_visible: false,
+                    variants: Vec::new(),
+                    exposure_sample_rate: 0.0,
+                },
+            )
+            .await
+            .expect_err("the key is still reserved");
+
+        assert!(
+            matches!(error, FlagError::ArchivedKey { project_id: 12, ref key } if key == "ratio")
+        );
+        let message = error.to_string();
+        assert!(message.contains("is archived in project 12"), "{message}");
+        assert!(
+            message.contains("/projects/12/flags/ratio/restore"),
+            "{message}"
+        );
+        assert!(message.contains("purge=true"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn purging_an_archived_flag_deletes_it() {
+        let mut archived = flag_model(3, 12, "ratio", "number");
+        archived.archived_at = Some(now());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![archived]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }]);
+        let db = Arc::new(db.into_connection());
+        let purged = FlagService::new(db.clone())
+            .purge(12, "ratio")
+            .await
+            .expect("an archived flag purges");
+        assert_eq!(purged.id, 3);
+
+        let log = Arc::try_unwrap(db)
+            .expect("the service is gone")
+            .into_transaction_log();
+        let delete = format!("{:?}", log.last().expect("a delete statement")).replace('\\', "");
+        assert!(delete.contains("DELETE FROM \"feature_flags\""), "{delete}");
+        assert!(delete.contains("\"archived_at\" IS NOT NULL"), "{delete}");
+    }
+
+    #[tokio::test]
+    async fn purging_a_live_flag_is_refused_and_a_concurrent_restore_wins() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![flag_model(3, 12, "ratio", "number")]]);
+        assert!(matches!(
+            service_with(db).purge(12, "ratio").await,
+            Err(FlagError::PurgeRequiresArchive { project_id: 12, .. })
+        ));
+
+        let mut archived = flag_model(3, 12, "ratio", "number");
+        archived.archived_at = Some(now());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![archived]])
+            // Restored between the read and the delete: nothing matches.
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }]);
+        assert!(matches!(
+            service_with(db).purge(12, "ratio").await,
+            Err(FlagError::StaleWrite { project_id: 12, .. })
+        ));
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<feature_flags::Model>::new()]);
+        assert!(matches!(
+            service_with(db).purge(12, "missing").await,
+            Err(FlagError::NotFound { project_id: 12, .. })
+        ));
     }
 
     /// Validation must run before the database is touched, so a bad key is a

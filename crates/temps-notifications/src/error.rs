@@ -33,6 +33,17 @@ pub enum NotificationError {
         actual: String,
     },
 
+    /// Deleting the provider would leave routes that list only it with no
+    /// provider at all: enabled, matching alerts, and delivering them nowhere.
+    /// `routes` names each one (`7 'critical'`); its own catch-all route is not
+    /// counted, because that one is removed with it.
+    #[error(
+        "Notification provider {provider_id} is the only provider of route(s) {routes}; deleting \
+         it would leave them with no provider. Add another provider to those routes, or delete \
+         them, first"
+    )]
+    ProviderInUse { provider_id: i32, routes: String },
+
     #[error("Notification provider {provider_id} has unsupported type '{provider_type}'")]
     UnsupportedProviderType {
         provider_id: i32,

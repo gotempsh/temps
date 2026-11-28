@@ -23,11 +23,16 @@ pub enum CronMonitorError {
     Limit,
     #[error("Cron monitor {monitor_id} was not found in project {project_id}")]
     NotFound { project_id: i32, monitor_id: i32 },
-    #[error("Cron monitor already exists in this project and environment")]
-    Conflict,
     #[error(
-        "Cron monitoring scope was not found: project {project_id}, environment {environment_id:?}"
+        "Cron monitor '{slug}' already exists in project {project_id} {}",
+        environment_phrase(*.environment_id)
     )]
+    Conflict {
+        slug: String,
+        project_id: i32,
+        environment_id: Option<i32>,
+    },
+    #[error("{}", scope_not_found_message(*.project_id, *.environment_id))]
     ScopeNotFound {
         project_id: i32,
         environment_id: Option<i32>,
@@ -39,6 +44,20 @@ pub enum CronMonitorError {
     #[error(transparent)]
     Database(CronOperationError<DbErr>),
 }
+fn environment_phrase(environment_id: Option<i32>) -> String {
+    match environment_id {
+        Some(id) => format!("for environment {id}"),
+        None => "with no environment".to_string(),
+    }
+}
+
+fn scope_not_found_message(project_id: i32, environment_id: Option<i32>) -> String {
+    match environment_id {
+        Some(id) => format!("Environment {id} not found in project {project_id}"),
+        None => format!("Project {project_id} not found"),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("Cron monitoring operation '{operation}' failed for project {project_id:?}, monitor {monitor_id:?}: {source}")]
 pub struct CronOperationError<E: std::error::Error + 'static> {
@@ -126,19 +145,36 @@ pub enum MonitorSchedule {
     Crontab { value: String },
     Interval { value: u32, unit: String },
 }
+/// Settings of a cron monitor. Every field but `schedule` has a default; on
+/// `PATCH` the fields given are merged into the stored ones.
 #[derive(Clone, Debug, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MonitorConfig {
+    /// A five-field crontab (`minute hour day-of-month month day-of-week`),
+    /// or an interval of `minute`, `hour`, `day` or `week` units, at most one
+    /// year long.
     pub schedule: MonitorSchedule,
+    /// IANA time zone the crontab is read in, e.g. `UTC` or `Europe/Madrid`.
+    /// Defaults to `UTC`.
     #[serde(default = "utc")]
     pub timezone: String,
-    #[serde(default = "margin")]
+    /// Minutes a check-in may be late before the run counts as missed,
+    /// 1–40320. Defaults to 1.
+    #[serde(default = "margin", deserialize_with = "saturating_u32")]
+    #[schema(minimum = 1, maximum = 40320)]
     pub checkin_margin: u32,
-    #[serde(default = "runtime")]
+    /// Minutes a run may stay in progress before it counts as failed,
+    /// 1–40320. Defaults to 30.
+    #[serde(default = "runtime", deserialize_with = "saturating_u32")]
+    #[schema(minimum = 1, maximum = 40320)]
     pub max_runtime: u32,
-    #[serde(default = "one")]
+    /// Consecutive failures that open an issue, 1–100. Defaults to 1.
+    #[serde(default = "one", deserialize_with = "saturating_u32")]
+    #[schema(minimum = 1, maximum = 100)]
     pub failure_issue_threshold: u32,
-    #[serde(default = "one")]
+    /// Consecutive successes that resolve it, 1–100. Defaults to 1.
+    #[serde(default = "one", deserialize_with = "saturating_u32")]
+    #[schema(minimum = 1, maximum = 100)]
     pub recovery_threshold: u32,
 }
 fn utc() -> String {
@@ -153,40 +189,179 @@ fn runtime() -> u32 {
 fn one() -> u32 {
     1
 }
+
+/// Read an integer limit without failing on one too large for `u32`: it
+/// saturates, so validation reports the field and its range (400) instead
+/// of the request failing to deserialize (422). A negative value reads as 0,
+/// which is out of every range for the same reason.
+fn saturating_u32<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    struct Saturating;
+    impl serde::de::Visitor<'_> for Saturating {
+        type Value = u32;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a non-negative integer")
+        }
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<u32, E> {
+            Ok(u32::try_from(value).unwrap_or(u32::MAX))
+        }
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<u32, E> {
+            Ok(u32::try_from(value).unwrap_or(if value < 0 { 0 } else { u32::MAX }))
+        }
+        fn visit_u128<E: serde::de::Error>(self, _value: u128) -> Result<u32, E> {
+            Ok(u32::MAX)
+        }
+    }
+    deserializer.deserialize_u64(Saturating)
+}
+
+fn saturating_u32_opt<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    #[derive(Deserialize)]
+    struct Wrapped(#[serde(deserialize_with = "saturating_u32")] u32);
+    Ok(Option::<Wrapped>::deserialize(deserializer)?.map(|Wrapped(value)| value))
+}
+
+/// The `config` of a `PATCH`: the fields given replace the stored ones, the
+/// others are kept. `schedule` is required only when the monitor has no
+/// configuration yet (one created by an SDK check-in without a schedule).
+#[derive(Clone, Debug, Default, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MonitorConfigPatch {
+    pub schedule: Option<MonitorSchedule>,
+    pub timezone: Option<String>,
+    #[serde(default, deserialize_with = "saturating_u32_opt")]
+    #[schema(minimum = 1, maximum = 40320)]
+    pub checkin_margin: Option<u32>,
+    #[serde(default, deserialize_with = "saturating_u32_opt")]
+    #[schema(minimum = 1, maximum = 40320)]
+    pub max_runtime: Option<u32>,
+    #[serde(default, deserialize_with = "saturating_u32_opt")]
+    #[schema(minimum = 1, maximum = 100)]
+    pub failure_issue_threshold: Option<u32>,
+    #[serde(default, deserialize_with = "saturating_u32_opt")]
+    #[schema(minimum = 1, maximum = 100)]
+    pub recovery_threshold: Option<u32>,
+}
+
+impl MonitorConfigPatch {
+    /// Merge into the stored configuration (or the defaults, when there is
+    /// none and the patch brings a schedule).
+    pub fn apply(self, stored: Option<MonitorConfig>) -> Result<MonitorConfig, CronMonitorError> {
+        let mut config = match (stored, self.schedule) {
+            (Some(mut stored), schedule) => {
+                if let Some(schedule) = schedule {
+                    stored.schedule = schedule;
+                }
+                stored
+            }
+            (None, Some(schedule)) => MonitorConfig {
+                schedule,
+                timezone: utc(),
+                checkin_margin: margin(),
+                max_runtime: runtime(),
+                failure_issue_threshold: one(),
+                recovery_threshold: one(),
+            },
+            (None, None) => {
+                return Err(CronMonitorError::Invalid {
+                    reason: "the monitor has no configuration yet, so config.schedule is required"
+                        .into(),
+                })
+            }
+        };
+        if let Some(timezone) = self.timezone {
+            config.timezone = timezone;
+        }
+        if let Some(value) = self.checkin_margin {
+            config.checkin_margin = value;
+        }
+        if let Some(value) = self.max_runtime {
+            config.max_runtime = value;
+        }
+        if let Some(value) = self.failure_issue_threshold {
+            config.failure_issue_threshold = value;
+        }
+        if let Some(value) = self.recovery_threshold {
+            config.recovery_threshold = value;
+        }
+        Ok(config)
+    }
+}
+
+/// Longest interval schedule: one year.
+const MAX_INTERVAL_MINUTES: i64 = 525_600;
+const MAX_CRONTAB_CHARS: usize = 128;
+
+fn out_of_range(field: &str, value: u32, min: u32, max: u32, unit: &str) -> CronMonitorError {
+    let got = if value == u32::MAX {
+        "a larger value".to_string()
+    } else {
+        value.to_string()
+    };
+    CronMonitorError::Invalid {
+        reason: format!("{field} must be between {min} and {max}{unit}; got {got}"),
+    }
+}
+
 impl MonitorConfig {
     pub fn validate(&self, now: DateTime<Utc>) -> Result<(), CronMonitorError> {
-        if !(1..=40320).contains(&self.checkin_margin)
-            || !(1..=40320).contains(&self.max_runtime)
-            || !(1..=100).contains(&self.failure_issue_threshold)
-            || !(1..=100).contains(&self.recovery_threshold)
-        {
-            return Err(CronMonitorError::Invalid {
-                reason: "minute limits must be 1–40320 and thresholds 1–100".into(),
-            });
+        for (field, value, max, unit) in [
+            ("checkin_margin", self.checkin_margin, 40320, " minutes"),
+            ("max_runtime", self.max_runtime, 40320, " minutes"),
+            (
+                "failure_issue_threshold",
+                self.failure_issue_threshold,
+                100,
+                "",
+            ),
+            ("recovery_threshold", self.recovery_threshold, 100, ""),
+        ] {
+            if !(1..=max).contains(&value) {
+                return Err(out_of_range(field, value, 1, max, unit));
+            }
         }
         self.next_after(now)?;
         Ok(())
     }
     fn next_after(&self, now: DateTime<Utc>) -> Result<DateTime<Utc>, CronMonitorError> {
-        let invalid = || CronMonitorError::Invalid {
-            reason: "schedule or timezone is unsupported".into(),
-        };
-        let tz = chrono_tz::Tz::from_str(&self.timezone).map_err(|_| invalid())?;
+        let invalid = |reason: String| CronMonitorError::Invalid { reason };
+        let tz = chrono_tz::Tz::from_str(&self.timezone).map_err(|_| {
+            invalid(format!(
+                "timezone '{}' is not an IANA time zone name; use one such as 'UTC' or \
+                 'Europe/Madrid'",
+                self.timezone
+            ))
+        })?;
         match &self.schedule {
             MonitorSchedule::Crontab { value } => {
-                if value.len() > 128 || value.split_whitespace().count() != 5 {
-                    return Err(invalid());
+                let length = value.chars().count();
+                if length > MAX_CRONTAB_CHARS {
+                    return Err(invalid(format!(
+                        "crontab is {length} characters; at most {MAX_CRONTAB_CHARS}"
+                    )));
+                }
+                let fields = value.split_whitespace().count();
+                if fields != 5 {
+                    return Err(invalid(format!(
+                        "crontab '{value}' has {fields} field(s); use exactly five: minute hour \
+                         day-of-month month day-of-week (seconds and years are not supported)"
+                    )));
                 }
                 let local = now.with_timezone(&tz);
                 // Restrict search to eight years instead of letting impossible
                 // public-DSN schedules scan millennia. Includes leap-day cycles.
                 let year = local.year();
                 let schedule = croner::Cron::from_str(&format!("0 {value} {year}-{}", year + 8))
-                    .map_err(|_| invalid())?;
+                    .map_err(|error| invalid(format!("crontab '{value}' is invalid: {error}")))?;
                 schedule
                     .find_next_occurrence(&local, false)
                     .map(|v| v.with_timezone(&Utc))
-                    .map_err(|_| invalid())
+                    .map_err(|_| {
+                        invalid(format!(
+                            "crontab '{value}' never runs in the next eight years"
+                        ))
+                    })
             }
             MonitorSchedule::Interval { value, unit } => {
                 let minutes = match unit.as_str() {
@@ -194,12 +369,23 @@ impl MonitorConfig {
                     "hour" => 60,
                     "day" => 1440,
                     "week" => 10080,
-                    _ => return Err(invalid()),
+                    other => {
+                        return Err(invalid(format!(
+                        "interval unit '{other}' is not supported; use minute, hour, day or week"
+                    )))
+                    }
                 };
-                if *value == 0 || i64::from(*value) * minutes > 525600 {
-                    return Err(invalid());
+                if *value == 0 {
+                    return Err(invalid("interval value must be at least 1".into()));
                 }
-                Ok(now + Duration::minutes(i64::from(*value) * minutes))
+                let total = i64::from(*value) * minutes;
+                if total > MAX_INTERVAL_MINUTES {
+                    return Err(invalid(format!(
+                        "an interval of {value} {unit}(s) is longer than the maximum of one year \
+                         ({MAX_INTERVAL_MINUTES} minutes)"
+                    )));
+                }
+                Ok(now + Duration::minutes(total))
             }
         }
     }
@@ -737,6 +923,114 @@ impl CronMonitorService {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
+
+    fn reason_for(config: serde_json::Value) -> String {
+        let config: MonitorConfig = serde_json::from_value(config).expect("config parses");
+        match config.validate(Utc::now()) {
+            Err(CronMonitorError::Invalid { reason }) => reason,
+            other => panic!("expected an invalid config, got {other:?}"),
+        }
+    }
+
+    /// #2101: each schedule problem says what is wrong and what is accepted,
+    /// instead of one "schedule or timezone is unsupported" for all of them.
+    #[test]
+    fn every_schedule_failure_has_its_own_message() {
+        let crontab =
+            |value: &str| serde_json::json!({"schedule": {"type": "crontab", "value": value}});
+        let interval = |value: u32, unit: &str| serde_json::json!({"schedule": {"type": "interval", "value": value, "unit": unit}});
+        let cases = [
+            (crontab("61 * * * *"), "crontab '61 * * * *' is invalid"),
+            (crontab("0 0 3 * * *"), "has 6 field(s); use exactly five"),
+            (
+                serde_json::json!({"schedule": {"type": "crontab", "value": "0 3 * * *"}, "timezone": "Mars/Olympus"}),
+                "timezone 'Mars/Olympus' is not an IANA time zone name",
+            ),
+            (
+                interval(2, "fortnight"),
+                "interval unit 'fortnight' is not supported; use minute, hour, day or week",
+            ),
+            (interval(0, "day"), "interval value must be at least 1"),
+            (interval(53, "week"), "longer than the maximum of one year"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (config, expected) in cases {
+            let reason = reason_for(config.clone());
+            assert!(reason.contains(expected), "{config}: {reason}");
+            assert!(seen.insert(reason), "messages must differ");
+        }
+    }
+
+    #[test]
+    fn each_limit_names_its_field_and_range_even_past_u32() {
+        let schedule = serde_json::json!({"type": "interval", "value": 5, "unit": "minute"});
+        let reason = reason_for(serde_json::json!({"schedule": schedule, "checkin_margin": 0}));
+        assert_eq!(
+            reason,
+            "checkin_margin must be between 1 and 40320 minutes; got 0"
+        );
+        // Past u32 used to be a 422 deserialization error.
+        let reason = reason_for(
+            serde_json::json!({"schedule": schedule, "checkin_margin": 99_999_999_999_u64}),
+        );
+        assert_eq!(
+            reason,
+            "checkin_margin must be between 1 and 40320 minutes; got a larger value"
+        );
+        let reason =
+            reason_for(serde_json::json!({"schedule": schedule, "recovery_threshold": 101}));
+        assert_eq!(
+            reason,
+            "recovery_threshold must be between 1 and 100; got 101"
+        );
+        let reason = reason_for(serde_json::json!({"schedule": schedule, "max_runtime": -1}));
+        assert!(
+            reason.starts_with("max_runtime must be between"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_config_patch_merges_into_the_stored_config() {
+        let stored: MonitorConfig = serde_json::from_value(serde_json::json!({
+            "schedule": {"type": "crontab", "value": "0 3 * * *"},
+            "timezone": "Europe/Madrid",
+            "checkin_margin": 5,
+            "max_runtime": 30,
+            "failure_issue_threshold": 3,
+            "recovery_threshold": 2
+        }))
+        .expect("stored config parses");
+        let patch: MonitorConfigPatch = serde_json::from_value(serde_json::json!({
+            "schedule": {"type": "crontab", "value": "0 4 * * *"}
+        }))
+        .expect("patch parses");
+        let merged = patch.apply(Some(stored)).expect("merge");
+        assert!(
+            matches!(merged.schedule, MonitorSchedule::Crontab { ref value } if value == "0 4 * * *")
+        );
+        assert_eq!(merged.timezone, "Europe/Madrid");
+        assert_eq!(merged.checkin_margin, 5);
+        assert_eq!(merged.failure_issue_threshold, 3);
+        assert_eq!(merged.recovery_threshold, 2);
+
+        // Nothing stored yet: the schedule is required, the rest default.
+        assert!(matches!(
+            MonitorConfigPatch::default().apply(None),
+            Err(CronMonitorError::Invalid { .. })
+        ));
+        let fresh = MonitorConfigPatch {
+            schedule: Some(MonitorSchedule::Interval {
+                value: 1,
+                unit: "hour".into(),
+            }),
+            ..Default::default()
+        }
+        .apply(None)
+        .expect("a schedule is enough");
+        assert_eq!(fresh.timezone, "UTC");
+        assert_eq!(fresh.checkin_margin, 1);
+    }
     pub(super) struct Notifications;
     #[async_trait::async_trait]
     impl temps_core::notifications::NotificationService for Notifications {

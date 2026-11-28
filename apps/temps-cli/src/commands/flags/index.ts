@@ -193,6 +193,8 @@ export function registerFlagsCommands(program: Command): void {
     .command('archive <key>')
     .description('Archive a flag (callers fall back to their own default)')
     .option('-p, --project <project>', 'Project slug or ID')
+    .option('--purge', 'Delete an already archived flag for good, freeing its key')
+    .option('-y, --yes', 'Skip the confirmation for --purge')
     .action(archiveFlagCmd)
 }
 
@@ -799,18 +801,37 @@ async function toggleFlagCmd(
   newline()
 }
 
-async function archiveFlagCmd(key: string, options: { project?: string }): Promise<void> {
+async function archiveFlagCmd(
+  key: string,
+  options: { project?: string; purge?: boolean; yes?: boolean }
+): Promise<void> {
   await requireAuth()
   await setupClient()
 
   const project = await resolveProject(options.project)
+  const purge = options.purge ?? false
+  if (purge && !options.yes) {
+    const confirmed = await promptConfirm({
+      message: `Delete archived flag "${key}" for good? It cannot be restored afterwards.`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
 
-  await withSpinner(`Archiving ${key}...`, async () => {
-    const { error } = await archiveFlag({ client, path: { project_id: project.id, key } })
+  await withSpinner(`${purge ? 'Purging' : 'Archiving'} ${key}...`, async () => {
+    const { error } = await archiveFlag({ client, path: { project_id: project.id, key }, query: { purge } })
     if (error) throw new Error(getErrorMessage(error))
   })
 
   newline()
+  if (purge) {
+    success(`Purged ${colors.bold(key)}; the key is free again`)
+    newline()
+    return
+  }
   success(`Archived ${colors.bold(key)}`)
   info('Callers now fall back to the default they compiled in.')
   newline()

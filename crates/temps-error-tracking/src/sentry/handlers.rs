@@ -1302,7 +1302,7 @@ async fn process_parsed_envelope(
                     CronMonitorError::NotFound { .. } | CronMonitorError::ScopeNotFound { .. } => {
                         StatusCode::NOT_FOUND
                     }
-                    CronMonitorError::Conflict => StatusCode::CONFLICT,
+                    CronMonitorError::Conflict { .. } => StatusCode::CONFLICT,
                     CronMonitorError::Limit => StatusCode::TOO_MANY_REQUESTS,
                     CronMonitorError::Database(_) if retryable => StatusCode::SERVICE_UNAVAILABLE,
                     CronMonitorError::Database(_)

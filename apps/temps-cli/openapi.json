@@ -7188,10 +7188,15 @@
           },
           "key": {
             "type": "string"
+          },
+          "purged": {
+            "description": "True when the flag was deleted for good (`purge=true`) and its key is\nfree again; false when it was archived and can be restored.",
+            "type": "boolean"
           }
         },
         "required": [
-          "key"
+          "key",
+          "purged"
         ],
         "type": "object"
       },
@@ -18189,7 +18194,7 @@
             "type": "boolean"
           },
           "environment_filter": {
-            "description": "Optional environment ID to filter alerts",
+            "description": "Only alert on errors in this environment of the project. It must be one\nof the project's environments; omit or `null` for every environment.",
             "format": "int32",
             "type": [
               "integer",
@@ -18197,13 +18202,17 @@
             ]
           },
           "error_level_filter": {
-            "description": "Optional error type/level filter",
+            "description": "Only alert on errors of this exception type (for example `TypeError`),\ncompared case-insensitively with the error group's type. Despite the\nname it does not match a severity level. Omit, `null` or `\"\"` for\nevery type.",
+            "maxLength": 255,
             "type": [
               "string",
               "null"
             ]
           },
           "name": {
+            "description": "Unique within the project (case-insensitive), trimmed, 1-255 characters.",
+            "maxLength": 255,
+            "minLength": 1,
             "type": "string"
           },
           "notification_priority": {
@@ -18211,7 +18220,7 @@
             "type": "string"
           },
           "trigger_config": {
-            "description": "Trigger-specific configuration (e.g., {\"count\": 100, \"window_minutes\": 60} for frequency)"
+            "description": "Trigger-specific configuration. `frequency`: `{\"count\": 100,\n\"window_minutes\": 60}`; `user_count`: `{\"count\": 10}` (the user\nthreshold); `status_change`: `{\"statuses\": [\"resolved\"]}`; the other\ntypes take `{}`. Unknown keys are refused."
           },
           "trigger_type": {
             "description": "Trigger type: new_issue, regression, frequency, new_user, user_count, status_change",
@@ -19616,7 +19625,7 @@
       "CreateGroupEnvVarRequest": {
         "properties": {
           "environment_slug": {
-            "description": "Environment slug (e.g. `production`, `staging`) this applies to.\nOmit to apply to every environment.",
+            "description": "Environment slug (e.g. `production`, `staging`) this applies to.\nOmit to apply to every environment. When the group has projects, at\nleast one of them must have an environment with this slug (a 400\nnames the slugs they do have); an empty group accepts any valid slug.",
             "type": [
               "string",
               "null"
@@ -20303,15 +20312,20 @@
             ]
           },
           "max_severity": {
+            "description": "Highest severity the route matches, same values as `min_severity`.\nCase-insensitive; stored lower-case.",
+            "example": "critical",
             "type": "string"
           },
           "min_severity": {
+            "description": "Lowest severity the route matches: debug, info, warning, error,\ncritical or emergency. Case-insensitive; stored lower-case.",
+            "example": "error",
             "type": "string"
           },
           "name": {
             "type": "string"
           },
           "provider_ids": {
+            "description": "Providers that receive the matching notifications; at least one.\nDuplicates are ignored and the stored list is sorted.",
             "items": {
               "format": "int32",
               "type": "integer"
@@ -21848,7 +21862,7 @@
             ]
           },
           "events": {
-            "description": "Event types to subscribe to",
+            "description": "Event types to subscribe to. Duplicates are stored once.",
             "example": [
               "deployment.created",
               "deployment.succeeded"
@@ -21859,19 +21873,17 @@
             "type": "array"
           },
           "secret": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/SecretString",
-                "description": "Secret for HMAC signature verification (optional)"
-              },
-              {
-                "type": "null"
-              }
+            "description": "Secret for HMAC signature verification (optional). Must not be empty;\nomit it for an unsigned webhook.",
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
             ]
           },
           "url": {
-            "description": "Target URL for webhook delivery",
+            "description": "Target URL for webhook delivery: http(s), at most 2048 characters, and\nnot a loopback, private, link-local or cloud-metadata address.",
             "example": "https://example.com/webhook",
+            "maxLength": 2048,
             "type": "string"
           }
         },
@@ -22797,6 +22809,8 @@
         "type": "object"
       },
       "CustomDomainRequest": {
+        "additionalProperties": false,
+        "description": "A custom domain to add. Unknown fields are refused, so a misspelt one is\nan error instead of being ignored.",
         "properties": {
           "branch": {
             "type": [
@@ -22805,6 +22819,8 @@
             ]
           },
           "domain": {
+            "description": "Hostname. Stored lower-cased and without a trailing dot\n(`Shop.Example.COM.` is stored as `shop.example.com`).",
+            "example": "shop.example.com",
             "type": "string"
           },
           "environment_id": {
@@ -22812,19 +22828,21 @@
             "type": "integer"
           },
           "redirect_to": {
+            "description": "Redirect every request to this URL instead of serving the environment.\n`http://` or `https://`; a bare host gets `https://`.",
             "type": [
               "string",
               "null"
             ]
           },
           "service_name": {
-            "description": "Docker Compose service name this domain routes to (only for docker-compose projects)",
+            "description": "Docker Compose service this domain routes to. Only for Docker Compose\nprojects; refused on others.",
             "type": [
               "string",
               "null"
             ]
           },
           "status_code": {
+            "description": "Status of the redirect: 301, 302, 303, 307 or 308. Requires\n`redirect_to`.",
             "format": "int32",
             "type": [
               "integer",
@@ -40679,6 +40697,18 @@
         ],
         "type": "object"
       },
+      "GroupEnvVarValueResponse": {
+        "description": "The plaintext value of a non-secret group variable.",
+        "properties": {
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
+      },
       "GroupIgnoreState": {
         "description": "The ignore conditions of an ignored group and how far along they are.",
         "properties": {
@@ -42793,6 +42823,66 @@
         ],
         "type": "object"
       },
+      "HttpCheckSpecView": {
+        "description": "An HTTP recipe as returned. Header values may hold secrets and are\nwrite-only, so only their names are listed; resend them on update.",
+        "properties": {
+          "accepted_statuses": {
+            "items": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "credential_header": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "credential_prefix": {
+            "type": "string"
+          },
+          "expiration": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ExpirationRule"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "header_names": {
+            "description": "Names of the headers the recipe sends (values are write-only).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "method": {
+            "$ref": "#/components/schemas/HttpCheckMethod"
+          },
+          "numeric_rules": {
+            "items": {
+              "$ref": "#/components/schemas/NumericRule"
+            },
+            "type": "array"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "method",
+          "header_names",
+          "credential_prefix",
+          "accepted_statuses",
+          "numeric_rules"
+        ],
+        "type": "object"
+      },
       "HttpCheckView": {
         "properties": {
           "automatic_provider": {
@@ -42811,6 +42901,10 @@
               "null"
             ]
           },
+          "has_credential": {
+            "description": "Whether an inline credential is stored (it is never returned).",
+            "type": "boolean"
+          },
           "id": {
             "format": "int32",
             "type": "integer"
@@ -42827,6 +42921,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "local": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LocalCheckSpec",
+                "description": "The expiry thresholds of a `local` check."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "name": {
@@ -42856,6 +42961,17 @@
               "integer",
               "null"
             ]
+          },
+          "spec": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HttpCheckSpecView",
+                "description": "The HTTP recipe of an `http` check (header values omitted)."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -42865,7 +42981,8 @@
           "name",
           "enabled",
           "interval_seconds",
-          "next_check_at"
+          "next_check_at",
+          "has_credential"
         ],
         "type": "object"
       },
@@ -52104,37 +52221,107 @@
       },
       "MonitorConfig": {
         "additionalProperties": false,
+        "description": "Settings of a cron monitor. Every field but `schedule` has a default; on\n`PATCH` the fields given are merged into the stored ones.",
         "properties": {
           "checkin_margin": {
+            "description": "Minutes a check-in may be late before the run counts as missed,\n1–40320. Defaults to 1.",
             "format": "int32",
-            "minimum": 0,
+            "maximum": 40320,
+            "minimum": 1,
             "type": "integer"
           },
           "failure_issue_threshold": {
+            "description": "Consecutive failures that open an issue, 1–100. Defaults to 1.",
             "format": "int32",
-            "minimum": 0,
+            "maximum": 100,
+            "minimum": 1,
             "type": "integer"
           },
           "max_runtime": {
+            "description": "Minutes a run may stay in progress before it counts as failed,\n1–40320. Defaults to 30.",
             "format": "int32",
-            "minimum": 0,
+            "maximum": 40320,
+            "minimum": 1,
             "type": "integer"
           },
           "recovery_threshold": {
+            "description": "Consecutive successes that resolve it, 1–100. Defaults to 1.",
             "format": "int32",
-            "minimum": 0,
+            "maximum": 100,
+            "minimum": 1,
             "type": "integer"
           },
           "schedule": {
-            "$ref": "#/components/schemas/MonitorSchedule"
+            "$ref": "#/components/schemas/MonitorSchedule",
+            "description": "A five-field crontab (`minute hour day-of-month month day-of-week`),\nor an interval of `minute`, `hour`, `day` or `week` units, at most one\nyear long."
           },
           "timezone": {
+            "description": "IANA time zone the crontab is read in, e.g. `UTC` or `Europe/Madrid`.\nDefaults to `UTC`.",
             "type": "string"
           }
         },
         "required": [
           "schedule"
         ],
+        "type": "object"
+      },
+      "MonitorConfigPatch": {
+        "additionalProperties": false,
+        "description": "The `config` of a `PATCH`: the fields given replace the stored ones, the\nothers are kept. `schedule` is required only when the monitor has no\nconfiguration yet (one created by an SDK check-in without a schedule).",
+        "properties": {
+          "checkin_margin": {
+            "format": "int32",
+            "maximum": 40320,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "failure_issue_threshold": {
+            "format": "int32",
+            "maximum": 100,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_runtime": {
+            "format": "int32",
+            "maximum": 40320,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "recovery_threshold": {
+            "format": "int32",
+            "maximum": 100,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "schedule": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MonitorSchedule"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "MonitorLocationResult": {
@@ -73383,16 +73570,21 @@
         "type": "object"
       },
       "SaveHttpCheck": {
-        "description": "Credentials and recipe headers are write-only and encrypted at rest.\nA check reads at most one of `env_var_id`, `secret_id` and `credential`.",
+        "description": "Credentials and recipe headers are write-only and encrypted at rest.\nA check reads at most one of `env_var_id`, `secret_id` and `credential`.\n\nOn update (`PUT`) the recipe, kind and credential source are replaced as\nsent, while an omitted `enabled` or `interval_seconds` keeps its current\nvalue. A change to the recipe, kind or credential runs the check again; a\nchange to anything else keeps its last result.",
         "properties": {
           "credential": {
+            "description": "Inline credential, write-only. On update: omit to keep the stored one\n(for the same kind of check), `null` to remove it, or a value to\nreplace it. `has_credential` in the view says whether one is stored.",
             "type": [
               "string",
               "null"
             ]
           },
           "enabled": {
-            "type": "boolean"
+            "description": "Defaults to `true` on create; an update that omits it keeps the\ncurrent state.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "env_var_id": {
             "format": "int32",
@@ -73402,8 +73594,14 @@
             ]
           },
           "interval_seconds": {
+            "description": "Seconds between checks, 300-604800. Defaults to 86400 on create; an\nupdate that omits it keeps the current interval.",
             "format": "int32",
-            "type": "integer"
+            "maximum": 604800,
+            "minimum": 300,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "kind": {
             "$ref": "#/components/schemas/CheckKind",
@@ -73421,6 +73619,9 @@
             ]
           },
           "name": {
+            "description": "1-120 characters (counted as characters, not bytes), trimmed.",
+            "maxLength": 120,
+            "minLength": 1,
             "type": "string"
           },
           "secret_id": {
@@ -87699,6 +87900,7 @@
         "type": "object"
       },
       "UpdateAlertRuleRequest": {
+        "description": "A partial update: an omitted field keeps its value.",
         "properties": {
           "cooldown_minutes": {
             "format": "int32",
@@ -87714,6 +87916,7 @@
             ]
           },
           "environment_filter": {
+            "description": "One of the project's environments, or `null` to alert on every\nenvironment again. Omit to keep the current filter.",
             "format": "int32",
             "type": [
               "integer",
@@ -87721,12 +87924,17 @@
             ]
           },
           "error_level_filter": {
+            "description": "Exception type to match (for example `TypeError`), or `null` / `\"\"` to\nalert on every type again. Omit to keep the current filter.",
+            "maxLength": 255,
             "type": [
               "string",
               "null"
             ]
           },
           "name": {
+            "description": "Unique within the project (case-insensitive), trimmed, 1-255 characters.",
+            "maxLength": 255,
+            "minLength": 1,
             "type": [
               "string",
               "null"
@@ -87738,7 +87946,9 @@
               "null"
             ]
           },
-          "trigger_config": {},
+          "trigger_config": {
+            "description": "See `CreateAlertRuleRequest.trigger_config`; unknown keys are refused."
+          },
           "trigger_type": {
             "type": [
               "string",
@@ -88231,7 +88441,15 @@
       "UpdateCloudflareProviderRequest": {
         "properties": {
           "config": {
-            "$ref": "#/components/schemas/CloudflareConfig"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CloudflareConfig",
+                "description": "Replacement config. Omit it to keep the stored one (for example to\nrename or disable the provider). Send `***` for a masked secret to\nkeep its stored value."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "enabled": {
             "type": [
@@ -88240,15 +88458,13 @@
             ]
           },
           "name": {
+            "description": "New name; must not be empty or only whitespace.",
             "type": [
               "string",
               "null"
             ]
           }
         },
-        "required": [
-          "config"
-        ],
         "type": "object"
       },
       "UpdateClusterNetworkRequest": {
@@ -88365,7 +88581,8 @@
           "config": {
             "oneOf": [
               {
-                "$ref": "#/components/schemas/MonitorConfig"
+                "$ref": "#/components/schemas/MonitorConfigPatch",
+                "description": "Fields to change; the ones omitted keep their stored values."
               },
               {
                 "type": "null"
@@ -88382,14 +88599,18 @@
         "type": "object"
       },
       "UpdateCustomDomainRequest": {
+        "additionalProperties": false,
+        "description": "Changes to a custom domain; omitted fields are kept. Unknown fields are\nrefused, so a misspelt one is an error instead of a silent no-op.",
         "properties": {
           "branch": {
+            "description": "Branch; an empty string clears it.",
             "type": [
               "string",
               "null"
             ]
           },
           "domain": {
+            "description": "New hostname, normalised like on create (lower-cased, no trailing dot).",
             "type": [
               "string",
               "null"
@@ -88403,19 +88624,21 @@
             ]
           },
           "redirect_to": {
+            "description": "Redirect target; an empty string clears the redirect, and its\n`status_code` with it.",
             "type": [
               "string",
               "null"
             ]
           },
           "service_name": {
-            "description": "Docker Compose service name this domain routes to (empty string clears it)",
+            "description": "Docker Compose service this domain routes to (Compose projects only);\nan empty string clears it.",
             "type": [
               "string",
               "null"
             ]
           },
           "status_code": {
+            "description": "Redirect status (301, 302, 303, 307 or 308); `null` (or `0`) clears\nit. Only valid while the domain has a `redirect_to`.",
             "format": "int32",
             "type": [
               "integer",
@@ -88707,7 +88930,7 @@
             ]
           },
           "environment_id": {
-            "description": "`null` applies the rule to every environment.",
+            "description": "`null` applies the rule to every environment; omit to keep the current\none. A new environment must be one of the project's; the current one\nis kept as is, even if it has since been deleted.",
             "format": "int32",
             "type": [
               "integer",
@@ -89860,7 +90083,15 @@
       "UpdateNotificationEmailProviderRequest": {
         "properties": {
           "config": {
-            "$ref": "#/components/schemas/EmailConfig"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EmailConfig",
+                "description": "Replacement config. Omit it to keep the stored one (for example to\nrename or disable the provider). Send `***` for a masked secret to\nkeep its stored value."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "enabled": {
             "type": [
@@ -89869,15 +90100,13 @@
             ]
           },
           "name": {
+            "description": "New name; must not be empty or only whitespace.",
             "type": [
               "string",
               "null"
             ]
           }
         },
-        "required": [
-          "config"
-        ],
         "type": "object"
       },
       "UpdateNotificationRouteRequest": {
@@ -89889,12 +90118,14 @@
             ]
           },
           "max_severity": {
+            "description": "Highest severity the route matches, same values as `min_severity`.\nCase-insensitive; stored lower-case.",
             "type": [
               "string",
               "null"
             ]
           },
           "min_severity": {
+            "description": "Lowest severity the route matches: debug, info, warning, error,\ncritical or emergency. Case-insensitive; stored lower-case.",
             "type": [
               "string",
               "null"
@@ -89907,6 +90138,7 @@
             ]
           },
           "provider_ids": {
+            "description": "Replacement provider list; at least one when given. Duplicates are\nignored and the stored list is sorted.",
             "items": {
               "format": "int32",
               "type": "integer"
@@ -90063,6 +90295,19 @@
         "required": [
           "access",
           "allowed_cidrs"
+        ],
+        "type": "object"
+      },
+      "UpdateProjectAccessRequest": {
+        "additionalProperties": false,
+        "description": "The new role of an existing project grant.",
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/TeamRole"
+          }
+        },
+        "required": [
+          "role"
         ],
         "type": "object"
       },
@@ -91065,7 +91310,15 @@
       "UpdateSlackProviderRequest": {
         "properties": {
           "config": {
-            "$ref": "#/components/schemas/SlackConfig"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SlackConfig",
+                "description": "Replacement config. Omit it to keep the stored one (for example to\nrename or disable the provider). Send `***` for a masked secret to\nkeep its stored value."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "enabled": {
             "type": [
@@ -91074,15 +91327,13 @@
             ]
           },
           "name": {
+            "description": "New name; must not be empty or only whitespace.",
             "type": [
               "string",
               "null"
             ]
           }
         },
-        "required": [
-          "config"
-        ],
         "type": "object"
       },
       "UpdateSpeedMetricsPayload": {
@@ -91373,8 +91624,11 @@
         "type": "object"
       },
       "UpdateTeamRequest": {
+        "additionalProperties": false,
+        "description": "Changes to a team; omitted fields are kept. Unknown fields (a team's slug\ncannot change) are refused rather than ignored.",
         "properties": {
           "description": {
+            "description": "New description; `null` (or an empty string) clears it. Omit it to\nkeep the current one.",
             "type": [
               "string",
               "null"
@@ -91392,7 +91646,15 @@
       "UpdateTelegramProviderRequest": {
         "properties": {
           "config": {
-            "$ref": "#/components/schemas/TelegramConfig"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TelegramConfig",
+                "description": "Replacement config. Omit it to keep the stored one (for example to\nrename or disable the provider). Send `***` for a masked secret to\nkeep its stored value."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "enabled": {
             "type": [
@@ -91401,15 +91663,13 @@
             ]
           },
           "name": {
+            "description": "New name; must not be empty or only whitespace.",
             "type": [
               "string",
               "null"
             ]
           }
         },
-        "required": [
-          "config"
-        ],
         "type": "object"
       },
       "UpdateTelemetrySettingsRequest": {
@@ -91512,7 +91772,15 @@
       "UpdateWebhookProviderRequest": {
         "properties": {
           "config": {
-            "$ref": "#/components/schemas/WebhookConfig"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WebhookConfig",
+                "description": "Replacement config. Omit it to keep the stored one (for example to\nrename or disable the provider). Send `***` for a masked secret to\nkeep its stored value."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "enabled": {
             "type": [
@@ -91521,15 +91789,13 @@
             ]
           },
           "name": {
+            "description": "New name; must not be empty or only whitespace.",
             "type": [
               "string",
               "null"
             ]
           }
         },
-        "required": [
-          "config"
-        ],
         "type": "object"
       },
       "UpdateWebhookRequestBody": {
@@ -91542,7 +91808,7 @@
             ]
           },
           "events": {
-            "description": "Event types to subscribe to",
+            "description": "Event types to subscribe to. Duplicates are stored once.",
             "items": {
               "type": "string"
             },
@@ -91552,18 +91818,16 @@
             ]
           },
           "secret": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/SecretString",
-                "description": "Secret for HMAC signature verification"
-              },
-              {
-                "type": "null"
-              }
+            "description": "Secret for HMAC signature verification. Omit to keep the current one,\nsend `null` to remove it (deliveries are then unsigned), or a\nnon-empty string to replace it.",
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
             ]
           },
           "url": {
-            "description": "Target URL for webhook delivery",
+            "description": "Target URL for webhook delivery (same rules as on create)",
+            "maxLength": 2048,
             "type": [
               "string",
               "null"
@@ -94662,10 +94926,11 @@
             "type": "string"
           },
           "timeout_secs": {
-            "description": "Request timeout in seconds. Defaults to 30.",
+            "description": "Request timeout in seconds, from 1 to 120. Defaults to 30.",
             "example": 30,
             "format": "int64",
-            "minimum": 0,
+            "maximum": 120,
+            "minimum": 1,
             "type": "integer"
           },
           "url": {
@@ -144143,6 +144408,9 @@
           "404": {
             "description": "Provider not found"
           },
+          "409": {
+            "description": "The provider is of another type; nothing was changed"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -144244,6 +144512,9 @@
           "404": {
             "description": "Provider not found"
           },
+          "409": {
+            "description": "The provider is of another type; nothing was changed"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -144344,6 +144615,9 @@
           },
           "404": {
             "description": "Provider not found"
+          },
+          "409": {
+            "description": "The provider is of another type; nothing was changed"
           },
           "500": {
             "description": "Internal server error"
@@ -144458,6 +144732,9 @@
           "404": {
             "description": "Provider not found"
           },
+          "409": {
+            "description": "The provider is of another type; nothing was changed"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -144560,6 +144837,9 @@
           "404": {
             "description": "Provider not found"
           },
+          "409": {
+            "description": "The provider is of another type; nothing was changed"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -144597,6 +144877,9 @@
           },
           "404": {
             "description": "Provider not found"
+          },
+          "409": {
+            "description": "A route lists only this provider; deleting it would leave the route with none"
           },
           "500": {
             "description": "Internal server error"
@@ -152547,6 +152830,17 @@
       },
       "post": {
         "operationId": "create_project_group",
+        "parameters": [
+          {
+            "description": "Move a project that already belongs to another group out of it (that\ngroup's routes involving it are dropped). Without it, placing such a\nproject is refused with a 409 naming its group.",
+            "in": "query",
+            "name": "move",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -152575,10 +152869,10 @@
             "description": "Insufficient permissions"
           },
           "404": {
-            "description": "A listed project does not exist, or a route dropped by moving a listed project involves a service the caller cannot see"
+            "description": "A listed project does not exist, or (with move=true) a route dropped by moving a listed project involves a service the caller cannot see"
           },
           "409": {
-            "description": "Slug already taken, or a listed project gained a route or changed group while the request was being authorized; retry"
+            "description": "Slug already taken; a listed project already belongs to another group and move=true was not passed (the detail names the group); or a listed project gained a route or changed group while the request was being authorized; retry"
           }
         },
         "security": [
@@ -153057,6 +153351,68 @@
         "x-maturity": "experimental"
       }
     },
+    "/project-groups/{group_id}/env-vars/{var_id}/value": {
+      "get": {
+        "description": "Follows the project reveal (`GET /projects/{project_id}/env-vars/{key}/value`):\nit takes what changing the variable takes (`environments:write` on every\nproject in the group), a secret is refused with a 403 (secret values are\nwrite-only), and every reveal is audit-logged before the value is\nreturned; when the audit record cannot be written the value is not\nreturned.",
+        "operationId": "reveal_group_env_var",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Variable ID",
+            "in": "path",
+            "name": "var_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupEnvVarValueResponse"
+                }
+              }
+            },
+            "description": "The variable's plaintext value (sent with Cache-Control: no-store)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "The variable is secret (write-only), or insufficient permissions on a member project"
+          },
+          "404": {
+            "description": "Project group or variable not found"
+          },
+          "500": {
+            "description": "The value could not be decrypted, or the reveal could not be audit-logged"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Reveal the value of one non-secret group variable.",
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/project-groups/{group_id}/import": {
       "post": {
         "description": "Creates one service per app, each building from its directory of the\nproject's repository and following it. Runs in the background like\n`POST /templates/{slug}/instantiate`: poll `GET /instantiations/{id}`.",
@@ -153200,6 +153556,15 @@
               "format": "int32",
               "type": "integer"
             }
+          },
+          {
+            "description": "Move a project that already belongs to another group out of it (that\ngroup's routes involving it are dropped). Without it, placing such a\nproject is refused with a 409 naming its group.",
+            "in": "query",
+            "name": "move",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -153211,7 +153576,7 @@
                 }
               }
             },
-            "description": "Project placed in the group (moved out of any other group)"
+            "description": "Project placed in the group (or already in it); with move=true, moved out of any other group"
           },
           "403": {
             "description": "Insufficient permissions on the project, or on the group's projects: joining gives it their shared variables, so it requires managing them; or no ProjectsWrite on a service whose route to or from the project is dropped by leaving its previous group"
@@ -153220,7 +153585,7 @@
             "description": "Project group or project not found, or a route that would be dropped involves a service the caller cannot see"
           },
           "409": {
-            "description": "A route involving the project appeared, the project changed group, or a project the caller cannot manage joined the destination group, while the request was being authorized; retry. Projects placed concurrently by a caller that may manage them do not conflict"
+            "description": "The project already belongs to another group and move=true was not passed (the detail names the group); or a route involving the project appeared, the project changed group, or a project the caller cannot manage joined the destination group, while the request was being authorized; retry. Projects placed concurrently by a caller that may manage them do not conflict"
           }
         },
         "security": [
@@ -154819,13 +155184,16 @@
                 }
               }
             },
-            "description": "Access granted (idempotent upsert)"
+            "description": "Access granted"
           },
           "403": {
             "description": "Insufficient permissions or no access to this project"
           },
           "404": {
-            "description": "Team not found"
+            "description": "Project or team not found"
+          },
+          "409": {
+            "description": "The team already has a grant on this project; change its role with PATCH /projects/{project_id}/access/{team_id}"
           }
         },
         "security": [
@@ -155974,6 +156342,118 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Teams"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "operationId": "get_project_access",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "team_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectAccessResponse"
+                }
+              }
+            },
+            "description": "The grant"
+          },
+          "403": {
+            "description": "Insufficient permissions or no access to this project"
+          },
+          "404": {
+            "description": "Project not found, or the team has no grant on it"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One team's grant on a project.",
+        "tags": [
+          "Teams"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "operationId": "update_project_access",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "team_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProjectAccessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectAccessResponse"
+                }
+              }
+            },
+            "description": "Grant updated"
+          },
+          "403": {
+            "description": "Insufficient permissions or no access to this project"
+          },
+          "404": {
+            "description": "Project not found, or the team has no grant on it"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change the role of a team's existing grant on a project. The same rules\nas granting apply: `projects:write` on the project, and neither the new\nnor the replaced role above the caller's own.",
         "tags": [
           "Teams"
         ],
@@ -162674,6 +163154,7 @@
     },
     "/projects/{project_id}/cron-monitors": {
       "get": {
+        "description": "Cron monitors are governed by the environments permissions: reading needs\n`environments:read`, changing them `environments:write`. The `crons:*`\npermissions govern deployment cron jobs, not these monitors.",
         "operationId": "listCronMonitors",
         "parameters": [
           {
@@ -162751,6 +163232,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "List a project's cron monitors.",
         "tags": [
           "Cron Monitors"
         ]
@@ -162817,6 +163299,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Create a cron monitor. Requires `environments:write` (see `listCronMonitors`).",
         "tags": [
           "Cron Monitors"
         ]
@@ -162878,6 +163361,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Delete a cron monitor. Requires `environments:write` (see `listCronMonitors`).",
         "tags": [
           "Cron Monitors"
         ]
@@ -162944,6 +163428,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Get one cron monitor. Requires `environments:read` (see `listCronMonitors`).",
         "tags": [
           "Cron Monitors"
         ]
@@ -163020,6 +163505,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Change a cron monitor. The `config` fields given replace the stored ones and\nthe omitted ones are kept. Requires `environments:write` (see `listCronMonitors`).",
         "tags": [
           "Cron Monitors"
         ]
@@ -163114,6 +163600,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "List a cron monitor's runs. Requires `environments:read` (see `listCronMonitors`).",
         "tags": [
           "Cron Monitors"
         ]
@@ -163157,12 +163644,13 @@
             "bearer_auth": []
           }
         ],
-        "summary": "List all custom domains for a project",
+        "summary": "List all custom domains for a project. Requires `projects:read`.",
         "tags": [
           "Custom Domains"
         ]
       },
       "post": {
+        "description": "Requires `projects:write` on the project. A project's custom domains are\ngoverned by the `projects:*` permissions, not `domains:*` (which governs\nthe instance's domains and certificates).",
         "operationId": "create_custom_domain",
         "parameters": [
           {
@@ -163265,7 +163753,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Delete a custom domain",
+        "summary": "Delete a custom domain. Requires `projects:delete`.",
         "tags": [
           "Custom Domains"
         ]
@@ -163320,7 +163808,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Get a custom domain by ID",
+        "summary": "Get a custom domain by ID. Requires `projects:read`.",
         "tags": [
           "Custom Domains"
         ]
@@ -163388,7 +163876,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Update a custom domain",
+        "summary": "Update a custom domain. Omitted fields are kept; unknown fields are refused.\nRequires `projects:write`.",
         "tags": [
           "Custom Domains"
         ]
@@ -163455,7 +163943,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Link a custom domain to a certificate",
+        "summary": "Link a custom domain to a certificate. Requires `projects:write`.",
         "tags": [
           "Custom Domains"
         ]
@@ -173982,6 +174470,7 @@
     },
     "/projects/{project_id}/error-alert-rules": {
       "get": {
+        "description": "Every new project starts with two rules, \"New issue detected\"\n(`new_issue`) and \"Regression detected\" (`regression`), both High\npriority with a 30-minute cooldown; they can be changed or deleted like\nany other rule.",
         "operationId": "list_alert_rules",
         "parameters": [
           {
@@ -174007,7 +174496,10 @@
                 }
               }
             },
-            "description": "List of alert rules"
+            "description": "List of alert rules, including the two default rules every project starts with"
+          },
+          "404": {
+            "description": "Project not found"
           },
           "500": {
             "description": "Internal server error"
@@ -174055,13 +174547,13 @@
             "description": "Alert rule created"
           },
           "400": {
-            "description": "Validation error"
+            "description": "Invalid field (the problem names it), including an environment_filter that is not one of the project's environments"
           },
           "404": {
             "description": "Project not found"
           },
           "409": {
-            "description": "Project already holds the maximum number of error alert rules"
+            "description": "Another rule of the project has this name, or the project already holds the maximum number of error alert rules"
           },
           "500": {
             "description": "Internal server error"
@@ -174210,10 +174702,13 @@
             "description": "Alert rule updated"
           },
           "400": {
-            "description": "Validation error"
+            "description": "Invalid field (the problem names it), including an environment_filter that is not one of the project's environments"
           },
           "404": {
-            "description": "Alert rule not found"
+            "description": "Project not found, or the rule is not one of the project's"
+          },
+          "409": {
+            "description": "Another rule of the project has this name"
           },
           "500": {
             "description": "Internal server error"
@@ -178505,6 +179000,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Delete an already archived flag for good, with its per-environment\nvalues, freeing its key for a new flag of any `value_type`. Refused\n(409) for a flag that is not archived. Defaults to false (archive).",
+            "in": "query",
+            "name": "purge",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -178516,7 +179020,7 @@
                 }
               }
             },
-            "description": "Flag archived"
+            "description": "Flag archived, or purged with `purge=true`"
           },
           "401": {
             "description": "Unauthorized"
@@ -178526,6 +179030,9 @@
           },
           "404": {
             "description": "Flag not found"
+          },
+          "409": {
+            "description": "`purge=true` on a flag that is not archived, or one restored concurrently"
           },
           "500": {
             "description": "Internal server error"
