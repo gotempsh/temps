@@ -398,6 +398,78 @@ async fn writes_are_scoped_to_the_project_and_its_environments() {
     ));
 }
 
+/// #2111: a rule whose environment was deleted can still be edited; only an
+/// environment the update moves it to is checked.
+#[tokio::test]
+async fn a_rule_of_a_deleted_environment_can_still_be_edited() {
+    let Some(test_db) = database().await else {
+        return;
+    };
+    let service = EdgeRuleService::new(test_db.connection_arc());
+    let (project_id, environment_id) = project(&test_db, "edge-deleted-env").await;
+    let (_, foreign_environment) = project(&test_db, "edge-deleted-env-other").await;
+    let mut scoped = block_admin();
+    scoped.environment_id = Some(environment_id);
+    let rule = service
+        .create(project_id, scoped, None)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    test_db
+        .query_sql(&format!(
+            "UPDATE environments SET deleted_at = NOW() WHERE id = {environment_id} RETURNING id"
+        ))
+        .await
+        .expect("soft-delete the environment");
+
+    let update = |body: serde_json::Value| -> UpdateEdgeRuleRequest {
+        serde_json::from_value(body).expect("valid update")
+    };
+    let (_, renamed) = service
+        .update(
+            project_id,
+            rule.id,
+            update(serde_json::json!({"name": "x"})),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("a rename keeps the binding: {e}"));
+    assert_eq!(renamed.name, "x");
+    assert_eq!(renamed.environment_id, Some(environment_id));
+    // Sending the stored environment back unchanged is not a move.
+    let (_, disabled) = service
+        .update(
+            project_id,
+            rule.id,
+            update(serde_json::json!({"enabled": false, "environment_id": environment_id})),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(!disabled.enabled);
+    // Moving it still checks the destination.
+    assert!(matches!(
+        service
+            .update(
+                project_id,
+                rule.id,
+                update(serde_json::json!({"environment_id": foreign_environment})),
+                None,
+            )
+            .await,
+        Err(EdgeRuleServiceError::EnvironmentNotFound { .. })
+    ));
+    let (_, unscoped) = service
+        .update(
+            project_id,
+            rule.id,
+            update(serde_json::json!({"environment_id": null})),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(unscoped.environment_id, None);
+}
+
 fn no_conditions(combinator: &str) -> serde_json::Value {
     serde_json::json!({"combinator": combinator, "children": []})
 }
