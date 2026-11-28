@@ -16,13 +16,21 @@ pub enum TeamError {
     #[error("Project {project_id} has no access grant for team {team_id}")]
     ProjectAccessNotFound { project_id: i32, team_id: i32 },
 
+    #[error("Project {project_id} not found")]
+    ProjectNotFound { project_id: i32 },
+
     #[error("Team slug '{slug}' is already taken")]
     SlugConflict { slug: String },
 
     #[error("Team {team_id} already has user {user_id} as a member")]
     DuplicateMember { team_id: i32, user_id: i32 },
 
-    #[error("Project {project_id} already grants access to team {team_id}")]
+    /// A grant is created once; changing its role is a PATCH of that grant,
+    /// so a second POST is refused rather than replacing the role silently.
+    #[error(
+        "Project {project_id} already grants access to team {team_id}; change its role with \
+         PATCH /projects/{project_id}/access/{team_id}"
+    )]
     DuplicateProjectAccess { project_id: i32, team_id: i32 },
 
     #[error("Validation error: {message}")]
@@ -94,6 +102,10 @@ pub enum TeamError {
 impl From<TeamError> for Problem {
     fn from(error: TeamError) -> Self {
         match error {
+            TeamError::ProjectNotFound { project_id } => {
+                temps_core::api_problems::project_not_found(project_id)
+            }
+
             TeamError::NotFound { .. }
             | TeamError::MemberNotFound { .. }
             | TeamError::ProjectAccessNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
@@ -111,11 +123,21 @@ impl From<TeamError> for Problem {
                 .with_title("Project Access Change Denied")
                 .with_detail(error.to_string()),
 
-            TeamError::SlugConflict { .. }
-            | TeamError::DuplicateMember { .. }
-            | TeamError::DuplicateProjectAccess { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Resource Conflict")
-                .with_detail(error.to_string()),
+            TeamError::DuplicateProjectAccess {
+                project_id,
+                team_id,
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type("https://temps.sh/probs/project-access-exists")
+                .with_title("Project Access Already Granted")
+                .with_detail(error.to_string())
+                .with_value("project_id", project_id)
+                .with_value("team_id", team_id),
+
+            TeamError::SlugConflict { .. } | TeamError::DuplicateMember { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Resource Conflict")
+                    .with_detail(error.to_string())
+            }
 
             // `CorruptStoredRole` and `PermissionResolution` are server-side
             // faults, not caller mistakes — a 4xx here would have an operator

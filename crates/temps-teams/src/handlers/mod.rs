@@ -25,7 +25,8 @@ use utoipa::OpenApi;
 use crate::checker::TeamProjectAccessChecker;
 use crate::service::{
     CreateProjectAccessRequest, CreateTeamMemberRequest, CreateTeamRequest, ProjectAccessResponse,
-    TeamMemberResponse, TeamService, UpdateMemberRoleRequest, UpdateTeamRequest,
+    TeamMemberResponse, TeamService, UpdateMemberRoleRequest, UpdateProjectAccessRequest,
+    UpdateTeamRequest,
 };
 
 /// Handler state shared across all teams routes.
@@ -84,6 +85,8 @@ pub fn router(state: Arc<TeamsAppState>) -> Router {
         teams::list_team_projects,
         project_access::list_project_access,
         project_access::grant_project_access,
+        project_access::get_project_access,
+        project_access::update_project_access,
         project_access::revoke_project_access,
     ),
     components(schemas(
@@ -95,6 +98,7 @@ pub fn router(state: Arc<TeamsAppState>) -> Router {
         UpdateTeamRequest,
         CreateTeamMemberRequest,
         CreateProjectAccessRequest,
+        UpdateProjectAccessRequest,
         UpdateMemberRoleRequest,
         temps_entities::TeamRole,
     )),
