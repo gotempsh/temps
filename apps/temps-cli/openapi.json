@@ -117838,6 +117838,16 @@
           "204": {
             "description": "Service detached"
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Detaching would leave the schedule with nothing to back up"
+          },
           "401": {
             "content": {
               "application/json": {
@@ -117884,7 +117894,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Detach a single external service from a backup schedule. Returns `204` when\nthe service was detached, and `404` when it wasn't attached to the schedule.",
+        "summary": "Detach a single external service from a backup schedule. Returns `204` when\nthe service was detached, `404` when it wasn't attached to the schedule, and\n`400` when it is the last database of a schedule that does not include the\ncontrol plane (the schedule would back up nothing).",
         "tags": [
           "Backups"
         ]

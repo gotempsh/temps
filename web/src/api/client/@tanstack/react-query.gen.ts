@@ -6040,7 +6040,9 @@ export const attachScheduleServicesMutation = (options?: Partial<Options<AttachS
 
 /**
  * Detach a single external service from a backup schedule. Returns `204` when
- * the service was detached, and `404` when it wasn't attached to the schedule.
+ * the service was detached, `404` when it wasn't attached to the schedule, and
+ * `400` when it is the last database of a schedule that does not include the
+ * control plane (the schedule would back up nothing).
  */
 export const detachScheduleServiceMutation = (options?: Partial<Options<DetachScheduleServiceData>>): UseMutationOptions<DetachScheduleServiceResponse, DetachScheduleServiceError, Options<DetachScheduleServiceData>> => {
     const mutationOptions: UseMutationOptions<DetachScheduleServiceResponse, DetachScheduleServiceError, Options<DetachScheduleServiceData>> = {
