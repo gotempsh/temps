@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Bound for a single MongoDB backup `docker exec`. Mongo dumps can be
 /// large; 4 hours is a reasonable middle ground.
@@ -421,6 +421,21 @@ impl MongodbService {
             .container_name
             .clone()
             .unwrap_or_else(|| self.get_container_name())
+    }
+
+    /// Host and port this process connects to the server on.
+    ///
+    /// `config.host` and `config.port` are the stored loopback address the
+    /// container publishes. A containerized control plane cannot reach that,
+    /// so every connection opened here goes through this instead of reading
+    /// those fields (see `crate::externalsvc::dial`).
+    fn dial_address(&self, config: &MongodbRuntimeConfig) -> (String, String) {
+        crate::externalsvc::dial::engine_dial_address(
+            &config.host,
+            &config.port,
+            &self.get_live_container_name(config),
+            MONGODB_INTERNAL_PORT,
+        )
     }
 
     fn get_effective_address_for_environment(
@@ -1029,12 +1044,13 @@ impl MongodbService {
         // loopback and is unreachable from the host or from sibling
         // containers. Direct connection bypasses discovery and is safe on
         // standalone too. See ReplicaSetNoPrimary failure mode.
+        let (host, port) = self.dial_address(&config);
         let connection_string = format!(
             "mongodb://{}:{}@{}:{}/?authSource=admin&directConnection=true",
             urlencoding::encode(&config.username),
             urlencoding::encode(&config.password),
-            config.host,
-            config.port
+            host,
+            port
         );
 
         let client_options = ClientOptions::parse(&connection_string)
@@ -2566,12 +2582,13 @@ impl ExternalService for MongodbService {
         // probe checks *this* node instead of chasing the member address
         // advertised by `rs.initiate` (`127.0.0.1:27017`, unreachable from
         // outside the container). Safe on standalone too.
+        let (host, port) = self.dial_address(&cfg);
         let uri = format!(
             "mongodb://{}:{}@{}:{}/?authSource=admin&directConnection=true&serverSelectionTimeoutMS=3000&connectTimeoutMS=3000",
             urlencoding::encode(&cfg.username),
             urlencoding::encode(&cfg.password),
-            cfg.host,
-            cfg.port
+            host,
+            port
         );
 
         let start = Instant::now();
@@ -2596,7 +2613,7 @@ impl ExternalService for MongodbService {
             Err(e) => {
                 return Ok(HealthProbeResult::down(format!(
                     "mongodb probe to {}:{} connect failed: {}",
-                    cfg.host, cfg.port, e
+                    host, port, e
                 )));
             }
         };
@@ -2619,13 +2636,13 @@ impl ExternalService for MongodbService {
         match probe_outcome {
             Err(_) => Ok(HealthProbeResult::down(format!(
                 "mongodb probe to {}:{} timed out after {}s",
-                cfg.host,
-                cfg.port,
+                host,
+                port,
                 PROBE_TIMEOUT.as_secs()
             ))),
             Ok(Err(msg)) => Ok(HealthProbeResult::down(format!(
                 "mongodb probe to {}:{} {}",
-                cfg.host, cfg.port, msg
+                host, port, msg
             ))),
             Ok(Ok(())) => {
                 let elapsed_ms = start.elapsed().as_millis();
@@ -3690,6 +3707,13 @@ impl ExternalService for MongodbService {
             .trim_start_matches('/')
             .to_string();
 
+        // Ports the container listens on and publishes, to find the engine
+        // port behind the one the operator entered.
+        let published_ports = container
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.ports.clone());
+
         // Extract image name and version
         let image = container.config.and_then(|c| c.image).ok_or_else(|| {
             EngineError::failed(
@@ -3720,17 +3744,42 @@ impl ExternalService for MongodbService {
             .cloned()
             .unwrap_or_else(|| "admin".to_string());
 
-        // Build connection URL for verification
+        // Join the Temps network first: a containerized control plane reaches
+        // the imported container by name on it, so it must be attached before
+        // the credentials can be checked.
+        crate::externalsvc::import_attach::attach_imported_container(
+            &self.docker,
+            &self.name,
+            "MongoDB",
+            &container_id,
+            &imported_container_name,
+        )
+        .await?;
+        let (dial_host, dial_port) = crate::externalsvc::import_attach::import_dial_address(
+            published_ports.as_ref(),
+            &port,
+            &imported_container_name,
+            MONGODB_INTERNAL_PORT,
+        );
+
+        // Build connection URL for verification. `directConnection` keeps the
+        // driver on this address: a replica-set member advertises the host it
+        // was initiated with (often its own loopback), which is not reachable
+        // from here.
         let connection_url = if let (Some(user), Some(pass)) = (&username, &password) {
             format!(
-                "mongodb://{}:{}@localhost:{}/{}",
+                "mongodb://{}:{}@{}:{}/{}?directConnection=true",
                 urlencoding::encode(user),
                 urlencoding::encode(pass),
-                port,
+                dial_host,
+                dial_port,
                 database
             )
         } else {
-            format!("mongodb://localhost:{}", port)
+            format!(
+                "mongodb://{}:{}/?directConnection=true",
+                dial_host, dial_port
+            )
         };
 
         // Verify connection to the imported service. Connects directly with
@@ -3759,46 +3808,12 @@ impl ExternalService for MongodbService {
             EngineError::connection(
                 &self.name,
                 format!(
-                    "Failed to connect to MongoDB at localhost:{} with provided credentials: {}",
-                    port, e
+                    "Failed to connect to MongoDB container '{}' at {}:{} with provided credentials: {}",
+                    imported_container_name, dial_host, dial_port, e
                 ),
             )
         })?;
         info!("Successfully verified MongoDB connection for import");
-
-        let network_ready = match ensure_network_exists(&self.docker).await {
-            Ok(()) => true,
-            Err(e) => {
-                warn!(
-                    "Failed to ensure Temps Docker network before MongoDB import attach: {:?}",
-                    e
-                );
-                false
-            }
-        };
-        if network_ready {
-            let network_name = temps_core::NETWORK_NAME.as_str();
-            let request = bollard::models::NetworkConnectRequest {
-                container: container_id.clone(),
-                ..Default::default()
-            };
-            match self.docker.connect_network(network_name, request).await {
-                Ok(()) => info!(
-                    "Attached imported MongoDB container '{}' to {}",
-                    imported_container_name, network_name
-                ),
-                Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 403, ..
-                }) => debug!(
-                    "Imported MongoDB container '{}' is already attached to {}",
-                    imported_container_name, network_name
-                ),
-                Err(e) => warn!(
-                    "Failed to attach imported MongoDB container '{}' to {}: {}",
-                    imported_container_name, network_name, e
-                ),
-            }
-        }
 
         // Build the ServiceConfig for registration
         let config = ServiceConfig {

@@ -14,6 +14,7 @@ import {
   listPresetsOptions,
   revealServiceEnvironmentVariablesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { presetUnavailableReason } from '@/lib/compose-check'
 import { invalidateProjectLists } from '@/lib/project-list-cache'
 import { detectPublicPresets } from '@/api/client/sdk.gen'
 import {
@@ -1147,6 +1148,10 @@ export function ProjectConfigurator({
     [presetData?.presets, selectedPreset]
   )
   const selectedPresetName = selectedPreset?.split('::')[0]?.toLowerCase()
+  const unavailablePresetReason = presetUnavailableReason(
+    allPresetsData?.presets,
+    selectedPreset
+  )
   const effectiveDetectedPort =
     selectedPresetName === 'dockerfile' &&
     (selectedDockerfilePath || 'Dockerfile') === 'Dockerfile'
@@ -1777,6 +1782,15 @@ export function ProjectConfigurator({
             />
           </CollapsibleContent>
         </Collapsible>
+      )}
+
+      {/* A preset this instance cannot deploy stays selectable in the list so
+          the limit is explained here, where the choice is made. */}
+      {unavailablePresetReason && (
+        <Alert variant="destructive">
+          <AlertCircle className="h-4 w-4" />
+          <AlertDescription>{unavailablePresetReason}</AlertDescription>
+        </Alert>
       )}
 
       {/* Docker Compose Configuration */}
@@ -2665,7 +2679,10 @@ export function ProjectConfigurator({
                 Cancel
               </Button>
             )}
-            <Button type="submit" disabled={isSubmitting}>
+            <Button
+              type="submit"
+              disabled={isSubmitting || unavailablePresetReason !== null}
+            >
               {isSubmitting ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />

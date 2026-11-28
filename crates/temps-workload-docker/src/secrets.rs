@@ -1,10 +1,22 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Secret files delivered at `/run/secrets` (read-only bind of a
-//! per-container host directory, mode 0700, files 0400, owned by the
-//! image's `USER`). Shared by the legacy deployer and [`crate::DockerDriver`]
-//! so both deliver secrets the same way.
+//! Secret files delivered at `/run/secrets` (mode 0700, files 0400, owned
+//! by the image's `USER`). Shared by the legacy deployer and
+//! [`crate::DockerDriver`] so both deliver secrets the same way.
+//!
+//! There are two ways to put them there, and which one works depends on
+//! whether the Docker daemon sees this process's filesystem
+//! ([`SecretDelivery`]):
+//!
+//! - a read-only bind of a per-container directory this process wrote. The
+//!   bind source is resolved by the daemon, so this needs a shared
+//!   filesystem: a native process;
+//! - an upload into the created container through the daemon
+//!   ([`upload_secrets`]). The daemon writes the files and sets their owner,
+//!   so it works wherever the daemon is and needs no privilege here: a
+//!   process running in a container, whose paths the daemon cannot see and
+//!   which usually may not `chown`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +51,124 @@ pub fn default_secrets_root() -> PathBuf {
                 .join(".temps")
         });
     base.join("secrets")
+}
+
+/// How secret files reach a workload's `/run/secrets`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretDelivery {
+    /// Written to `<root>/<instance>` and bound read-only. The root must be
+    /// a directory the Docker daemon sees at the same path, and must survive
+    /// a reboot: the bind lasts the container's whole life.
+    HostDirectory(PathBuf),
+    /// Uploaded into the created container through the daemon, before it
+    /// starts. Nothing is written on this process's side.
+    Upload,
+}
+
+/// Where uploaded secrets are extracted. `/` exists in every image, and the
+/// daemon creates the missing parents of an archive entry, so `/run/secrets`
+/// appears even in an image built from `scratch`.
+const UPLOAD_EXTRACT_DIR: &str = "/";
+
+/// The directory of the secret files, relative to [`UPLOAD_EXTRACT_DIR`].
+const UPLOAD_SECRETS_DIR: &str = "run/secrets";
+
+/// A secret's name becomes a file name: it must be one path component.
+fn validate_secret_key(key: &str) -> std::io::Result<()> {
+    if key.is_empty()
+        || key == "."
+        || key == ".."
+        || key.contains('/')
+        || key.contains('\\')
+        || key.contains('\0')
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "invalid secret key '{}': contains path-separator characters",
+                key
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A tar archive that extracts, at the root of a container, to
+/// `/run/secrets` (mode 0700) holding one file per secret (mode 0400), all
+/// owned by `owner`.
+///
+/// Entries are ordered by name, and carry no timestamps, so the same secrets
+/// always produce the same archive.
+pub fn secrets_archive(
+    secrets: &HashMap<String, String>,
+    owner: (u32, u32),
+) -> std::io::Result<Vec<u8>> {
+    let (uid, gid) = owner;
+    let mut archive = tar::Builder::new(Vec::new());
+
+    let mut directory = tar::Header::new_gnu();
+    directory.set_entry_type(tar::EntryType::Directory);
+    directory.set_mode(0o700);
+    directory.set_uid(u64::from(uid));
+    directory.set_gid(u64::from(gid));
+    directory.set_size(0);
+    directory.set_mtime(0);
+    archive.append_data(
+        &mut directory,
+        format!("{UPLOAD_SECRETS_DIR}/"),
+        std::io::empty(),
+    )?;
+
+    let mut keys: Vec<&String> = secrets.keys().collect();
+    keys.sort();
+    for key in keys {
+        validate_secret_key(key)?;
+        let value = secrets[key].as_bytes();
+        let mut file = tar::Header::new_gnu();
+        file.set_entry_type(tar::EntryType::Regular);
+        file.set_mode(0o400);
+        file.set_uid(u64::from(uid));
+        file.set_gid(u64::from(gid));
+        file.set_size(value.len() as u64);
+        file.set_mtime(0);
+        archive.append_data(&mut file, format!("{UPLOAD_SECRETS_DIR}/{key}"), value)?;
+    }
+    archive.into_inner()
+}
+
+/// Put `secrets` at `/run/secrets` of the created, not yet started
+/// `container`, owned by `owner`.
+///
+/// The daemon extracts the archive as root and applies the owner and modes
+/// it carries, so this process needs neither a filesystem the daemon can see
+/// nor the right to `chown`. The files live in the container's writable
+/// layer: they survive a restart and a reboot, and go when the container is
+/// removed.
+pub async fn upload_secrets(
+    docker: &Docker,
+    container: &str,
+    secrets: &HashMap<String, String>,
+    owner: (u32, u32),
+) -> std::io::Result<()> {
+    let archive = secrets_archive(secrets, owner)?;
+    docker
+        .upload_to_container(
+            container,
+            Some(bollard::query_parameters::UploadToContainerOptions {
+                path: UPLOAD_EXTRACT_DIR.to_string(),
+                ..Default::default()
+            }),
+            bollard::body_full(archive.into()),
+        )
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "upload {} secret file(s) into container '{}': {}",
+                secrets.len(),
+                container,
+                error
+            ))
+        })
 }
 
 pub fn validate_secret_dir_name(name: &str) -> std::io::Result<()> {
@@ -159,21 +289,7 @@ pub fn write_secrets_to_host_dir(
     for (key, value) in secrets {
         // Keys must be plain identifiers — defense-in-depth even though
         // SecretService::validate_secret_key already enforces this.
-        if key.is_empty()
-            || key == "."
-            || key == ".."
-            || key.contains('/')
-            || key.contains('\\')
-            || key.contains('\0')
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "invalid secret key '{}': contains path-separator characters",
-                    key
-                ),
-            ));
-        }
+        validate_secret_key(key)?;
         let path = dir.join(key);
         let mut f = fs::File::create(&path)?;
         f.write_all(value.as_bytes())?;
@@ -308,6 +424,193 @@ pub async fn image_owner(docker: &Docker, image: &str) -> (u32, u32) {
     }
 }
 
+/// Largest `/etc/passwd` or `/etc/group` read from a container to resolve a
+/// named `USER`. Real account files are a few kilobytes; anything larger is
+/// not read, and the owner falls back as for an unresolvable name.
+const MAX_ACCOUNT_FILE_BYTES: usize = 1024 * 1024;
+
+/// `(uid, primary gid)` of account `name` in passwd-format `passwd`.
+fn passwd_lookup(passwd: &str, name: &str) -> Option<(u32, u32)> {
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        if fields.next()? != name {
+            return None;
+        }
+        let _password = fields.next()?;
+        let uid = fields.next()?.trim().parse().ok()?;
+        let gid = fields.next()?.trim().parse().ok()?;
+        Some((uid, gid))
+    })
+}
+
+/// Primary gid of the account with `uid` in passwd-format `passwd`.
+fn passwd_primary_gid(passwd: &str, uid: u32) -> Option<u32> {
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':').skip(2);
+        let entry_uid: u32 = fields.next()?.trim().parse().ok()?;
+        if entry_uid != uid {
+            return None;
+        }
+        fields.next()?.trim().parse().ok()
+    })
+}
+
+/// gid of group `name` in group-format `group`.
+fn group_lookup(group: &str, name: &str) -> Option<u32> {
+    group.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        if fields.next()? != name {
+            return None;
+        }
+        let _password = fields.next()?;
+        fields.next()?.trim().parse().ok()
+    })
+}
+
+/// Resolve a `USER` spec to `(uid, gid)` the way the container runtime
+/// does, using the image's own account files for names.
+///
+/// A user given by name takes its uid and primary group from `passwd`; a
+/// user given by number takes its primary group from `passwd` when listed
+/// there, else the uid. A group given by name is looked up in `group`.
+/// `None` when a name is not listed (or its file could not be read).
+pub fn resolve_user_spec(
+    spec: &str,
+    passwd: Option<&str>,
+    group: Option<&str>,
+) -> Option<(u32, u32)> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Some((0, 0));
+    }
+    let (user_part, group_part) = match spec.split_once(':') {
+        Some((user, group)) => (user, Some(group)),
+        None => (spec, None),
+    };
+
+    let (uid, primary_gid) = if user_part.is_empty() {
+        (0, 0)
+    } else if let Ok(uid) = user_part.parse::<u32>() {
+        let gid = passwd
+            .and_then(|passwd| passwd_primary_gid(passwd, uid))
+            .unwrap_or(uid);
+        (uid, gid)
+    } else if user_part == "root" {
+        (0, 0)
+    } else {
+        passwd_lookup(passwd?, user_part)?
+    };
+
+    let gid = match group_part {
+        None | Some("") => primary_gid,
+        Some(name) => match name.parse::<u32>() {
+            Ok(gid) => gid,
+            Err(_) => group_lookup(group?, name)?,
+        },
+    };
+    Some((uid, gid))
+}
+
+/// Contents of the regular file at `path` in `container` (created or
+/// running), through the daemon's archive API. `None` when it is missing,
+/// not a regular file, larger than [`MAX_ACCOUNT_FILE_BYTES`] or unreadable.
+async fn read_container_file(docker: &Docker, container: &str, path: &str) -> Option<String> {
+    use futures::StreamExt;
+    use std::io::Read;
+
+    let mut stream = docker.download_from_container(
+        container,
+        Some(bollard::query_parameters::DownloadFromContainerOptions {
+            path: path.to_string(),
+        }),
+    );
+    // The archive holds one entry: a header block, the file and padding.
+    let limit = MAX_ACCOUNT_FILE_BYTES + 64 * 1024;
+    let mut archive = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        archive.extend_from_slice(&chunk.ok()?);
+        if archive.len() > limit {
+            return None;
+        }
+    }
+
+    let mut reader = tar::Archive::new(archive.as_slice());
+    let mut entry = reader.entries().ok()?.next()?.ok()?;
+    if !entry.header().entry_type().is_file() {
+        return None;
+    }
+    let mut contents = String::new();
+    entry
+        .by_ref()
+        .take(MAX_ACCOUNT_FILE_BYTES as u64)
+        .read_to_string(&mut contents)
+        .ok()?;
+    Some(contents)
+}
+
+/// The `(uid, gid)` created container `container` will run as, so secrets
+/// uploaded into it can be owned by that user.
+///
+/// Unlike [`image_owner`], this resolves a named `USER` (`USER node`) from
+/// the container's own `/etc/passwd` and `/etc/group`, which the daemon can
+/// read before the container starts. Falls back to `(0, 0)`, logged, when
+/// the container cannot be inspected or the name is not listed there.
+pub async fn container_owner(docker: &Docker, container: &str) -> (u32, u32) {
+    let inspect = match docker
+        .inspect_container(
+            container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+    {
+        Ok(inspect) => inspect,
+        Err(e) => {
+            warn!(
+                "Failed to inspect container '{}' for secrets ownership; defaulting to root: {}",
+                container, e
+            );
+            return (0, 0);
+        }
+    };
+    let user_spec = inspect
+        .config
+        .as_ref()
+        .and_then(|c| c.user.clone())
+        .unwrap_or_default();
+    let (user_part, group_part) = match user_spec.trim().split_once(':') {
+        Some((user, group)) => (user, Some(group)),
+        None => (user_spec.trim(), None),
+    };
+    let numeric_group = group_part.is_some_and(|group| group.parse::<u32>().is_ok());
+    if group_part.is_none() && (user_part.is_empty() || user_part == "root") {
+        return (0, 0);
+    }
+    if user_part.parse::<u32>().is_ok() && numeric_group {
+        // Fully numeric `uid:gid`: no account file needed.
+        return resolve_user_spec(&user_spec, None, None).unwrap_or((0, 0));
+    }
+
+    let passwd = read_container_file(docker, container, "/etc/passwd").await;
+    let group = match group_part {
+        Some(group) if !group.is_empty() && !numeric_group => {
+            read_container_file(docker, container, "/etc/group").await
+        }
+        _ => None,
+    };
+    match resolve_user_spec(&user_spec, passwd.as_deref(), group.as_deref()) {
+        Some(owner) => owner,
+        None => {
+            warn!(
+                "Container '{}' runs as USER='{}', which its /etc/passwd and /etc/group do \
+                 not resolve; secrets will be owned by root and may be unreadable. Use a \
+                 numeric USER (e.g. USER 1000:1000) for this image.",
+                container, user_spec
+            );
+            (0, 0)
+        }
+    }
+}
+
 /// The bind that mounts `dir` read-only at `/run/secrets`.
 pub fn secrets_bind(dir: &Path) -> String {
     format!("{}:/run/secrets:ro", dir.display())
@@ -332,6 +635,195 @@ pub fn remove_secrets_dir(dir: &Path) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// (path, is_dir, mode, uid, gid, contents) of every archive entry.
+    fn archive_entries(archive: &[u8]) -> Vec<(String, bool, u32, u64, u64, String)> {
+        use std::io::Read;
+
+        let mut reader = tar::Archive::new(archive);
+        reader
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let mut entry = entry.unwrap();
+                let header = entry.header().clone();
+                let mut contents = String::new();
+                entry.read_to_string(&mut contents).unwrap();
+                (
+                    entry.path().unwrap().to_string_lossy().into_owned(),
+                    header.entry_type().is_dir(),
+                    header.mode().unwrap(),
+                    header.uid().unwrap(),
+                    header.gid().unwrap(),
+                    contents,
+                )
+            })
+            .collect()
+    }
+
+    const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\n\
+                          daemon:x:1:1::/usr/sbin:/usr/sbin/nologin\n\
+                          node:x:1000:1000::/home/node:/bin/sh\n\
+                          app:x:10001:2000::/app:/bin/sh\n";
+    const GROUP: &str = "root:x:0:\nnode:x:1000:\napps:x:2000:app\nshared:x:3000:node,app\n";
+
+    #[test]
+    fn test_named_user_resolves_to_uid_and_primary_group() {
+        assert_eq!(
+            resolve_user_spec("node", Some(PASSWD), None),
+            Some((1000, 1000))
+        );
+        assert_eq!(
+            resolve_user_spec("app", Some(PASSWD), None),
+            Some((10001, 2000))
+        );
+    }
+
+    #[test]
+    fn test_numeric_user_takes_primary_group_from_passwd_when_listed() {
+        assert_eq!(
+            resolve_user_spec("10001", Some(PASSWD), None),
+            Some((10001, 2000))
+        );
+        // Not listed: the group defaults to the uid, as before.
+        assert_eq!(
+            resolve_user_spec("4242", Some(PASSWD), None),
+            Some((4242, 4242))
+        );
+        assert_eq!(resolve_user_spec("4242", None, None), Some((4242, 4242)));
+    }
+
+    #[test]
+    fn test_explicit_group_by_name_or_number_overrides_primary_group() {
+        assert_eq!(
+            resolve_user_spec("node:shared", Some(PASSWD), Some(GROUP)),
+            Some((1000, 3000))
+        );
+        assert_eq!(
+            resolve_user_spec("node:55", Some(PASSWD), None),
+            Some((1000, 55))
+        );
+        assert_eq!(
+            resolve_user_spec("1000:1000", None, None),
+            Some((1000, 1000))
+        );
+    }
+
+    #[test]
+    fn test_root_and_empty_user_are_root() {
+        assert_eq!(resolve_user_spec("", None, None), Some((0, 0)));
+        assert_eq!(resolve_user_spec("root", None, None), Some((0, 0)));
+    }
+
+    #[test]
+    fn test_unlisted_names_or_missing_files_do_not_resolve() {
+        assert_eq!(resolve_user_spec("ghost", Some(PASSWD), None), None);
+        assert_eq!(resolve_user_spec("node", None, None), None);
+        assert_eq!(
+            resolve_user_spec("node:nogroup", Some(PASSWD), Some(GROUP)),
+            None
+        );
+        assert_eq!(resolve_user_spec("node:shared", Some(PASSWD), None), None);
+    }
+
+    #[test]
+    fn test_malformed_account_lines_are_skipped() {
+        let passwd = "node\nnode:x:notanumber:1\nnode:x:1000:1000::/home/node:/bin/sh\n";
+
+        assert_eq!(
+            resolve_user_spec("node", Some(passwd), None),
+            Some((1000, 1000))
+        );
+        assert_eq!(
+            resolve_user_spec("1000", Some(passwd), None),
+            Some((1000, 1000))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_container_owner_falls_back_to_root_when_docker_is_unreachable() {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .unwrap();
+
+        assert_eq!(container_owner(&docker, "missing").await, (0, 0));
+    }
+
+    #[test]
+    fn test_secrets_archive_holds_a_private_directory_owned_by_the_image_user() {
+        let secrets = HashMap::from([
+            ("DB_PASSWORD".to_string(), "s3cret".to_string()),
+            ("API_KEY".to_string(), "abc\ndef".to_string()),
+        ]);
+
+        let archive = secrets_archive(&secrets, (65532, 65532)).unwrap();
+
+        assert_eq!(
+            archive_entries(&archive),
+            vec![
+                (
+                    "run/secrets/".to_string(),
+                    true,
+                    0o700,
+                    65532,
+                    65532,
+                    String::new()
+                ),
+                (
+                    "run/secrets/API_KEY".to_string(),
+                    false,
+                    0o400,
+                    65532,
+                    65532,
+                    "abc\ndef".to_string()
+                ),
+                (
+                    "run/secrets/DB_PASSWORD".to_string(),
+                    false,
+                    0o400,
+                    65532,
+                    65532,
+                    "s3cret".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_secrets_archive_is_the_same_for_the_same_secrets() {
+        let secrets = HashMap::from([
+            ("B".to_string(), "2".to_string()),
+            ("A".to_string(), "1".to_string()),
+            ("C".to_string(), "3".to_string()),
+        ]);
+
+        assert_eq!(
+            secrets_archive(&secrets, (0, 0)).unwrap(),
+            secrets_archive(&secrets.clone(), (0, 0)).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_secrets_archive_refuses_a_key_that_escapes_the_directory() {
+        for key in ["../etc/passwd", "a/b", "", ".", ".."] {
+            let secrets = HashMap::from([(key.to_string(), "v".to_string())]);
+
+            let error = secrets_archive(&secrets, (0, 0)).unwrap_err();
+
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{key:?}");
+            assert!(error.to_string().contains("invalid secret key"), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn test_secrets_archive_of_no_secrets_still_creates_the_directory() {
+        let archive = secrets_archive(&HashMap::new(), (1000, 1000)).unwrap();
+
+        let entries = archive_entries(&archive);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "run/secrets/");
+        assert!(entries[0].1);
+    }
 
     #[test]
     fn test_write_secrets_to_host_dir_creates_files_with_correct_perms() {

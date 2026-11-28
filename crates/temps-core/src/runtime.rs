@@ -40,6 +40,38 @@ impl fmt::Display for ExecutionEnvironment {
     }
 }
 
+/// Why a containerized control plane cannot deploy Docker Compose projects.
+///
+/// Quoted verbatim by every surface that refuses one — project creation, the
+/// preset catalog, the Compose host status and the deploy job — so an operator
+/// reads the same sentence wherever they meet the limit.
+pub const COMPOSE_PROJECTS_UNSUPPORTED_IN_CONTAINER: &str =
+    "Docker Compose projects are not supported while Temps itself runs in a container. \
+     A Compose stack is built and mounted from files on the Docker host, which a \
+     containerized Temps does not share. Deploy the application as a Dockerfile, image or \
+     framework project instead, or run Temps directly on the host to use Compose.";
+
+impl ExecutionEnvironment {
+    /// Whether a control plane in this environment can deploy Docker Compose
+    /// projects.
+    ///
+    /// Compose resolves build contexts, bind mounts, env files and secrets as
+    /// paths on the machine the Docker daemon runs on. A native control plane
+    /// shares that filesystem; a containerized one does not.
+    pub fn supports_compose_projects(self) -> bool {
+        match self {
+            Self::Host => true,
+            Self::Docker => false,
+        }
+    }
+
+    /// Operator-facing reason Compose projects are refused, `None` when they
+    /// are supported.
+    pub fn compose_projects_unsupported_reason(self) -> Option<&'static str> {
+        (!self.supports_compose_projects()).then_some(COMPOSE_PROJECTS_UNSUPPORTED_IN_CONTAINER)
+    }
+}
+
 /// Which bootstrap input selected the execution environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionEnvironmentSource {
@@ -349,6 +381,25 @@ pub fn execution_environment_compatibility() -> ExecutionEnvironment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_native_control_plane_supports_compose_projects() {
+        assert!(ExecutionEnvironment::Host.supports_compose_projects());
+        assert_eq!(
+            ExecutionEnvironment::Host.compose_projects_unsupported_reason(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_containerized_control_plane_refuses_compose_projects_with_a_reason() {
+        assert!(!ExecutionEnvironment::Docker.supports_compose_projects());
+        let reason = ExecutionEnvironment::Docker
+            .compose_projects_unsupported_reason()
+            .expect("a containerized control plane must explain the refusal");
+        assert!(reason.contains("not supported while Temps itself runs in a container"));
+        assert!(reason.contains("Dockerfile"));
+    }
 
     const PROCESS_ENVIRONMENT_CHILD: &str = "TEMPS_RUNTIME_PROCESS_ENVIRONMENT_CHILD";
     const NON_UNICODE_CHILD: &str = "TEMPS_RUNTIME_NON_UNICODE_CHILD";

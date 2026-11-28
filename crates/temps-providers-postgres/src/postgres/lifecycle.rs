@@ -62,6 +62,21 @@ impl PostgresService {
             .unwrap_or_else(|| self.get_container_name())
     }
 
+    /// Host and port this process connects to the service on.
+    ///
+    /// `config.host` and `config.port` are the stored loopback address the
+    /// container publishes. A containerized control plane cannot reach that,
+    /// so every connection opened here goes through this instead of reading
+    /// those fields (see `crate::externalsvc::dial`).
+    pub(super) fn dial_address(&self, config: &PostgresConfig) -> (String, String) {
+        crate::externalsvc::dial::engine_dial_address(
+            &config.host,
+            &config.port,
+            &self.get_live_container_name(config),
+            POSTGRES_INTERNAL_PORT,
+        )
+    }
+
     pub(super) fn get_effective_address_for_environment(
         &self,
         service_config: ServiceConfig,
@@ -862,12 +877,13 @@ impl PostgresService {
         Self::validate_database_name(name)?;
 
         let config: PostgresConfig = self.get_postgres_config(service_config)?;
+        let (host, port) = self.dial_address(&config);
         let connection_string = format!(
             "postgres://{}:{}@{}:{}/postgres?sslmode=disable",
             urlencoding::encode(&config.username),
             urlencoding::encode(&config.password),
-            config.host,
-            config.port
+            host,
+            port
         );
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(config.max_connections)

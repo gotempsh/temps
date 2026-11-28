@@ -53,52 +53,85 @@ impl PostgresWorkflowJournal {
         if service.service_type != "postgres" {
             return Err(fail("service must be managed PostgreSQL"));
         }
-        let config = self
+        let service_config = self
             .manager
             .get_service_config(scope.service_id)
             .await
             .map_err(|_| fail("credentials are unavailable"))?;
         let config: temps_providers_postgres::postgres::PostgresInputConfig =
-            serde_json::from_value(config.parameters)
+            serde_json::from_value(service_config.parameters.clone())
                 .map_err(|_| fail("invalid PostgreSQL configuration"))?;
-        let (host, port) = match self
-            .manager
-            .get_cluster_primary_address(scope.service_id)
-            .await
-            .map_err(|_| fail("cannot resolve primary"))?
-        {
-            Some(endpoint) => endpoint,
-            None => {
-                if !matches!(config.host.as_str(), "localhost" | "127.0.0.1" | "::1") {
-                    return Err(fail("standalone host must be loopback"));
-                }
-                let host = self
-                    .manager
-                    .worker_data_address(&service)
-                    .await
-                    .map_err(|_| fail("cannot resolve worker"))?
-                    .unwrap_or(config.host);
-                let port = config
-                    .port
-                    .as_deref()
-                    .and_then(|v| v.parse::<u16>().ok())
-                    .filter(|v| *v > 0)
-                    .ok_or_else(|| fail("missing managed port"))?;
-                (host, port)
-            }
-        };
         let password = config
             .password
             .as_deref()
             .ok_or_else(|| fail("missing managed credentials"))?;
-        let client = temps_providers_postgres::query::connect_with_private_tls_ladder(
-            &host,
-            port,
-            &config.username,
-            password,
-            &config.database,
-        )
-        .await
+        let primary = self
+            .manager
+            .get_cluster_primary_address(scope.service_id)
+            .await
+            .map_err(|_| fail("cannot resolve primary"))?;
+        let client = match primary {
+            Some((host, port)) => {
+                temps_providers_postgres::query::connect_with_private_tls_ladder(
+                    &host,
+                    port,
+                    &config.username,
+                    password,
+                    &config.database,
+                )
+                .await
+            }
+            None => {
+                if !matches!(config.host.as_str(), "localhost" | "127.0.0.1" | "::1") {
+                    return Err(fail("standalone host must be loopback"));
+                }
+                let worker = self
+                    .manager
+                    .worker_data_address(&service)
+                    .await
+                    .map_err(|_| fail("cannot resolve worker"))?;
+                // A containerized control plane reaches a service on its own
+                // daemon at the address Docker reports for the service's
+                // container on the Temps network.
+                let local = match worker {
+                    Some(_) => None,
+                    None => self
+                        .manager
+                        .local_container_address(&service, &service_config)
+                        .await
+                        .map_err(|_| fail("cannot resolve the service container"))?,
+                };
+                match local {
+                    Some(local) => {
+                        temps_providers_postgres::query::connect_to_local_container(
+                            local.address,
+                            local.port,
+                            &config.username,
+                            password,
+                            &config.database,
+                        )
+                        .await
+                    }
+                    None => {
+                        let host = worker.unwrap_or(config.host.clone());
+                        let port = config
+                            .port
+                            .as_deref()
+                            .and_then(|v| v.parse::<u16>().ok())
+                            .filter(|v| *v > 0)
+                            .ok_or_else(|| fail("missing managed port"))?;
+                        temps_providers_postgres::query::connect_with_private_tls_ladder(
+                            &host,
+                            port,
+                            &config.username,
+                            password,
+                            &config.database,
+                        )
+                        .await
+                    }
+                }
+            }
+        }
         .map_err(|_| fail("PostgreSQL connection failed"))?;
         client
             .batch_execute(TABLE)

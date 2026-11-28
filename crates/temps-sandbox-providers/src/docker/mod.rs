@@ -40,7 +40,7 @@ use super::{
 
 mod create;
 mod service_access;
-pub use service_access::ServiceAccessTarget;
+pub use service_access::{service_access_supported, ServiceAccessTarget};
 mod egress;
 mod exec;
 mod files;
@@ -50,6 +50,7 @@ mod network;
 mod provider;
 mod recover;
 mod snapshot;
+mod workspace_owner;
 
 pub use egress::{
     egress_network_gateway, egress_proxy_endpoints, egress_proxy_sandbox, handed_off_to,
@@ -269,6 +270,10 @@ pub struct DockerSandboxProvider {
     capacity: tokio::sync::OnceCell<crate::SandboxHostCapacity>,
     docker: Arc<Docker>,
     config: DockerSandboxConfig,
+    /// How the daemon must be told to mount a sandbox's workspace directory.
+    /// A native process binds the path as it is; a containerized one has to
+    /// name the host path or volume its own container got the directory from.
+    daemon_mounts: temps_core::daemon_mount::DaemonMounts,
     service_access: Option<service_access::AccessMounts>,
     network_lock: tokio::sync::Mutex<()>,
     /// Which sandboxes are being created and which are being reaped, so the
@@ -397,6 +402,7 @@ impl DockerSandboxProvider {
 
     pub fn new(docker: Arc<Docker>, config: DockerSandboxConfig) -> Self {
         Self {
+            daemon_mounts: temps_core::daemon_mount::DaemonMounts::for_process(Arc::clone(&docker)),
             docker,
             config,
             capacity: Default::default(),
@@ -405,6 +411,16 @@ impl DockerSandboxProvider {
             creates_in_flight: std::sync::Mutex::new(SandboxLifecycle::default()),
             image_pulls: Arc::default(),
         }
+    }
+
+    /// Replace how workspace paths are translated for the daemon. The default
+    /// follows the environment this process was started in.
+    pub fn with_daemon_mounts(
+        mut self,
+        daemon_mounts: temps_core::daemon_mount::DaemonMounts,
+    ) -> Self {
+        self.daemon_mounts = daemon_mounts;
+        self
     }
 
     /// Enable host-owned service proxy mounts. The directory is private worker

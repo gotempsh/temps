@@ -324,6 +324,11 @@ impl ProjectService {
             request.preset_config.as_ref(),
             None,
         )?;
+        ensure_preset_selectable(
+            resolved.preset,
+            None,
+            temps_core::runtime::execution_environment_compatibility(),
+        )?;
         let preset = resolved.preset;
         let preset_config = resolved.config.clone();
         // An app's image services are service projects: their runtime is the

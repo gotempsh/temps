@@ -16103,6 +16103,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "temps-docker-capture",
  "temps-docker-util",

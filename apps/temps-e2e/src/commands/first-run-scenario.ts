@@ -28,7 +28,7 @@
 import { existsSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import { createProject, getLastDeployment, linkServiceToProject } from '@temps-sdk/api'
+import { createProject, getLastDeployment, linkServiceToProject, listPresets } from '@temps-sdk/api'
 import type { Client } from '@temps-sdk/api/client'
 import { makeClient, resolveConfig, unwrap, type TempsClientConfig } from '../lib/client.ts'
 import {
@@ -207,6 +207,13 @@ async function createUploadProject(ctx: Context, name: string, candidate: DropCa
   return created
 }
 
+/** Why this instance cannot deploy Compose projects, or `null` when it can. */
+async function composeUnavailableReason(client: Client): Promise<string | null> {
+  const catalog = unwrap(await listPresets({ client }), 'listPresets')
+  const compose = catalog.presets.find((preset) => preset.slug === 'docker-compose')
+  return compose?.unavailable_reason ?? null
+}
+
 // ── steps ───────────────────────────────────────────────────────────────────
 
 async function stepDockerImage(ctx: Context, t: StepTimer, image: string, port: number): Promise<string> {
@@ -320,6 +327,29 @@ async function stepCompose(ctx: Context, t: StepTimer): Promise<string> {
   )
   const candidates = await t.phase('detect preset', () => inspectArchive(ctx.client, archive, 'compose-app.zip'))
   const candidate = pickCandidate(candidates, (c) => c.preset === 'docker-compose', 'the docker-compose preset')
+  // An instance that cannot deploy Compose projects (Temps itself running in
+  // a container) says so in its preset catalog. What a first-time operator
+  // must get there is a refusal carrying that explanation, at creation, and
+  // not a project that fails on its first deployment.
+  const unsupported = await t.phase('check Compose support', () => composeUnavailableReason(ctx.client))
+  if (unsupported !== null) {
+    await t.phase('creation is refused with the explanation', async () => {
+      let created = false
+      try {
+        await createUploadProject(ctx, `${ctx.runId}-compose`, candidate)
+        created = true
+      } catch (error) {
+        const message = (error as Error).message
+        if (!message.includes('HTTP 400') || !message.includes(unsupported)) {
+          throw new Error(`Compose project creation failed without the catalog's explanation: ${message}`)
+        }
+      }
+      if (created) {
+        throw new Error('a Compose project was created on an instance whose catalog marks Compose unavailable')
+      }
+    })
+    return 'not supported on this instance; creation refused with the explanation'
+  }
   const project = await t.phase('create compose project', () =>
     createUploadProject(ctx, `${ctx.runId}-compose`, candidate),
   )

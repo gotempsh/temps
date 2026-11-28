@@ -243,7 +243,9 @@ impl AutofixerService {
     /// Returns the stable temp directory path for a given autofixer run.
     /// This directory persists across analysis → fix phases; only cleaned up by `create_pr` or `cancel_run`.
     pub fn work_dir(run_id: i32) -> PathBuf {
-        std::env::temp_dir().join(format!("autofixer-{}", run_id))
+        // Mounted into the run's sandbox: see `sandbox_workspace_root`.
+        temps_sandbox_providers::workspace_root::sandbox_workspace_root()
+            .join(format!("autofixer-{}", run_id))
     }
 
     /// Load the global agent sandbox settings (provider defaults, per-provider

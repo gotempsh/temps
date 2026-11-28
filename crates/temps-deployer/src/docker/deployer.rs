@@ -686,7 +686,12 @@ impl ContainerDeployer for DockerRuntime {
 
         // When secrets are present, materialize them as files in a per-container
         // host directory (mode 0700) and bind-mount that directory into the
-        // container at /run/secrets (read-only). This matches how Docker Swarm
+        // container at /run/secrets (read-only). A containerized control
+        // plane cannot do that — the daemon resolves the bind source on the
+        // host, where the directory does not exist — so it uploads the files
+        // into the created container instead (see `upload_secrets` below).
+        //
+        // The bind matches how Docker Swarm
         // delivers secrets: directory is created by the mount itself, so it
         // works with any image (no requirement that /run/secrets pre-exist),
         // and files are visible from container start (no race with start).
@@ -700,7 +705,7 @@ impl ContainerDeployer for DockerRuntime {
         // restart, forcing a redeploy. The directory is mode 0700
         // root-owned; individual files are mode 0400. Cleanup is handled
         // in `remove_container`.
-        let secrets_bind = if request.secrets.is_empty() {
+        let secrets_bind = if request.secrets.is_empty() || self.upload_secrets {
             None
         } else {
             let host_dir = self
@@ -769,7 +774,8 @@ impl ContainerDeployer for DockerRuntime {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            // Delivered through `secrets_bind`, prepared above.
+            // Delivered through `secrets_bind`, prepared above, or uploaded
+            // once the container exists.
             secret_files: Vec::new(),
             command: request.command.clone(),
             entrypoint: request.entrypoint.clone(),
@@ -840,6 +846,33 @@ impl ContainerDeployer for DockerRuntime {
                 };
                 DeployerError::DeploymentFailed(format!("Failed to create container: {}", reason))
             })?;
+
+        // Secrets go in before anything can start the container: one that
+        // runs without them is worse than none.
+        if self.upload_secrets && !request.secrets.is_empty() {
+            // The created container can name its user (`USER node`); resolve
+            // it from the container's own account files.
+            let owner =
+                temps_workload_docker::secrets::container_owner(&docker, &container.id).await;
+            if let Err(error) = temps_workload_docker::secrets::upload_secrets(
+                &docker,
+                &container.id,
+                &request.secrets,
+                owner,
+            )
+            .await
+            {
+                return Err(self
+                    .cleanup_created_container_after_error(
+                        &container.id,
+                        DeployerError::SecretMountFailed {
+                            container_name: request.container_name.clone(),
+                            reason: error.to_string(),
+                        },
+                    )
+                    .await);
+            }
+        }
 
         // Write the host-owned receipt before the candidate can be assigned a
         // runtime probe. Failure must not leave an untracked application.

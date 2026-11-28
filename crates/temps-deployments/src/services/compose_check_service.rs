@@ -149,6 +149,12 @@ pub struct ComposeHostStatusResponse {
     pub missing_flags: Vec<String>,
     /// Operator-facing explanation when not supported.
     pub problem: Option<String>,
+    /// Set when this installation cannot deploy Compose projects at all
+    /// (Temps itself runs in a container), as opposed to a host whose Compose
+    /// CLI is missing or old. `applicable` is false then: there is nothing to
+    /// install or upgrade, and clients should explain the limit where a
+    /// Compose project would be created instead of warning about the CLI.
+    pub unsupported_reason: Option<String>,
     pub checked_at: Option<DateTime<Utc>>,
 }
 
@@ -202,6 +208,9 @@ pub struct ComposeCheckService {
     /// Whether this process may run Compose workloads at all. Off for a
     /// control-plane profile, which has no Docker and deploys nothing locally.
     local_workloads_enabled: bool,
+    /// Why this installation deploys no Compose projects at all, when it does
+    /// not (a containerized control plane).
+    unsupported_reason: Option<&'static str>,
 }
 
 impl ComposeCheckService {
@@ -218,7 +227,19 @@ impl ComposeCheckService {
             executor,
             host_status: RwLock::new(None),
             local_workloads_enabled: true,
+            unsupported_reason: None,
         }
+    }
+
+    /// Declare where this control plane runs. A containerized one deploys no
+    /// Compose projects: the CLI is not probed and the host status carries the
+    /// reason.
+    pub fn with_execution_environment(
+        mut self,
+        execution_environment: temps_core::ExecutionEnvironment,
+    ) -> Self {
+        self.unsupported_reason = execution_environment.compose_projects_unsupported_reason();
+        self
     }
 
     /// Declare whether this process runs workloads itself. When it does not,
@@ -232,6 +253,18 @@ impl ComposeCheckService {
     /// Probe the Compose CLI and remember the result. Logs a warning when
     /// Compose deployments that need resolution would fail on this host.
     pub async fn probe_host(&self) -> ComposeSupport {
+        if let Some(reason) = self.unsupported_reason {
+            warn!(
+                event = "compose_projects_unsupported",
+                "Docker Compose projects are disabled on this installation: {reason}"
+            );
+            return ComposeSupport {
+                available: false,
+                version: None,
+                missing_flags: Vec::new(),
+                problem: None,
+            };
+        }
         if !self.local_workloads_enabled {
             info!("Skipping the Docker Compose probe: this process runs no local workloads");
             return ComposeSupport {
@@ -262,7 +295,7 @@ impl ComposeCheckService {
     }
 
     pub fn host_status(&self) -> ComposeHostStatusResponse {
-        if !self.local_workloads_enabled {
+        if !self.local_workloads_enabled || self.unsupported_reason.is_some() {
             return ComposeHostStatusResponse {
                 applicable: false,
                 probed: true,
@@ -272,6 +305,7 @@ impl ComposeCheckService {
                 minimum_version: MIN_COMPOSE_VERSION.to_string(),
                 missing_flags: Vec::new(),
                 problem: None,
+                unsupported_reason: self.unsupported_reason.map(str::to_string),
                 checked_at: None,
             };
         }
@@ -289,6 +323,7 @@ impl ComposeCheckService {
                 minimum_version: MIN_COMPOSE_VERSION.to_string(),
                 missing_flags: support.missing_flags,
                 problem: support.problem,
+                unsupported_reason: None,
                 checked_at: Some(checked_at),
             },
             None => ComposeHostStatusResponse {
@@ -300,6 +335,7 @@ impl ComposeCheckService {
                 minimum_version: MIN_COMPOSE_VERSION.to_string(),
                 missing_flags: Vec::new(),
                 problem: None,
+                unsupported_reason: None,
                 checked_at: None,
             },
         }
@@ -1408,6 +1444,30 @@ mod tests {
         assert!(!status.applicable);
         assert!(status.problem.is_none());
         assert!(status.missing_flags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_containerized_control_plane_reports_compose_as_unsupported_with_the_reason() {
+        // Nothing to install or upgrade: the status must not read like a
+        // missing Compose CLI, and must carry the reason a client can show.
+        let containerized = service(MockDatabase::new(DatabaseBackend::Postgres).into_connection())
+            .with_execution_environment(temps_core::ExecutionEnvironment::Docker);
+        let probed = containerized.probe_host().await;
+        assert!(!probed.available);
+        assert!(probed.problem.is_none());
+
+        let status = containerized.host_status();
+        assert!(!status.applicable);
+        assert!(status.probed);
+        assert!(status.problem.is_none());
+        assert_eq!(
+            status.unsupported_reason.as_deref(),
+            Some(temps_core::COMPOSE_PROJECTS_UNSUPPORTED_IN_CONTAINER)
+        );
+
+        let native = service(MockDatabase::new(DatabaseBackend::Postgres).into_connection())
+            .with_execution_environment(temps_core::ExecutionEnvironment::Host);
+        assert!(native.host_status().unsupported_reason.is_none());
     }
 
     #[tokio::test]

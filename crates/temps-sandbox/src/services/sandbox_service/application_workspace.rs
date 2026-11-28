@@ -572,7 +572,12 @@ impl SandboxService {
             .map_err(|e| from_agent_error(sandbox_public_id, e))?;
 
         let probe_id = hex::encode(rand::random::<[u8; 12]>());
-        let probe_dir = std::env::temp_dir().join(format!("temps-runtime-probe-{probe_id}"));
+        // Mounted into the probe sandbox: see `sandbox_workspace_root`.
+        let probe_root = temps_sandbox_providers::workspace_root::sandbox_workspace_root();
+        let probe_dir = probe_root.join(format!("temps-runtime-probe-{probe_id}"));
+        // `create_dir` below must stay exclusive (a fresh, empty directory);
+        // only its parent may already exist.
+        let _ = tokio::fs::create_dir_all(&probe_root).await;
         tokio::fs::create_dir(&probe_dir)
             .await
             .map_err(|source| SandboxError::CreateFailed {

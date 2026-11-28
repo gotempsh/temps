@@ -57,6 +57,9 @@ const RESET_FUNCTION_LOOKUP_SQL: &str = r#"
 enum PgStatConnectionPolicy {
     Standard,
     ManagedPrivate,
+    /// The host is the daemon-reported address of the service's container on
+    /// the Temps network, for a control plane that itself runs in a container.
+    LocalContainer,
 }
 
 impl PgStatConnectionPolicy {
@@ -78,6 +81,17 @@ impl PgStatConnectionPolicy {
             Self::ManagedPrivate => {
                 temps_providers_postgres::query::connect_with_private_tls_ladder(
                     host, port, username, password, database,
+                )
+                .await
+            }
+            Self::LocalContainer => {
+                let address = host.parse::<std::net::IpAddr>().map_err(|_| {
+                    temps_providers_core::query::DataError::InvalidConfiguration(format!(
+                        "PostgreSQL container address '{host}' is not an IP address"
+                    ))
+                })?;
+                temps_providers_postgres::query::connect_to_local_container(
+                    address, port, username, password, database,
                 )
                 .await
             }
@@ -509,7 +523,29 @@ impl PgStatStatementsService {
                     {
                         pg_stat_connection_target(Some((worker, port)), config.host.clone(), port)
                     }
-                    _ => pg_stat_connection_target(None, config.host.clone(), port),
+                    _ => {
+                        // A containerized control plane reaches a service on
+                        // its own daemon at the address Docker reports for the
+                        // service's container on the Temps network.
+                        let local = self
+                            .external_service_manager
+                            .local_container_address(&service, &service_config)
+                            .await
+                            .map_err(|e| PgStatStatementsError::ConnectionFailed {
+                                service_id,
+                                host: config.host.clone(),
+                                port,
+                                reason: e.to_string(),
+                            })?;
+                        match local {
+                            Some(local) => (
+                                local.address.to_string(),
+                                local.port,
+                                PgStatConnectionPolicy::LocalContainer,
+                            ),
+                            None => pg_stat_connection_target(None, config.host.clone(), port),
+                        }
+                    }
                 }
             }
             Err(e) => {

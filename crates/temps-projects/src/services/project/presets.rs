@@ -48,6 +48,48 @@ pub(super) fn project_type_for_resolved_preset(
     })
 }
 
+/// Why projects using the preset behind `slug` cannot be deployed where this
+/// control plane runs, `None` when they can.
+///
+/// The catalog quotes this next to the preset; [`ensure_preset_selectable`]
+/// enforces it.
+pub fn preset_unavailable_reason(
+    slug: &str,
+    execution_environment: temps_core::ExecutionEnvironment,
+) -> Option<&'static str> {
+    let is_compose = resolve_preset_slug(slug, None)
+        .is_ok_and(|resolved| resolved.preset == temps_entities::preset::Preset::DockerCompose);
+    if is_compose {
+        execution_environment.compose_projects_unsupported_reason()
+    } else {
+        None
+    }
+}
+
+/// Refuse to move a project onto a preset this control plane cannot deploy.
+///
+/// A project already on that preset may keep saving its settings: an instance
+/// moved into a container still has to be able to rename, reconfigure or
+/// migrate its existing Compose projects, and the deploy job is what refuses
+/// to run them.
+pub(super) fn ensure_preset_selectable(
+    selected: temps_entities::preset::Preset,
+    current: Option<temps_entities::preset::Preset>,
+    execution_environment: temps_core::ExecutionEnvironment,
+) -> Result<(), ProjectError> {
+    if current == Some(selected) || selected != temps_entities::preset::Preset::DockerCompose {
+        return Ok(());
+    }
+    match execution_environment.compose_projects_unsupported_reason() {
+        Some(reason) => Err(ProjectError::PresetUnsupportedInExecutionEnvironment {
+            preset: selected.as_str().to_string(),
+            execution_environment: execution_environment.to_string(),
+            reason: reason.to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Apply a canonical preset selection to a project update.
 pub(super) fn apply_resolved_preset(
     active: &mut projects::ActiveModel,
@@ -203,7 +245,13 @@ pub(super) fn resolve_preset_patch(
     config_value: Option<&serde_json::Value>,
 ) -> Result<Option<temps_presets::StoredPreset>, ProjectError> {
     if let Some(slug) = requested_preset {
-        return resolve_preset_selection(slug, config_value, current_config).map(Some);
+        let resolved = resolve_preset_selection(slug, config_value, current_config)?;
+        ensure_preset_selectable(
+            resolved.preset,
+            Some(current_preset),
+            temps_core::runtime::execution_environment_compatibility(),
+        )?;
+        return Ok(Some(resolved));
     }
     let Some(value) = config_value else {
         return Ok(None);
@@ -595,6 +643,7 @@ pub(super) fn resolve_preset_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_core::ExecutionEnvironment;
     use temps_entities::preset::Preset;
 
     fn settings(
@@ -764,6 +813,69 @@ mod tests {
             settings(Some("pnpm build"), None, None),
         );
         assert!(matches!(not_an_object, Err(ProjectError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn a_containerized_control_plane_refuses_selecting_the_compose_preset() {
+        let error =
+            ensure_preset_selectable(Preset::DockerCompose, None, ExecutionEnvironment::Docker)
+                .expect_err("a new Compose project must be refused in a container");
+        match &error {
+            ProjectError::PresetUnsupportedInExecutionEnvironment {
+                preset,
+                execution_environment,
+                reason,
+            } => {
+                assert_eq!(preset, Preset::DockerCompose.as_str());
+                assert_eq!(execution_environment, "docker");
+                assert!(reason.contains("not supported while Temps itself runs in a container"));
+            }
+            other => panic!("expected PresetUnsupportedInExecutionEnvironment, got {other:?}"),
+        }
+        assert!(error.to_string().contains("Dockerfile"));
+
+        let switching = ensure_preset_selectable(
+            Preset::DockerCompose,
+            Some(Preset::Dockerfile),
+            ExecutionEnvironment::Docker,
+        );
+        assert!(matches!(
+            switching,
+            Err(ProjectError::PresetUnsupportedInExecutionEnvironment { .. })
+        ));
+    }
+
+    #[test]
+    fn an_existing_compose_project_can_still_save_its_settings_in_a_container() {
+        assert!(ensure_preset_selectable(
+            Preset::DockerCompose,
+            Some(Preset::DockerCompose),
+            ExecutionEnvironment::Docker,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn other_presets_and_a_native_control_plane_are_not_restricted() {
+        assert!(
+            ensure_preset_selectable(Preset::Dockerfile, None, ExecutionEnvironment::Docker)
+                .is_ok()
+        );
+        assert!(
+            ensure_preset_selectable(Preset::DockerCompose, None, ExecutionEnvironment::Host)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_catalog_marks_only_compose_unavailable_in_a_container() {
+        let compose = Preset::DockerCompose.as_str();
+        assert!(preset_unavailable_reason(compose, ExecutionEnvironment::Docker).is_some());
+        assert!(preset_unavailable_reason(compose, ExecutionEnvironment::Host).is_none());
+        assert!(preset_unavailable_reason("dockerfile", ExecutionEnvironment::Docker).is_none());
+        assert!(
+            preset_unavailable_reason("no-such-preset", ExecutionEnvironment::Docker).is_none()
+        );
     }
 
     #[test]

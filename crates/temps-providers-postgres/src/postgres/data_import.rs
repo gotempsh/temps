@@ -208,12 +208,13 @@ impl PostgresService {
         pg: &PostgresConfig,
         database: &str,
     ) -> Result<sqlx::PgConnection, DataImportError> {
+        let (host, port) = self.dial_address(pg);
         let url = format!(
             "postgres://{}:{}@{}:{}/{}?sslmode=disable",
             percent_encode_userinfo(&pg.username),
             percent_encode_userinfo(&pg.password),
-            pg.host,
-            pg.port,
+            host,
+            port,
             database
         );
         let operation = format!("connect to database '{database}'");

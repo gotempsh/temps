@@ -276,7 +276,7 @@ services:
     environment:
       TEMPS_CONTROL_INTERNAL_IP: ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10}
       TEMPS_INGRESS_MODE: public
-      TEMPS_INGRESS_LISTEN_IP: ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10}
+      TEMPS_INGRESS_LISTEN_IP: ${TEMPS_PUBLIC_INGRESS_IP:-10.213.255.10}
     ports:
       - "127.0.0.1:3000:3000"
       - "127.0.0.1:3443:3443"
@@ -284,9 +284,9 @@ services:
     networks:
       temps-network:
       temps-app-network:
-        ipv4_address: ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10}
+        ipv4_address: ${TEMPS_PUBLIC_INGRESS_IP:-10.213.255.10}
     healthcheck:
-      test: ["CMD-SHELL", "nc -z -w 1 ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10} 3000 && nc -z -w 1 ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10} 3443 && nc -z -w 1 ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10} 9000 && nc -z -w 1 ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10} 9000"]
+      test: ["CMD-SHELL", "nc -z -w 1 ${TEMPS_PUBLIC_INGRESS_IP:-10.213.255.10} 3000 && nc -z -w 1 ${TEMPS_PUBLIC_INGRESS_IP:-10.213.255.10} 3443 && nc -z -w 1 ${TEMPS_PUBLIC_INGRESS_IP:-10.213.255.10} 9000 && nc -z -w 1 ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10} 9000"]
       interval: 10s
       timeout: 3s
       retries: 6
@@ -357,7 +357,7 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: ${TEMPS_WORKLOAD_SUBNET:-198.20.255.0/24}
+        - subnet: ${TEMPS_WORKLOAD_SUBNET:-10.213.255.0/24}
   temps-ingress-network:
     driver: bridge
     driver_opts:

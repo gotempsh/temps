@@ -15,7 +15,34 @@ pub(super) const MOUNT_LABEL: &str = "sh.temps.sandbox.service-access.mount";
 /// Why a control plane without a local Unix mount root cannot host service
 /// access. Shown to the operator as the fix, so it names what to change.
 pub(super) const SERVICE_ACCESS_HOST_UNSUPPORTED: &str = "this control plane cannot share Unix sockets with the Docker daemon (service access needs a Linux host running Docker locally; macOS and Docker Desktop are not supported)";
+/// Why a control plane running in a container does not host service access.
+/// Its private mount root is in its own filesystem (usually a named volume),
+/// which the daemon cannot bind as the exact host directory the attachment
+/// check requires.
+pub(super) const SERVICE_ACCESS_CONTAINER_UNSUPPORTED: &str = "service access is not available while Temps itself runs in a container (the proxy sockets it shares with a sandbox must be in a host directory the Docker daemon binds directly); run Temps on the host to use service access";
 pub(super) const GUEST_DIRECTORY: &str = "/run/temps-service-access";
+
+/// Why service access is unavailable on a provider that has no mount root,
+/// for a control plane running in `execution_environment`.
+pub(super) fn service_access_unsupported_reason(
+    execution_environment: temps_core::ExecutionEnvironment,
+) -> &'static str {
+    match execution_environment {
+        temps_core::ExecutionEnvironment::Host => SERVICE_ACCESS_HOST_UNSUPPORTED,
+        temps_core::ExecutionEnvironment::Docker => SERVICE_ACCESS_CONTAINER_UNSUPPORTED,
+    }
+}
+
+/// Whether a control plane in `execution_environment` can host service
+/// access mounts at all. A containerized one cannot (see
+/// [`SERVICE_ACCESS_CONTAINER_UNSUPPORTED`]); creating its mount root anyway
+/// would only make every sandbox create probe and fail.
+pub fn service_access_supported(execution_environment: temps_core::ExecutionEnvironment) -> bool {
+    matches!(
+        execution_environment,
+        temps_core::ExecutionEnvironment::Host
+    )
+}
 
 pub use crate::service_access::ServiceAccessTarget;
 
@@ -581,7 +608,10 @@ impl DockerSandboxProvider {
                 .as_ref()
                 .ok_or_else(|| AgentError::ServiceAccessUnavailable {
                     sandbox_id: handle.sandbox_id.clone(),
-                    reason: SERVICE_ACCESS_HOST_UNSUPPORTED.into(),
+                    reason: service_access_unsupported_reason(
+                        temps_core::runtime::execution_environment_compatibility(),
+                    )
+                    .into(),
                 })?;
         let _operation = mounts.operation(&handle.sandbox_id)?;
         let info = self.inspect_handle_policy(handle).await?;

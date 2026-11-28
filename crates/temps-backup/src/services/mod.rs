@@ -15,6 +15,9 @@ pub(crate) mod s3_lifecycle;
 pub(crate) mod s3_probe;
 pub use alerts::{sweep_backup_alerts, SweepStats, OVERDUE_GRACE};
 pub use backup::{
+    guard_unarchived_wal, stop_unarchived_wal_retention, WalRetentionError, WalRetentionOutcome,
+};
+pub use backup::{
     BackupAccessScope, BackupAlertEntry, BackupCollectionAccessScope, BackupError,
     BackupScheduleAccessScope, BackupService, BackupTriggerParams, BackupWithAccessScope,
     ChildBackupEntry, EnqueuedJob, InternalArchiveReconcile, PromotedDefaultSource,

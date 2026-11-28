@@ -17,6 +17,13 @@ pub(super) async fn start_background_services(
 ) {
     spawn_certificate_renewal_scheduler(service_context);
 
+    // Once per start: Temps' own database must not keep WAL that nothing
+    // archives (the Compose package starts it with archive_mode on).
+    let wal_db = Arc::clone(db);
+    tokio::spawn(async move {
+        temps_backup::guard_unarchived_wal(wal_db.as_ref()).await;
+    });
+
     spawn_disk_space_monitor(service_context);
 
     wire_traefik_discovery(service_context, traefik_discovery);
@@ -353,8 +360,14 @@ async fn start_metrics_pipeline(
                     .run(),
                 );
 
+                // A containerized control plane scrapes a service on its own
+                // Docker daemon by container name, which only the providers
+                // layer can derive.
                 let mut scraper =
-                    MetricsScraper::new(db.clone(), metrics_store.clone(), cfg_svc, enc_svc);
+                    MetricsScraper::new(db.clone(), metrics_store.clone(), cfg_svc, enc_svc)
+                        .with_container_endpoints(Arc::new(
+                            temps_providers::EngineContainerEndpoints,
+                        ));
                 // HA clusters are scraped at their elected primary, which
                 // only the providers layer can resolve.
                 match service_context.get_service::<temps_providers::ExternalServiceManager>() {

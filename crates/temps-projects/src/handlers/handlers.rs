@@ -3364,6 +3364,7 @@ pub async fn get_project_statistics(
 )]
 pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoResponse, Problem> {
     // No permission check needed - all authenticated users can list presets
+    let execution_environment = temps_core::runtime::execution_environment_compatibility();
 
     // Get all presets from temps-presets crate
     let presets: Vec<super::types::PresetResponse> = temps_presets::all_presets()
@@ -3383,6 +3384,10 @@ pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoRe
             // rather than the language icon it maps to. Those 404s fell back
             // to the generic gear in the UI.
             let icon_url = preset.icon_url();
+            let unavailable_reason = crate::services::preset_unavailable_reason(
+                preset.slug().as_str(),
+                execution_environment,
+            );
 
             super::types::PresetResponse {
                 slug,
@@ -3391,6 +3396,8 @@ pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoRe
                 project_type,
                 description,
                 default_port,
+                available: unavailable_reason.is_none(),
+                unavailable_reason: unavailable_reason.map(str::to_string),
             }
         })
         .collect();

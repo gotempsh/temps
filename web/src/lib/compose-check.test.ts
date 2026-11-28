@@ -17,6 +17,7 @@ import {
   composeHostWarning,
   composeStatusRefetchInterval,
   composeValidationWarning,
+  presetUnavailableReason,
 } from './compose-check'
 
 const supported: ComposeHostStatusResponse = {
@@ -30,6 +31,33 @@ const supported: ComposeHostStatusResponse = {
   problem: null,
   checked_at: '2026-10-15T00:00:00Z',
 }
+
+describe('Preset availability', () => {
+  const reason =
+    'Docker Compose projects are not supported while Temps itself runs in a container.'
+  const catalog = [
+    { slug: 'dockerfile', unavailable_reason: null },
+    { slug: 'docker-compose', unavailable_reason: reason },
+  ]
+
+  test('explains an unavailable preset for a bare slug and a slug with a path', () => {
+    expect(presetUnavailableReason(catalog, 'docker-compose')).toBe(reason)
+    expect(
+      presetUnavailableReason(catalog, 'docker-compose::deploy/compose.yml')
+    ).toBe(reason)
+    expect(presetUnavailableReason(catalog, 'Docker-Compose')).toBe(reason)
+  })
+
+  test('stays silent for available, unknown and missing selections', () => {
+    expect(presetUnavailableReason(catalog, 'dockerfile')).toBeNull()
+    expect(presetUnavailableReason(catalog, 'custom')).toBeNull()
+    expect(presetUnavailableReason(catalog, undefined)).toBeNull()
+    expect(presetUnavailableReason(undefined, 'docker-compose')).toBeNull()
+    expect(
+      presetUnavailableReason([{ slug: 'docker-compose' }], 'docker-compose')
+    ).toBeNull()
+  })
+})
 
 describe('Compose host warning', () => {
   test('stays silent until the probe finishes and when the CLI is supported', () => {

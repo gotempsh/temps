@@ -22,6 +22,7 @@ pub mod cloud_telemetry_activation;
 pub mod config;
 pub mod console_startup;
 pub mod crypto;
+pub mod daemon_mount;
 pub mod deployment;
 pub mod dns_automation;
 pub mod env_vars_provider;
@@ -45,6 +46,7 @@ pub mod log_transitions;
 pub mod managed_backup_schedule;
 /// Cloud-minted, job-scoped credentials for worker nodes (ADR-102).
 pub mod managed_backup_scoped_credentials;
+pub mod managed_service_address;
 pub mod managed_service_pki;
 pub mod node_address;
 pub mod node_pki;
@@ -212,7 +214,8 @@ pub use retention::{
 pub use runtime::{
     initialize_process_runtime_context, ExecutionEnvironment, ExecutionEnvironmentSource,
     RuntimeConfigurationError, RuntimeContext, ServiceEndpoint, ServiceEndpointResolver,
-    ServiceEndpointScheme, EXECUTION_ENVIRONMENT_VARIABLE, LEGACY_DEPLOYMENT_MODE_VARIABLE,
+    ServiceEndpointScheme, COMPOSE_PROJECTS_UNSUPPORTED_IN_CONTAINER,
+    EXECUTION_ENVIRONMENT_VARIABLE, LEGACY_DEPLOYMENT_MODE_VARIABLE,
 };
 pub use sandbox_runtime::{
     SandboxRuntimeCredentialsError, SandboxRuntimeCredentialsProvider, SandboxScope,

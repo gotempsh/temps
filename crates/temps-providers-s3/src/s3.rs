@@ -642,6 +642,18 @@ echo '[restore] complete'"#;
             .unwrap_or_else(|| self.get_container_name())
     }
 
+    /// Where this process reaches the S3 API: the stored host and published
+    /// port for a native control plane, the container and its own port for a
+    /// containerized one (whose loopback is not the Docker host's).
+    fn dial_address(&self, config: &S3Config) -> (String, String) {
+        temps_providers_core::externalsvc::dial::engine_dial_address(
+            &config.host,
+            &config.port,
+            &self.get_live_container_name(config),
+            S3_INTERNAL_PORT,
+        )
+    }
+
     fn get_effective_address_for_environment(
         &self,
         service_config: ServiceConfig,
@@ -1133,12 +1145,13 @@ echo '[restore] complete'"#;
 
     async fn initialize_client(&self, config: ServiceConfig) -> Result<Client> {
         let s3_config = self.get_s3_config(config)?;
+        let (host, port) = self.dial_address(&s3_config);
         info!(
             "Initializing S3 client (host={}, port={}, region={})",
-            s3_config.host, s3_config.port, s3_config.region
+            host, port, s3_config.region
         );
         let config = aws_sdk_s3::Config::builder()
-            .endpoint_url(format!("http://{}:{}", s3_config.host, s3_config.port))
+            .endpoint_url(format!("http://{}:{}", host, port))
             .region(Region::new(s3_config.region))
             .behavior_version_latest()
             .credentials_provider(aws_sdk_s3::config::Credentials::new(
@@ -1489,7 +1502,8 @@ impl ExternalService for S3Service {
             Err(e) => return Ok(HealthProbeResult::down(format!("invalid s3 config: {}", e))),
         };
 
-        let endpoint = format!("http://{}:{}", cfg.host, cfg.port);
+        let (host, port) = self.dial_address(&cfg);
+        let endpoint = format!("http://{}:{}", host, port);
         let start = Instant::now();
 
         let probe = async {
@@ -3287,6 +3301,12 @@ impl ExternalService for S3Service {
                     ..Default::default()
                 });
         let server = detect_image_server_kind(container_image_config.as_ref());
+        // Ports the container listens on and publishes, to find the engine
+        // port behind the one the operator entered.
+        let published_ports = container
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.ports.clone());
         // Extract image name and version
         let image = container.config.and_then(|c| c.image).ok_or_else(|| {
             EngineError::failed(
@@ -3325,8 +3345,28 @@ impl ExternalService for S3Service {
             EngineError::invalid_input(&self.name, "Secret key is required for S3/MinIO import")
         })?;
 
-        // Build endpoint
+        // The stored endpoint is the published loopback address, as for a
+        // service Temps created; connections map it per environment.
         let endpoint = format!("http://localhost:{}", port);
+
+        // Join the Temps network first: a containerized control plane reaches
+        // the imported container by name on it, so it must be attached before
+        // the credentials can be checked.
+        crate::externalsvc::import_attach::attach_imported_container(
+            &self.docker,
+            &self.name,
+            "S3/MinIO",
+            &container_id,
+            &imported_container_name,
+        )
+        .await?;
+        let (dial_host, dial_port) = crate::externalsvc::import_attach::import_dial_address(
+            published_ports.as_ref(),
+            &port,
+            &imported_container_name,
+            S3_INTERNAL_PORT,
+        );
+        let dial_endpoint = format!("http://{}:{}", dial_host, dial_port);
 
         // Verify connection to the imported service by attempting to list
         // buckets. Connects directly with `.await` on the current runtime —
@@ -3337,7 +3377,7 @@ impl ExternalService for S3Service {
             aws_sdk_s3::config::Credentials::new(&access_key, &secret_key, None, None, "imported");
         let s3_client_config = aws_sdk_s3::config::Config::builder()
             .credentials_provider(creds)
-            .endpoint_url(&endpoint)
+            .endpoint_url(&dial_endpoint)
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .force_path_style(true)
             .behavior_version_latest()
@@ -3355,46 +3395,12 @@ impl ExternalService for S3Service {
             EngineError::connection(
                 &self.name,
                 format!(
-                    "Failed to connect to S3/MinIO at {} with provided credentials: {}",
-                    endpoint, e
+                    "Failed to connect to S3/MinIO container '{}' at {} with provided credentials: {}",
+                    imported_container_name, dial_endpoint, e
                 ),
             )
         })?;
         info!("Successfully verified S3/MinIO connection for import");
-
-        let network_ready = match ensure_network_exists(&self.docker).await {
-            Ok(()) => true,
-            Err(e) => {
-                warn!(
-                    "Failed to ensure Temps Docker network before S3/MinIO import attach: {:?}",
-                    e
-                );
-                false
-            }
-        };
-        if network_ready {
-            let network_name = temps_core::NETWORK_NAME.as_str();
-            let request = bollard::models::NetworkConnectRequest {
-                container: container_id.clone(),
-                ..Default::default()
-            };
-            match self.docker.connect_network(network_name, request).await {
-                Ok(()) => info!(
-                    "Attached imported S3/MinIO container '{}' to {}",
-                    imported_container_name, network_name
-                ),
-                Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 403, ..
-                }) => debug!(
-                    "Imported S3/MinIO container '{}' is already attached to {}",
-                    imported_container_name, network_name
-                ),
-                Err(e) => warn!(
-                    "Failed to attach imported S3/MinIO container '{}' to {}: {}",
-                    imported_container_name, network_name, e
-                ),
-            }
-        }
 
         // Register as `Minio`, NOT `S3`: only the `Minio` service type routes
         // back to `S3Service` in `create_service_instance` (the `S3` type

@@ -31,6 +31,7 @@ pub mod routing;
 pub mod sandbox_registry;
 pub mod service_access;
 pub mod workload_vm;
+pub mod workspace_root;
 
 /// The Docker named volume holding `/home/temps` for a sandbox whose
 /// container suffix is `label`.

@@ -952,12 +952,13 @@ impl PostgresService {
             service_name: self.name.clone(),
             reason,
         };
+        let (host, port) = self.dial_address(config);
         let connection = format!(
             "postgres://{}:{}@{}:{}/{}?sslmode={}",
             urlencoding::encode(&config.username),
             urlencoding::encode(&config.password),
-            config.host,
-            config.port,
+            host,
+            port,
             urlencoding::encode(&config.database),
             urlencoding::encode(config.ssl_mode.as_deref().unwrap_or("disable")),
         );
@@ -1017,12 +1018,13 @@ impl PostgresService {
             ),
         }
         };
+        let (host, port) = self.dial_address(config);
         let connection = format!(
             "postgres://{}:{}@{}:{}/{}?sslmode={}",
             urlencoding::encode(&config.username),
             urlencoding::encode(&config.password),
-            config.host,
-            config.port,
+            host,
+            port,
             urlencoding::encode(&config.database),
             urlencoding::encode(config.ssl_mode.as_deref().unwrap_or("disable")),
         );

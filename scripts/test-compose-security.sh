@@ -239,7 +239,7 @@ jq -e --arg workload_network "$TEMPS_NETWORK_NAME" '
   and (.services.postgres.networks | has("temps-host-network"))
   and .services.clickhouse.networks["temps-network"].ipv4_address == "198.18.255.12"
   and (.services.clickhouse.networks | has("temps-host-network"))
-  and .services["temps-ingress"].networks["temps-app-network"].ipv4_address == "198.20.255.10"
+  and .services["temps-ingress"].networks["temps-app-network"].ipv4_address == "10.213.255.10"
   and (.services["temps-ingress"].networks | has("temps-ingress-network") | not)
   and (.services["temps-ingress"].cap_drop | index("ALL") != null)
   and .services["temps-ingress"].read_only == true
@@ -261,7 +261,7 @@ jq -e --arg workload_network "$TEMPS_NETWORK_NAME" '
   and .networks["temps-network"].internal == true
   and .networks["temps-network"].ipam.config[0].subnet == "198.18.255.0/24"
   and .networks["temps-app-network"].name == $workload_network
-  and .networks["temps-app-network"].ipam.config[0].subnet == "198.20.255.0/24"
+  and .networks["temps-app-network"].ipam.config[0].subnet == "10.213.255.0/24"
 ' <<<"$config" >/dev/null
 
 POSTGRES_PASSWORD="$safe_postgres" \

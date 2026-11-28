@@ -89,7 +89,11 @@ jobs:
   build-binary:
     name: Build temps Binary (musl)
     runs-on: ubuntu-latest
-    timeout-minutes: 100
+    # The same limit as rust-tests.yml's musl build. The build alone takes
+    # about 85 minutes from main's cache, so a pull request that changes a
+    # crate most of the workspace depends on (temps-core) rebuilds nearly
+    # everything and did not fit in 100.
+    timeout-minutes: 130
     permissions:
       contents: read
       # Looks up main's rust-tests runs and downloads their binary artifact.

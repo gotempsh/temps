@@ -952,12 +952,24 @@ impl TempsPlugin for AgentsPlugin {
                     };
                     let provider = DockerSandboxProvider::new(docker.clone(), config);
                     // Unix sockets must live on the daemon host, not a Docker
-                    // Desktop client filesystem. Other hosts remain unavailable.
+                    // Desktop client filesystem, nor the private filesystem
+                    // of a Temps that itself runs in a container. Other
+                    // hosts remain unavailable and say why when used.
                     #[cfg(target_os = "linux")]
-                    let provider = provider.with_service_access_root(
-                        temps_sandbox_providers::microsandbox::host_data_dir()
-                            .join("service-access-mounts"),
-                    );
+                    let provider = if crate::sandbox::docker::service_access_supported(
+                        temps_core::runtime::execution_environment_compatibility(),
+                    ) {
+                        provider.with_service_access_root(
+                            temps_sandbox_providers::microsandbox::host_data_dir()
+                                .join("service-access-mounts"),
+                        )
+                    } else {
+                        tracing::info!(
+                            "Sandbox service access is disabled: Temps runs in a container, \
+                             so it cannot share proxy sockets with sandboxes"
+                        );
+                        provider
+                    };
                     let provider = Arc::new(provider);
                     provider
                         .quarantine_stale_sandboxes()

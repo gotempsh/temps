@@ -551,6 +551,9 @@ impl SandboxProvider for DockerSandboxProvider {
                 }),
             )
             .await;
+        // Stopped, nothing writes to the workspace any more: give it back to
+        // an unprivileged Temps, which must remove or replace it next.
+        self.hand_back_workspace(handle).await;
 
         match self
             .docker

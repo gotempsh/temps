@@ -1153,8 +1153,15 @@ impl RustfsService {
         Ok(())
     }
 
+    /// Where this process reaches the S3 API: the stored host and published
+    /// port for a native control plane, the container and its own port for a
+    /// containerized one (whose loopback is not the Docker host's).
+    fn dial_endpoint(&self, config: &RustfsConfig) -> String {
+        rustfs_dial_endpoint(config, &self.get_container_name())
+    }
+
     async fn create_s3_client(&self, config: &RustfsConfig) -> Result<Client> {
-        let endpoint = format!("http://{}:{}", config.host, config.port);
+        let endpoint = self.dial_endpoint(config);
         let credentials = aws_sdk_s3::config::Credentials::new(
             &config.access_key,
             &config.secret_key,
@@ -1323,10 +1330,17 @@ impl ManagedS3Backend for RustfsService {
                 service: self.instance_name(),
                 reason: format!("'port' value '{}' is not a valid TCP port", stored.port),
             })?;
+        let container_name = self.get_container_name();
+        let (host, host_port) = temps_providers_core::externalsvc::dial::control_plane_endpoint(
+            &stored.host,
+            host_port,
+            &container_name,
+            DEFAULT_RUSTFS_API_PORT,
+        );
         Ok(ManagedS3Endpoint {
-            internal_host: self.get_container_name(),
+            internal_host: container_name,
             internal_port: DEFAULT_RUSTFS_API_PORT,
-            host: stored.host,
+            host,
             host_port,
             region: stored.region,
         })
@@ -1762,6 +1776,18 @@ const RUSTFS_INIT_CONTEXT_SIGNATURES: &[&str] = &[
 /// Readiness gate for one RustFS service: authenticated `ListBuckets` with
 /// the service's own credentials, plus restart and log evidence from its
 /// container. An unauthenticated `/health` 200 is deliberately not enough.
+/// The URL this process dials for a RustFS service running in
+/// `container_name`. See [`temps_providers_core::externalsvc::dial`].
+fn rustfs_dial_endpoint(config: &RustfsConfig, container_name: &str) -> String {
+    let (host, port) = temps_providers_core::externalsvc::dial::engine_dial_address(
+        &config.host,
+        &config.port,
+        container_name,
+        &DEFAULT_RUSTFS_API_PORT.to_string(),
+    );
+    format!("http://{host}:{port}")
+}
+
 pub(crate) struct RustfsReadinessTarget {
     endpoint: String,
     config: RustfsConfig,
@@ -1777,7 +1803,10 @@ impl RustfsReadinessTarget {
         policy: ReadinessPolicy,
     ) -> Self {
         Self {
-            endpoint: format!("http://{}:{}", config.host, config.port),
+            endpoint: match &container {
+                Some((_, name)) => rustfs_dial_endpoint(&config, name),
+                None => format!("http://{}:{}", config.host, config.port),
+            },
             config,
             container,
             policy,
@@ -2167,7 +2196,7 @@ impl ExternalService for RustfsService {
             }
         };
 
-        let endpoint = format!("http://{}:{}", cfg.host, cfg.port);
+        let endpoint = self.dial_endpoint(&cfg);
         let start = Instant::now();
 
         let probe = list_buckets_probe(&endpoint, &cfg);

@@ -44,7 +44,10 @@ use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use temps_config::ConfigService;
-use temps_core::EncryptionService;
+use temps_core::managed_service_address::{
+    retarget_parameters, ContainerEndpointResolver, DialTargetSource, HostForm,
+};
+use temps_core::{EncryptionService, ExecutionEnvironment};
 use temps_entities::{external_services, nodes};
 
 use crate::cache_hit_window::CacheHitWindows;
@@ -146,6 +149,12 @@ pub struct MetricsScraper {
     cluster_primaries: ClusterPrimaries,
     /// Windowed Postgres cache hit ratio state.
     cache_hit: CacheHitState,
+    /// Names the container behind a standalone service. A containerized
+    /// control plane connects to a service on its own Docker daemon by that
+    /// name; without it the stored loopback address is dialled as-is.
+    container_endpoints: Option<Arc<dyn ContainerEndpointResolver>>,
+    /// Where this process runs, read once at construction.
+    execution_environment: ExecutionEnvironment,
 }
 
 impl MetricsScraper {
@@ -175,7 +184,20 @@ impl MetricsScraper {
             cluster_primary: None,
             cluster_primaries: Arc::new(StdMutex::new(HashMap::new())),
             cache_hit: Arc::new(StdMutex::new(CacheHitWindows::default())),
+            container_endpoints: None,
+            execution_environment: temps_core::runtime::execution_environment_compatibility(),
         }
+    }
+
+    /// Resolve the container behind each standalone service through
+    /// `endpoints`, so a containerized control plane scrapes a service on its
+    /// own Docker daemon over the network they share.
+    pub fn with_container_endpoints(
+        mut self,
+        endpoints: Arc<dyn ContainerEndpointResolver>,
+    ) -> Self {
+        self.container_endpoints = Some(endpoints);
+        self
     }
 
     /// Scrape HA PostgreSQL clusters through `connector`, which resolves and
@@ -297,6 +319,8 @@ impl MetricsScraper {
             let node_lookup_error = Arc::clone(&node_lookup_error);
             let cluster_primary = self.cluster_primary.clone();
             let cluster_primaries = Arc::clone(&self.cluster_primaries);
+            let container_endpoints = self.container_endpoints.clone();
+            let execution_environment = self.execution_environment;
             let last_values = Arc::clone(&self.last_scalar_values);
             let cache_hit = Arc::clone(&self.cache_hit);
             let in_flight = Arc::clone(&self.in_flight);
@@ -374,7 +398,12 @@ impl MetricsScraper {
                         })?;
                     match worker_data_address(service.node_id, &worker_addresses) {
                         Ok(Some(data_address)) => use_worker_host(&mut params, data_address),
-                        Ok(None) => {}
+                        Ok(None) => use_container_endpoint(
+                            &mut params,
+                            &service,
+                            container_endpoints.as_deref(),
+                            execution_environment,
+                        ),
                         Err(node_id) => {
                             // Dialling the stored loopback host would reach
                             // the control plane, and possibly an unrelated
@@ -557,6 +586,48 @@ fn use_worker_host(params: &mut ServiceParams, data_address: &str) {
         "host".to_string(),
         serde_json::Value::String(temps_core::node_address::url_host(data_address)),
     );
+}
+
+/// Point a service on the control plane's own Docker daemon at the address
+/// this process can connect to.
+///
+/// Its stored loopback `host` and published `port` are an address only for a
+/// process sharing the Docker host's network namespace. A containerized
+/// control plane connects by container name on the engine's own port instead
+/// (see [`temps_core::managed_service_address`]); a native one keeps the
+/// stored address, as does a host the operator set explicitly.
+fn use_container_endpoint(
+    params: &mut ServiceParams,
+    service: &external_services::Model,
+    endpoints: Option<&dyn ContainerEndpointResolver>,
+    execution_environment: ExecutionEnvironment,
+) {
+    let Some(endpoints) = endpoints else {
+        return;
+    };
+    let mut parameters = serde_json::Value::Object(
+        params
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    let container = endpoints.container_endpoint(&service.service_type, &service.name, &parameters);
+    // Every connection string embeds the host in a URL authority.
+    let source = retarget_parameters(
+        execution_environment,
+        &mut parameters,
+        None,
+        container.as_ref(),
+        HostForm::UrlAuthority,
+    );
+    if source != DialTargetSource::ContainerNetwork {
+        return;
+    }
+    for key in ["host", "port"] {
+        if let Some(value) = parameters.get(key) {
+            params.insert(key.to_string(), value.clone());
+        }
+    }
 }
 
 /// Scrape an HA (cluster-topology) service at its current primary.
@@ -1874,6 +1945,112 @@ mod tests {
                 "[fd00::7]",
                 "stored host {loopback:?}"
             );
+        }
+    }
+
+    /// Names containers the way the engines do, without the providers layer.
+    struct PrefixedContainers;
+
+    impl ContainerEndpointResolver for PrefixedContainers {
+        fn container_endpoint(
+            &self,
+            service_type: &str,
+            service_name: &str,
+            _parameters: &serde_json::Value,
+        ) -> Option<temps_core::managed_service_address::ContainerEndpoint> {
+            let port = match service_type {
+                "postgres" => 5432,
+                "redis" => 6379,
+                _ => return None,
+            };
+            Some(temps_core::managed_service_address::ContainerEndpoint {
+                name: format!("{service_type}-{service_name}"),
+                port,
+            })
+        }
+    }
+
+    fn standalone_service(id: i32, service_type: &str, name: &str) -> external_services::Model {
+        let mut service = cluster_service(id, service_type);
+        service.name = name.to_string();
+        service.topology = "standalone".to_string();
+        service
+    }
+
+    /// Regression: a control plane running in a container dialled the stored
+    /// `localhost:<published port>`, which is its own loopback, and never
+    /// reached a service on its own Docker daemon. It must connect by
+    /// container name on the engine's port, over the network they share.
+    #[test]
+    fn containerized_control_plane_scrapes_a_local_service_by_container_name() {
+        let service = standalone_service(21, "postgres", "orders");
+        let mut p = params(&[
+            ("host", "localhost"),
+            ("port", "6097"),
+            ("username", "postgres"),
+            ("password", "pw"),
+            ("database", "app"),
+        ]);
+
+        use_container_endpoint(
+            &mut p,
+            &service,
+            Some(&PrefixedContainers),
+            ExecutionEnvironment::Docker,
+        );
+
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("postgresql://postgres:pw@postgres-orders:5432/app".to_string())
+        );
+    }
+
+    #[test]
+    fn native_control_plane_keeps_scraping_the_stored_loopback_address() {
+        let service = standalone_service(22, "redis", "cache");
+        let mut p = params(&[("host", "localhost"), ("port", "7043")]);
+
+        use_container_endpoint(
+            &mut p,
+            &service,
+            Some(&PrefixedContainers),
+            ExecutionEnvironment::Host,
+        );
+
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("redis://localhost:7043".to_string())
+        );
+    }
+
+    #[test]
+    fn container_endpoint_keeps_an_explicit_host_and_unknown_engines() {
+        let explicit_service = standalone_service(23, "redis", "cache");
+        let mut explicit = params(&[("host", "db.internal"), ("port", "7043")]);
+        use_container_endpoint(
+            &mut explicit,
+            &explicit_service,
+            Some(&PrefixedContainers),
+            ExecutionEnvironment::Docker,
+        );
+        assert_eq!(param_str(&explicit, "host"), "db.internal");
+        assert_eq!(param_str(&explicit, "port"), "7043");
+
+        // No resolver, or an engine it does not know: the stored address stays.
+        let unknown_service = standalone_service(24, "mariadb", "shop");
+        for resolver in [
+            None,
+            Some(&PrefixedContainers as &dyn ContainerEndpointResolver),
+        ] {
+            let mut p = params(&[("host", "localhost"), ("port", "33061")]);
+            use_container_endpoint(
+                &mut p,
+                &unknown_service,
+                resolver,
+                ExecutionEnvironment::Docker,
+            );
+            assert_eq!(param_str(&p, "host"), "localhost");
+            assert_eq!(param_str(&p, "port"), "33061");
         }
     }
 

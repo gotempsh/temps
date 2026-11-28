@@ -7203,6 +7203,14 @@ export type ComposeHostStatusResponse = {
      * Whether every `docker compose config` option Temps needs is present.
      */
     supported: boolean;
+    /**
+     * Set when this installation cannot deploy Compose projects at all
+     * (Temps itself runs in a container), as opposed to a host whose Compose
+     * CLI is missing or old. `applicable` is false then: there is nothing to
+     * install or upgrade, and clients should explain the limit where a
+     * Compose project would be created instead of warning about the CLI.
+     */
+    unsupported_reason?: string | null;
     version?: string | null;
 };
 
@@ -12093,7 +12101,7 @@ export type DeploymentEnvironmentResponse = {
  * Allowlisted failure codes. Wire values are `snake_case` and stable; add new
  * variants rather than renaming existing ones.
  */
-export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'registry_unavailable' | 'image_pull_failed' | 'dockerfile_copy_not_found' | 'static_output_rejected' | 'build_node_unreachable' | 'static_deploy_failed' | 'entrypoint_needs_capability' | 'unknown';
+export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'compose_unsupported_environment' | 'volume_mount' | 'route_activation' | 'registry_unavailable' | 'image_pull_failed' | 'dockerfile_copy_not_found' | 'static_output_rejected' | 'build_node_unreachable' | 'static_deploy_failed' | 'entrypoint_needs_capability' | 'unknown';
 
 /**
  * API view of a failed deployment's classification.
@@ -28760,6 +28768,12 @@ export type PresetInfo = {
 
 export type PresetResponse = {
     /**
+     * Whether this instance can deploy projects that use the preset. A
+     * preset stays in the catalog when it cannot, so a client can show it
+     * with the reason instead of hiding it.
+     */
+    available: boolean;
+    /**
      * Default port the application listens on (None for static sites)
      */
     default_port?: number | null;
@@ -28783,6 +28797,11 @@ export type PresetResponse = {
      * Unique identifier slug for the preset
      */
     slug: string;
+    /**
+     * Why the preset cannot be used on this instance, when `available` is
+     * false.
+     */
+    unavailable_reason?: string | null;
 };
 
 /**

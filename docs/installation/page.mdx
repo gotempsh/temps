@@ -472,6 +472,41 @@ and all three `*_INTERNAL_IP` values for the private control plane;
 or `TEMPS_INGRESS_SUBNET`, `TEMPS_ADMIN_INGRESS_IP`, and
 `TEMPS_INGRESS_GATEWAY_IP` for the loopback admin proxy.
 
+Keep `TEMPS_WORKLOAD_SUBNET` in a private range (`10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, or an IPv6 unique-local prefix). A bridge on
+routable address space hides the real hosts in that range from this machine,
+and Temps treats only private addresses as its own network when it decides
+where a managed database's credentials may be sent.
+
+#### Moving an existing install to a private workload subnet
+
+Releases before this change defaulted `TEMPS_WORKLOAD_SUBNET` to
+`198.20.255.0/24`, which is routable address space, and `.env` keeps that value
+across upgrades. Such an install keeps working; moving it is optional. Docker
+cannot change the subnet of a network in place, so the network is recreated and
+every container on it is reattached. Applications and managed services are
+unreachable for the duration, usually under a minute:
+
+```bash
+net=temps-docker-workloads   # your TEMPS_NETWORK_NAME
+docker compose stop
+# Containers Temps created (applications, databases), running or stopped:
+# everything on the network that Compose does not manage.
+attached=$(docker ps --all --filter "network=$net" \
+  --format '{{.Names}} {{.Label "com.docker.compose.project"}}' | awk 'NF == 1 { print $1 }')
+for name in $attached; do docker network disconnect --force "$net" "$name"; done
+docker compose down          # removes the Compose containers and the network
+# In .env, set a private range, for example:
+#   TEMPS_WORKLOAD_SUBNET=10.213.255.0/24
+#   TEMPS_PUBLIC_INGRESS_IP=10.213.255.10
+docker compose up --detach
+for name in $attached; do docker network connect "$net" "$name"; done
+```
+
+`docker compose down` does not remove volumes, so no data is deleted. A
+container that was attached only to this network has no network between the
+two loops; it keeps running and is reachable again once it is reconnected.
+
 On the first unattended startup, Temps creates `TEMPS_ADMIN_EMAIL` as the
 administrator using the mounted `TEMPS_ADMIN_PASSWORD_FILE`. The password is
 not placed in the container environment, command line, or logs. The source file

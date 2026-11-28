@@ -330,6 +330,34 @@ impl PostgresSource {
         Self::connect_with_policy(host, port, username, password, database, true).await
     }
 
+    /// Create a PostgreSQL data source for a Temps-managed container on the
+    /// Docker network this control plane shares with it (see
+    /// [`connect_to_local_container`]).
+    pub async fn connect_local_container(
+        address: std::net::IpAddr,
+        port: u16,
+        username: &str,
+        password: &str,
+        database: &str,
+    ) -> Result<Self> {
+        Self::validate_database_identifier(database)?;
+        debug!(
+            "Connecting to PostgreSQL container: {}@{}:{}/{}",
+            username, address, port, database
+        );
+        let client =
+            connect_to_local_container(address, port, username, password, database).await?;
+        Ok(Self::from_client(client, database))
+    }
+
+    fn from_client(client: Client, database: &str) -> Self {
+        Self {
+            client: Arc::new(client),
+            database_name: database.to_string(),
+            query_timeout_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
     async fn connect_with_policy(
         host: &str,
         port: u16,
@@ -374,11 +402,7 @@ impl PostgresSource {
             database
         );
 
-        Ok(Self {
-            client: Arc::new(client),
-            database_name: database.to_string(),
-            query_timeout_lock: Arc::new(tokio::sync::Mutex::new(())),
-        })
+        Ok(Self::from_client(client, database))
     }
 
     /// Execute a raw SQL statement (no result rows expected).
@@ -509,6 +533,10 @@ enum ResolvedHost {
         hostname: String,
         addresses: Vec<std::net::IpAddr>,
     },
+    /// A Temps-managed container on the Docker network this control plane
+    /// shares with it, at the address the Docker daemon reported for it.
+    /// Never resolved from a name: see [`connect_to_local_container`].
+    LocalContainer(std::net::IpAddr),
 }
 
 impl ResolvedHost {
@@ -517,6 +545,25 @@ impl ResolvedHost {
             Self::UnixSocket(_) => true,
             Self::Tcp { addresses, .. } => {
                 !addresses.is_empty() && addresses.iter().all(|address| ip_is_private(*address))
+            }
+            // A Docker bridge address belongs to a container on this host, so
+            // the connection never leaves it, whatever range the operator gave
+            // the network. The daemon, which this control plane already trusts
+            // with every container it runs, vouched for the address.
+            Self::LocalContainer(_) => true,
+        }
+    }
+
+    /// Why an unverified certificate or cleartext is allowed to this host,
+    /// for the warning logged when the ladder falls back to one.
+    fn unverified_transport_basis(&self) -> &'static str {
+        match self {
+            Self::UnixSocket(_) | Self::Tcp { .. } => {
+                "every resolved address is loopback or private"
+            }
+            Self::LocalContainer(_) => {
+                "the address is the managed container's own on this host's Docker network, as \
+                 the Docker daemon reported it"
             }
         }
     }
@@ -590,6 +637,9 @@ fn connect_config_with_ssl_mode(
     match resolved_host {
         ResolvedHost::UnixSocket(path) => {
             cfg.host(path);
+        }
+        ResolvedHost::LocalContainer(address) => {
+            cfg.host(address.to_string()).hostaddr(*address);
         }
         ResolvedHost::Tcp {
             hostname,
@@ -678,6 +728,35 @@ pub async fn connect_with_private_tls_ladder(
     .await
 }
 
+/// Connect to a Temps-managed PostgreSQL container on the Docker network this
+/// control plane shares with it, at `address`.
+///
+/// For a control plane that itself runs in a container: it reaches a managed
+/// service by its address on the shared network, which need not be a private
+/// range (the network's subnet is the operator's choice). `address` must be
+/// the one the Docker daemon reports for the service's own container on that
+/// network, never a name or a stored value, so the self-signed and cleartext
+/// rungs only ever reach a container on this host. The ladder is otherwise the
+/// same: verified TLS first.
+pub async fn connect_to_local_container(
+    address: std::net::IpAddr,
+    port: u16,
+    username: &str,
+    password: &str,
+    database: &str,
+) -> Result<Client> {
+    connect_resolved_with_policy(
+        ResolvedHost::LocalContainer(address),
+        &address.to_string(),
+        port,
+        username,
+        password,
+        database,
+        TransportPolicy::PrivateOnly,
+    )
+    .await
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum TransportPolicy {
     VerifiedPublicAllowed,
@@ -693,6 +772,27 @@ async fn connect_with_tls_ladder_policy(
     policy: TransportPolicy,
 ) -> Result<Client> {
     let resolved_host = resolve_host_once(host, port).await?;
+    connect_resolved_with_policy(
+        resolved_host,
+        host,
+        port,
+        username,
+        password,
+        database,
+        policy,
+    )
+    .await
+}
+
+async fn connect_resolved_with_policy(
+    resolved_host: ResolvedHost,
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    database: &str,
+    policy: TransportPolicy,
+) -> Result<Client> {
     if policy == TransportPolicy::PrivateOnly && !resolved_host.permits_unverified_transport() {
         return Err(DataError::ConnectionFailed(format!(
             "Managed PostgreSQL endpoint '{host}' resolved outside the private network; refusing \
@@ -729,6 +829,7 @@ async fn connect_with_tls_ladder_policy(
                 )));
             }
 
+            let permitted_because = resolved_host.unverified_transport_basis();
             match connect_with_self_signed_tls_config(&tls_config).await {
                 Ok(client) => {
                     warn!(
@@ -736,8 +837,9 @@ async fn connect_with_tls_ladder_policy(
                         "PostgreSQL certificate did not validate against the system roots ({}); \
                          connected with an unverified (self-signed) certificate. Traffic is \
                          encrypted but the server is NOT authenticated. Permitted only because \
-                         every resolved address is loopback or private.",
-                        format_chain(&verified_error)
+                         {}.",
+                        format_chain(&verified_error),
+                        permitted_because
                     );
                     Ok(client)
                 }
@@ -745,8 +847,9 @@ async fn connect_with_tls_ladder_policy(
                     warn!(
                         host = %host,
                         "PostgreSQL refused TLS ({}); falling back to an UNENCRYPTED connection. \
-                         Permitted only because every resolved address is loopback or private.",
-                        format_chain(&tls_error)
+                         Permitted only because {}.",
+                        format_chain(&tls_error),
+                        permitted_because
                     );
 
                     let plain_config = config(tokio_postgres::config::SslMode::Disable);
@@ -2599,6 +2702,38 @@ mod tests {
     }
 
     #[test]
+    fn ip_is_private_covers_default_container_networks() {
+        // Where a containerized Temps finds a managed database: on the
+        // workload network of the Compose install or in one of Docker's
+        // default address pools. The private-only rungs must keep working on
+        // all of them.
+        for (ip, what) in [
+            ("10.213.255.7", "Compose install workload network"),
+            ("172.17.0.2", "Docker default bridge"),
+            ("172.31.255.254", "Docker default pool, last /16"),
+            ("192.168.240.2", "Docker default pool, 192.168.0.0/16"),
+        ] {
+            assert!(
+                ip_is_private(ip.parse().expect("test address should parse")),
+                "{what} ({ip}) should be treated as private"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_is_private_rejects_non_private_bridge_ranges() {
+        // A container network can be given any range. Routable space and the
+        // benchmarking range are not private, so a workload network placed
+        // there is refused rather than trusted because it is "only a bridge".
+        for ip in ["198.20.255.7", "198.18.255.10", "198.19.255.10"] {
+            assert!(
+                !ip_is_private(ip.parse().expect("test address should parse")),
+                "should NOT be treated as private: {ip}"
+            );
+        }
+    }
+
+    #[test]
     fn ip_is_private_rejects_public_addresses() {
         // Falling back to an unverified certificate or to cleartext for these
         // would put the service's admin password on the open internet.
@@ -2694,6 +2829,52 @@ mod tests {
         );
         assert_eq!(config.get_hosts().len(), 1);
         assert_eq!(config.get_hostaddrs().len(), 1);
+    }
+
+    #[test]
+    fn daemon_reported_container_address_permits_fallback_outside_private_ranges() {
+        // A workload network can be given a range that is not private (older
+        // Compose installs defaulted to one). A name resolving there stays
+        // refused; the same address as reported by the Docker daemon for a
+        // managed container is allowed.
+        let address: std::net::IpAddr = "198.20.255.7".parse().expect("test address");
+        let resolved_by_name = ResolvedHost::Tcp {
+            hostname: "postgres-orders".to_string(),
+            addresses: vec![address],
+        };
+
+        assert!(!resolved_by_name.permits_unverified_transport());
+        assert!(ResolvedHost::LocalContainer(address).permits_unverified_transport());
+        assert!(ResolvedHost::LocalContainer(address)
+            .unverified_transport_basis()
+            .contains("Docker daemon reported"));
+        assert!(resolved_by_name
+            .unverified_transport_basis()
+            .contains("loopback or private"));
+    }
+
+    #[test]
+    fn local_container_config_pins_exactly_the_daemon_address_and_requires_tls() {
+        let address: std::net::IpAddr = "198.20.255.7".parse().expect("test address");
+
+        let config = connect_config_for(
+            &ResolvedHost::LocalContainer(address),
+            5432,
+            "admin",
+            "secret",
+            "postgres",
+        );
+
+        assert_eq!(config.get_hostaddrs(), &[address]);
+        assert!(matches!(
+            config.get_hosts(),
+            [tokio_postgres::config::Host::Tcp(name)] if name == "198.20.255.7"
+        ));
+        assert_eq!(config.get_ports(), &[5432]);
+        assert_eq!(
+            config.get_ssl_mode(),
+            tokio_postgres::config::SslMode::Require
+        );
     }
 
     #[tokio::test]

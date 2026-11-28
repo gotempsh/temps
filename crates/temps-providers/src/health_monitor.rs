@@ -1153,7 +1153,7 @@ impl ExternalServiceHealthMonitor {
         &self,
         service: &external_services::Model,
     ) -> Option<PostgresWalHealth> {
-        let service_config = match self.manager.get_service_config(service.id).await {
+        let mut service_config = match self.manager.get_service_config(service.id).await {
             Ok(cfg) => cfg,
             Err(e) => {
                 debug!(
@@ -1163,6 +1163,9 @@ impl ExternalServiceHealthMonitor {
                 return None;
             }
         };
+        // The stored loopback address is not reachable from a containerized
+        // control plane; connect where this process can.
+        ExternalServiceManager::retarget_local_standalone_dial(service, &mut service_config);
 
         let conn_str = postgres_wal_health::build_conn_str(&service_config.parameters)?;
         postgres_wal_health::probe_wal_health(&conn_str).await

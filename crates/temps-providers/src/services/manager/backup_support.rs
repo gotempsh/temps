@@ -548,7 +548,8 @@ impl ExternalServiceManager {
         active.update(self.db.as_ref()).await?;
 
         // Probe fresh against the new container. Best-effort.
-        let service_config = self.get_service_config(service_id).await?;
+        let mut service_config = self.get_service_config(service_id).await?;
+        Self::retarget_local_standalone_dial(&service, &mut service_config);
         let Some(conn_str) = postgres_wal_health::build_conn_str(&service_config.parameters) else {
             return Ok(());
         };

@@ -144,8 +144,8 @@ services:
     environment:
       TEMPS_CONTROL_INTERNAL_IP: 198.18.255.21
       TEMPS_INGRESS_MODE: public
-      TEMPS_INGRESS_LISTEN_IP: 198.20.255.21
+      TEMPS_INGRESS_LISTEN_IP: 10.213.255.21
     networks:
       temps-network:
       temps-app-network:
-        ipv4_address: 198.20.255.21
+        ipv4_address: 10.213.255.21

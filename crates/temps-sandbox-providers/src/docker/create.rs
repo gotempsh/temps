@@ -69,6 +69,22 @@ impl DockerSandboxProvider {
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
         config.validate_allow_docker(super::SandboxBackend::Docker)?;
+        let (container_name, home_volume_name) = Self::sandbox_names(&config);
+        // Before anything is asked of the daemon or replaced: a workspace the
+        // daemon cannot mount fails the create outright, with the previous
+        // sandbox (if any) still in place.
+        let workspace = self
+            .daemon_mounts
+            .resolve(&config.host_work_dir)
+            .await
+            .map_err(|error| AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "docker".into(),
+                reason: format!(
+                    "workspace '{}' of sandbox '{container_name}' cannot be mounted: {error}",
+                    config.host_work_dir.display()
+                ),
+            })?;
         let capacity = self.capacity().await?;
         let cpu_limit = capacity.cpu_limit(
             config.run_id,
@@ -80,7 +96,6 @@ impl DockerSandboxProvider {
             config.memory_limit_mb,
             self.config.default_memory_limit_mb,
         )?;
-        let (container_name, home_volume_name) = Self::sandbox_names(&config);
         let _access_operation = self
             .service_access
             .as_ref()
@@ -229,6 +244,7 @@ impl DockerSandboxProvider {
             },
             uses_daemon,
         );
+        Self::mount_workspace(&mut container_config, workspace, &home_volume_name);
         if let Some(pending) = &mut access_mount {
             pending.configure(
                 &mut container_config,
@@ -820,6 +836,40 @@ impl DockerSandboxProvider {
         ]
     }
 
+    /// Put the workspace at `/workspace` from the source the daemon can
+    /// actually reach.
+    ///
+    /// A host path is bound exactly as [`Self::container_binds`] always did.
+    /// A workspace that lives in a named volume of Temps' own container is
+    /// mounted from that volume, narrowed to the sandbox's directory, so the
+    /// sandbox and Temps keep seeing the same files; binding the path instead
+    /// would hand the sandbox an empty directory the daemon created on the
+    /// host.
+    pub(super) fn mount_workspace(
+        container: &mut bollard::models::ContainerCreateBody,
+        workspace: temps_core::daemon_mount::DaemonMountSource,
+        home_volume_name: &str,
+    ) {
+        use temps_core::daemon_mount::DaemonMountSource;
+
+        let host_config = container.host_config.get_or_insert_with(Default::default);
+        match workspace {
+            DaemonMountSource::HostPath(path) => {
+                host_config.binds = Some(Self::container_binds(
+                    &path.to_string_lossy(),
+                    home_volume_name,
+                ));
+            }
+            volume @ DaemonMountSource::VolumeSubpath { .. } => {
+                host_config.binds = Some(vec![format!("{}:{}", home_volume_name, SANDBOX_HOME)]);
+                host_config
+                    .mounts
+                    .get_or_insert_with(Vec::new)
+                    .push(volume.into_mount(CONTAINER_WORK_DIR, false));
+            }
+        }
+    }
+
     pub(super) fn container_tmpfs() -> HashMap<String, String> {
         let mut tmpfs = HashMap::new();
         tmpfs.insert(
@@ -1254,6 +1304,81 @@ mod tests {
             "POST",
             "/containers/fake-restore-container/exec"
         ));
+    }
+
+    /// A containerized Temps keeps sandbox workspaces in its data volume. The
+    /// sandbox must mount that volume narrowed to its own directory; binding
+    /// the path would give it an empty directory on the Docker host.
+    #[tokio::test]
+    async fn a_workspace_in_temps_own_volume_is_mounted_from_that_volume() {
+        use temps_core::daemon_mount::{
+            DaemonFilesystemView, DaemonMounts, OwnMount, OwnMountSource,
+        };
+
+        let (fake, provider) = fake_provider().await;
+        let provider =
+            provider.with_daemon_mounts(DaemonMounts::with_view(DaemonFilesystemView::Container {
+                container: "temps-app".to_string(),
+                mounts: vec![OwnMount {
+                    destination: PathBuf::from("/app/data"),
+                    source: OwnMountSource::Volume("temps_data".to_string()),
+                }],
+                volume_subpath_supported: true,
+                api_version: "1.47".to_string(),
+            }));
+        image_present(&fake, json!({}));
+        let mut cfg = config(7120, Some("none"));
+        cfg.host_work_dir = PathBuf::from("/app/data/standalone-sandboxes/sbx_7120");
+
+        // The create goes on to steps this fake does not script; only the
+        // container it asked for matters here.
+        let _ = provider.create_inner(cfg).await;
+
+        let creates = fake.creates();
+        let create = creates.last().expect("the sandbox container was requested");
+        let host = &create.body["HostConfig"];
+        let home = DockerSandboxProvider::home_volume_name("temps-sandbox-7120");
+        assert_eq!(host["Binds"], json!([format!("{home}:{SANDBOX_HOME}")]));
+        let mounts = host["Mounts"].as_array().expect("a workspace mount");
+        assert_eq!(mounts.len(), 1, "{mounts:?}");
+        assert_eq!(mounts[0]["Type"], "volume");
+        assert_eq!(mounts[0]["Source"], "temps_data");
+        assert_eq!(mounts[0]["Target"], CONTAINER_WORK_DIR);
+        assert_eq!(
+            mounts[0]["VolumeOptions"]["Subpath"],
+            "standalone-sandboxes/sbx_7120"
+        );
+    }
+
+    /// A workspace outside every mount of Temps' own container cannot reach
+    /// the daemon at all. The create must say so and touch nothing.
+    #[tokio::test]
+    async fn a_workspace_the_daemon_cannot_reach_fails_before_creating_anything() {
+        use temps_core::daemon_mount::{DaemonFilesystemView, DaemonMounts};
+
+        let (fake, provider) = fake_provider().await;
+        let provider =
+            provider.with_daemon_mounts(DaemonMounts::with_view(DaemonFilesystemView::Container {
+                container: "temps-app".to_string(),
+                mounts: Vec::new(),
+                volume_subpath_supported: true,
+                api_version: "1.47".to_string(),
+            }));
+
+        let error = provider
+            .create_inner(config(7121, Some("none")))
+            .await
+            .expect_err("an unreachable workspace must fail the create");
+
+        let (run_id, reason) = creation_failure(error);
+        assert_eq!(run_id, 7121);
+        assert!(
+            reason.contains("workspace '/tmp/temps-create-steps'")
+                && reason.contains("temps-sandbox-7121")
+                && reason.contains("cannot be mounted"),
+            "{reason}"
+        );
+        assert!(fake.calls().is_empty(), "{}", describe(&fake.calls()));
     }
 
     #[tokio::test]

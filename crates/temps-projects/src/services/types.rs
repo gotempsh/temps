@@ -554,6 +554,19 @@ pub enum ProjectError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    /// The selected preset cannot be deployed where this control plane runs
+    /// (a Docker Compose project on a containerized Temps). Refused when the
+    /// preset is chosen rather than at the first deployment, so the operator
+    /// learns the limit before configuring a project around it.
+    #[error(
+        "Preset '{preset}' cannot be selected in the '{execution_environment}' execution environment: {reason}"
+    )]
+    PresetUnsupportedInExecutionEnvironment {
+        preset: String,
+        execution_environment: String,
+        reason: String,
+    },
+
     #[error("GitHub error: {0}")]
     GitHubError(String),
 

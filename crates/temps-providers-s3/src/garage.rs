@@ -447,9 +447,15 @@ impl GarageAdmin {
                 operation: "building the admin API client".to_string(),
                 reason: e.to_string(),
             })?;
+        let (host, port) = temps_providers_core::externalsvc::dial::control_plane_endpoint(
+            &config.host,
+            port,
+            &garage_container_name(service),
+            GARAGE_ADMIN_PORT,
+        );
         Ok(Self {
             http,
-            base_url: format!("http://{}:{}", config.host, port),
+            base_url: format!("http://{}:{}", host, port),
             token: config.admin_token.clone(),
             service: service.to_string(),
         })
@@ -809,7 +815,13 @@ async fn authenticated_probe(service: &str, config: &GarageConfig) -> Result<(),
         Err(e) => return Err(e.to_string()),
     }
 
-    let endpoint = format!("http://{}:{}", config.host, config.port);
+    let (host, port) = temps_providers_core::externalsvc::dial::engine_dial_address(
+        &config.host,
+        &config.port,
+        &garage_container_name(service),
+        &GARAGE_S3_PORT.to_string(),
+    );
+    let endpoint = format!("http://{}:{}", host, port);
     let credentials = aws_sdk_s3::config::Credentials::new(
         config.access_key.clone(),
         config.secret_key.clone(),
@@ -1356,11 +1368,18 @@ impl ManagedS3Backend for GarageService {
 
     fn endpoint(&self, config: &ServiceConfig) -> Result<ManagedS3Endpoint, ManagedS3Error> {
         let stored = self.stored_config(config)?;
+        let container_name = self.get_container_name();
+        let (host, host_port) = temps_providers_core::externalsvc::dial::control_plane_endpoint(
+            &stored.host,
+            stored.s3_port(&self.name)?,
+            &container_name,
+            GARAGE_S3_PORT,
+        );
         Ok(ManagedS3Endpoint {
-            internal_host: self.get_container_name(),
+            internal_host: container_name,
             internal_port: GARAGE_S3_PORT,
-            host: stored.host.clone(),
-            host_port: stored.s3_port(&self.name)?,
+            host,
+            host_port,
             region: stored.region,
         })
     }
