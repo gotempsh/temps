@@ -891,6 +891,66 @@ async function showAction(options: ShowOptions): Promise<void> {
   newline()
 }
 
+/**
+ * The complete credentials to send when `update --api-key` rotates a
+ * provider's key. The update endpoint replaces the stored credentials as a
+ * whole and needs the `type` tag, so the body is rebuilt from the provider's
+ * masked credentials with the new key in place. Only providers whose other
+ * fields come back unmasked can be rebuilt this way; for the rest a key-only
+ * body would silently drop stored values, so this refuses with what to do.
+ */
+export function rotatedCredentials(
+  providerType: string,
+  maskedCredentials: unknown,
+  newKey: string,
+): Record<string, unknown> {
+  const stored =
+    maskedCredentials && typeof maskedCredentials === 'object'
+      ? (maskedCredentials as Record<string, unknown>)
+      : {}
+  const present = (value: unknown) => value !== undefined && value !== null && value !== ''
+
+  switch (providerType) {
+    case 'bunny':
+      return { type: 'bunny', api_key: newKey }
+    case 'digitalocean':
+      return { type: 'digitalocean', api_token: newKey }
+    case 'cloudflare':
+      if (present(stored.account_id)) {
+        throw new Error(
+          'This Cloudflare provider has an account ID, which the API only returns masked, so --api-key would erase it. ' +
+            'Update the token from the provider page in the console instead.',
+        )
+      }
+      return { type: 'cloudflare', api_token: newKey }
+    case 'powerdns': {
+      if (typeof stored.api_url !== 'string' || !present(stored.api_url)) {
+        throw new Error('The stored PowerDNS credentials have no API URL; update them from the console instead.')
+      }
+      return {
+        type: 'powerdns',
+        api_url: stored.api_url,
+        api_key: newKey,
+        ...(typeof stored.server_id === 'string' && present(stored.server_id) && { server_id: stored.server_id }),
+      }
+    }
+    case 'namecheap':
+      throw new Error(
+        'Namecheap credentials include a username the API does not return, so --api-key cannot rotate the key without erasing it. ' +
+          'Update the credentials from the provider page in the console instead.',
+      )
+    case 'route53':
+    case 'gcp':
+    case 'azure':
+      throw new Error(
+        `${providerType} credentials have more than one secret, so a single --api-key cannot replace them. ` +
+          'Update them from the provider page in the console instead.',
+      )
+    default:
+      throw new Error(`--api-key does not apply to ${providerType} providers, which have no API key.`)
+  }
+}
+
 async function updateAction(rawOptions: UpdateOptions): Promise<void> {
   const options = await resolveStdinSecret(rawOptions)
 
@@ -914,7 +974,13 @@ async function updateAction(rawOptions: UpdateOptions): Promise<void> {
   }
 
   if (options.apiKey) {
-    body.credentials = { api_token: options.apiKey }
+    const { data: existing, error: getError } = await getDnsProvider({ client, path: { id } })
+    if (getError || !existing) {
+      throw new Error(
+        `Failed to load DNS provider ${id} to rotate its key: ${getErrorMessage(getError) ?? 'not found'}`,
+      )
+    }
+    body.credentials = rotatedCredentials(existing.provider_type, existing.credentials, options.apiKey)
   }
 
   if (options.active !== undefined) {

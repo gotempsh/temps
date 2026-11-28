@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
-import { resolveDnsProviderCredentials, resolveStdinSecret } from './index.js'
+import { resolveDnsProviderCredentials, resolveStdinSecret, rotatedCredentials } from './index.js'
 import type { DnsProviderType } from '../../api/types.gen.js'
 
 describe('resolveDnsProviderCredentials', () => {
@@ -317,5 +317,55 @@ describe('resolveStdinSecret', () => {
     ).rejects.toThrow(
       'Only one secret can be read from stdin per command, got --api-key-stdin, --api-token-stdin',
     )
+  })
+})
+
+describe('rotatedCredentials', () => {
+  test('keeps the stored PowerDNS API URL and server ID around the new key', () => {
+    expect(
+      rotatedCredentials(
+        'powerdns',
+        { type: 'powerdns', api_url: 'http://10.0.0.5:8081', api_key: '***', server_id: 'ns1' },
+        'new-key',
+      ),
+    ).toEqual({ type: 'powerdns', api_url: 'http://10.0.0.5:8081', api_key: 'new-key', server_id: 'ns1' })
+  })
+
+  test('omits an unset PowerDNS server ID', () => {
+    expect(
+      rotatedCredentials(
+        'powerdns',
+        { type: 'powerdns', api_url: 'http://10.0.0.5:8081', api_key: '***', server_id: null },
+        'new-key',
+      ),
+    ).toEqual({ type: 'powerdns', api_url: 'http://10.0.0.5:8081', api_key: 'new-key' })
+  })
+
+  test('tags single-secret providers with their type', () => {
+    expect(rotatedCredentials('bunny', { type: 'bunny', api_key: '***' }, 'k')).toEqual({
+      type: 'bunny',
+      api_key: 'k',
+    })
+    expect(rotatedCredentials('digitalocean', { type: 'digitalocean', api_token: 'abc***' }, 't')).toEqual({
+      type: 'digitalocean',
+      api_token: 't',
+    })
+    expect(
+      rotatedCredentials('cloudflare', { type: 'cloudflare', api_token: 'abc***', account_id: null }, 't'),
+    ).toEqual({ type: 'cloudflare', api_token: 't' })
+  })
+
+  test('refuses to erase a Cloudflare account ID it cannot read back', () => {
+    expect(() =>
+      rotatedCredentials('cloudflare', { type: 'cloudflare', api_token: 'abc***', account_id: 'acc***' }, 't'),
+    ).toThrow('account ID')
+  })
+
+  test('refuses providers whose credentials it cannot rebuild', () => {
+    expect(() => rotatedCredentials('namecheap', { type: 'namecheap', api_key: '***' }, 'k')).toThrow('username')
+    for (const type of ['route53', 'gcp', 'azure']) {
+      expect(() => rotatedCredentials(type, { type }, 'k')).toThrow('more than one secret')
+    }
+    expect(() => rotatedCredentials('manual', {}, 'k')).toThrow('no API key')
   })
 })
