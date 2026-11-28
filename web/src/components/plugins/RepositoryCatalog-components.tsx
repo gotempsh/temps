@@ -23,18 +23,25 @@ import {
   deployPluginPath,
   filterRepositoryCatalog,
 } from './RepositoryCatalog-shared'
-import { PLUGIN_IMAGE_COMMAND } from '@/lib/plugin-services'
+import { pluginImageCommand } from '@/lib/plugin-image'
+import type { PluginImageChoice } from './PluginImageForm'
 
 /**
- * Plugins published as Git repositories. A plugin runs as a Temps service, so
- * each listing leads to deploying its repository; nothing is installed from
- * here.
+ * Plugins their authors list. A plugin runs as a Temps service: a listing
+ * that offers an image is added from it in one go, and one published as
+ * source only leads to deploying its repository.
  */
 export function RepositoryCatalog({
   addedNames,
+  onAdd,
 }: {
   /** Names of the plugins already added to this server. */
   addedNames: string[]
+  /**
+   * Add the plugin a listing offers as an image. Absent for someone who
+   * cannot add plugins, who is given the command to pass on instead.
+   */
+  onAdd?: (choice: PluginImageChoice) => void
 }) {
   const [search, setSearch] = useState('')
   const [category, setCategory] = useState('')
@@ -144,10 +151,9 @@ export function RepositoryCatalog({
       ) : (
         <>
           <p className="text-sm text-muted-foreground">
-            Add a plugin from its image with{' '}
-            <code className="text-xs">{PLUGIN_IMAGE_COMMAND}</code>, or deploy
-            its repository and choose Add plugin. Listings are not a security
-            audit.
+            A listing that offers an image is added from it in one step; the
+            others are deployed from their repository, then added with Add
+            plugin. Listings are not a security audit.
           </p>
           <p
             role="status"
@@ -218,18 +224,29 @@ export function RepositoryCatalog({
                     {addedNames.includes(plugin.name) && (
                       <Badge variant="secondary">Added</Badge>
                     )}
-                    <CopyButton
-                      value={plugin.repository}
-                      label={`Copy the Git link of ${plugin.title}`}
-                      className="h-8 rounded-md border bg-background px-3"
-                    >
-                      Copy Git link
-                    </CopyButton>
-                    <Button asChild variant="outline" size="sm">
-                      <Link to={deployPluginPath(plugin.repository)}>
-                        Deploy
-                      </Link>
-                    </Button>
+                    {plugin.image ? (
+                      <CatalogImageActions
+                        title={plugin.title}
+                        choice={{ image: plugin.image, name: plugin.name }}
+                        added={addedNames.includes(plugin.name)}
+                        onAdd={onAdd}
+                      />
+                    ) : (
+                      <>
+                        <CopyButton
+                          value={plugin.repository}
+                          label={`Copy the Git link of ${plugin.title}`}
+                          className="h-8 rounded-md border bg-background px-3"
+                        >
+                          Copy Git link
+                        </CopyButton>
+                        <Button asChild variant="outline" size="sm">
+                          <Link to={deployPluginPath(plugin.repository)}>
+                            Deploy
+                          </Link>
+                        </Button>
+                      </>
+                    )}
                   </div>
                 </article>
               ))}
@@ -248,5 +265,44 @@ export function RepositoryCatalog({
         </>
       )}
     </section>
+  )
+}
+
+/**
+ * What a listing that offers an image leads to: adding the plugin from that
+ * image here, and the command that does the same from a terminal.
+ */
+export function CatalogImageActions({
+  title,
+  choice,
+  added,
+  onAdd,
+}: {
+  title: string
+  choice: PluginImageChoice
+  /** Whether a plugin of this name is already added. */
+  added: boolean
+  onAdd?: (choice: PluginImageChoice) => void
+}) {
+  return (
+    <>
+      <CopyButton
+        value={pluginImageCommand(choice.image)}
+        label={`Copy the command that adds ${title} from its image`}
+        className="h-8 rounded-md border bg-background px-3"
+      >
+        Copy command
+      </CopyButton>
+      {onAdd && !added && (
+        <Button
+          type="button"
+          size="sm"
+          title={`Add ${title} from the image ${choice.image}`}
+          onClick={() => onAdd(choice)}
+        >
+          Add plugin
+        </Button>
+      )}
+    </>
   )
 }

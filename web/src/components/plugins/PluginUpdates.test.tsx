@@ -143,6 +143,25 @@ test('a plugin deployed from an image names the image it is pinned to', () => {
   const image = 'registry.example.com/acme/reports:1.0.0'
   const pinned = render(<PluginPinnedBuild plugin={plugin({ image })} />)
   expect(pinned).toContain(`Pinned to deployment #41 of the image ${image}`)
+  // The content the image resolved to is named with it: a tag can be moved,
+  // what was approved cannot.
+  const content = render(
+    <PluginPinnedBuild
+      plugin={plugin({ image, image_id: `sha256:${'0123456789ab'.repeat(6)}` })}
+    />
+  )
+  expect(content).toContain(
+    `of the image ${image} (content 0123456789ab) · a new deployment`
+  )
+  // An image uploaded from a client has no reference, only its content.
+  const uploaded = render(
+    <PluginPinnedBuild
+      plugin={plugin({ image_id: `sha256:${'ab'.repeat(32)}` })}
+    />
+  )
+  expect(uploaded).toContain(
+    'Pinned to deployment #41 of an uploaded image (content abababababab)'
+  )
   // A service built from a repository has no image to name.
   expect(render(<PluginPinnedBuild plugin={plugin({})} />)).not.toContain(
     'of the image'

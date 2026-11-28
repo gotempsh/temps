@@ -54,6 +54,7 @@ import { createElement, useEffect, useState } from 'react'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
+import type { PluginImageChoice } from '@/components/plugins/PluginImageForm'
 import { RepositoryCatalog } from '@/components/plugins/RepositoryCatalog'
 import { PluginNavigationHint } from '@/components/plugins/PluginNavigationHint'
 import { PluginPermissionsDialog } from '@/components/plugins/PluginPermissionsDialog'
@@ -91,6 +92,10 @@ export function PluginsPage() {
   const serviceOf = (name: string) =>
     services.data?.plugins.find((plugin) => plugin.name === name)
   const [addingService, setAddingService] = useState(false)
+  // The image a catalogue listing offers, to add the plugin from.
+  const [offeredImage, setOfferedImage] = useState<
+    PluginImageChoice | undefined
+  >()
   const [uninstallName, setUninstallName] = useState<string | null>(null)
   const [permissionsName, setPermissionsName] = useState<string | null>(null)
   // The plugin whose waiting update is being reviewed.
@@ -201,6 +206,7 @@ export function PluginsPage() {
         open={canManagePlugins && addingService}
         onOpenChange={setAddingService}
         services={services.data}
+        image={offeredImage}
         onSensitiveError={handleSensitiveActionError}
         onAdded={setPermissionsName}
       />
@@ -231,7 +237,10 @@ export function PluginsPage() {
           canManagePlugins && (
             <Button
               disabled={managementPending}
-              onClick={() => setAddingService(true)}
+              onClick={() => {
+                setOfferedImage(undefined)
+                setAddingService(true)
+              }}
             >
               <Plus className="mr-2 size-4" /> Add plugin
             </Button>
@@ -287,6 +296,14 @@ export function PluginsPage() {
         <TabsContent value="browse" className="space-y-4">
           <RepositoryCatalog
             addedNames={plugins.map((plugin) => plugin.name)}
+            onAdd={
+              canManagePlugins
+                ? (choice) => {
+                    setOfferedImage(choice)
+                    setAddingService(true)
+                  }
+                : undefined
+            }
           />
         </TabsContent>
         <TabsContent value="running">

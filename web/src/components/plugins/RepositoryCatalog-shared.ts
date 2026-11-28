@@ -18,6 +18,7 @@ export function filterRepositoryCatalog(
         plugin.summary,
         plugin.author,
         plugin.repository,
+        plugin.image ?? '',
       ].some((value) => value.toLowerCase().includes(needle))
   )
 }

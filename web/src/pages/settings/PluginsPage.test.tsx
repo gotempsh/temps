@@ -74,6 +74,13 @@ mock.module('@/hooks/usePlugins', () => ({
     reset: () => undefined,
     mutateAsync: () => Promise.resolve(),
   }),
+  useAddPluginFromImage: () => ({
+    isPending: false,
+    isError: false,
+    at: null,
+    reset: () => undefined,
+    mutateAsync: () => Promise.resolve(),
+  }),
   useReloadPlugins: () => ({
     isPending: false,
     mutateAsync: () => Promise.resolve(),

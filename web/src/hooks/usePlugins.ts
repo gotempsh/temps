@@ -12,6 +12,13 @@ import {
   uninstallPlugin,
 } from '@/api/client/sdk.gen'
 import type { AddServicePlugin, ReloadResponse } from '@/api/client/types.gen'
+import { getProjectsQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import {
+  addPluginFromImage,
+  type PluginImageProgress,
+  type PluginImageStep,
+  type PluginImageValues,
+} from '@/lib/plugin-image'
 import type { PluginManifest } from '@/types/plugins'
 import {
   queryOptions,
@@ -19,6 +26,7 @@ import {
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query'
+import { useCallback, useRef, useState } from 'react'
 
 export const PLUGINS_QUERY_KEY = ['external-plugins']
 export const PLUGIN_SERVICES_QUERY_KEY = ['external-plugins', 'services']
@@ -50,6 +58,42 @@ export function useAddServicePlugin() {
       await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
     },
   })
+}
+
+/**
+ * Add a plugin from its image in one go: create the service, deploy the
+ * image, wait until it is live and add it. `at` says which step runs or
+ * failed and what exists so far. Running it again after a failure continues
+ * from there; `reset` forgets a run.
+ */
+export function useAddPluginFromImage() {
+  const queryClient = useQueryClient()
+  const progress = useRef<PluginImageProgress>({})
+  const [at, setAt] = useState<{
+    step: PluginImageStep
+    progress: PluginImageProgress
+  } | null>(null)
+  const mutation = useMutation({
+    mutationFn: (values: PluginImageValues) =>
+      addPluginFromImage(values, progress.current, (step, done) =>
+        setAt({ step, progress: done })
+      ),
+    retry: false,
+    // A service may have been created and deployed also when it failed.
+    onSettled: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY }),
+        queryClient.invalidateQueries({ queryKey: getProjectsQueryKey() }),
+      ])
+    },
+  })
+  const resetMutation = mutation.reset
+  const reset = useCallback(() => {
+    progress.current = {}
+    setAt(null)
+    resetMutation()
+  }, [resetMutation])
+  return { ...mutation, at, reset }
 }
 
 /**

@@ -31,8 +31,19 @@ import {
   ShieldAlert,
   ShieldCheck,
 } from 'lucide-react'
+import { imageWithContent } from '@/lib/plugin-image'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
+
+/** The image of a build after `lead`, or nothing for a build without one. */
+function buildImage(
+  image: string | null | undefined,
+  imageId: string | null | undefined,
+  lead: string
+): string {
+  const named = imageWithContent(image, imageId)
+  return named ? `${lead}${named}` : ''
+}
 
 /**
  * Which build of its service a plugin is pinned to: the one an administrator
@@ -47,7 +58,7 @@ export function PluginPinnedBuild({
   return (
     <p className="mt-1 text-xs text-muted-foreground [overflow-wrap:anywhere]">
       Pinned to deployment #{plugin.pinned_deployment_id}
-      {plugin.image ? ` of the image ${plugin.image}` : ''}
+      {buildImage(plugin.image, plugin.image_id, ' of ')}
       {plugin.pending_update
         ? ` · deployment #${plugin.pending_update.deployment_id} waits for approval`
         : ' · a new deployment will wait for approval'}
@@ -239,12 +250,12 @@ export function PluginUpdateDialog({
                 {plugin.pinned_deployment_id != null
                   ? `Deployment #${plugin.pinned_deployment_id}`
                   : 'Not recorded'}
-                {plugin.image ? ` · ${plugin.image}` : ''}
+                {buildImage(plugin.image, plugin.image_id, ' · ')}
               </dd>
               <dt className="text-muted-foreground">New build</dt>
               <dd className="[overflow-wrap:anywhere]">
                 Deployment #{update.deployment_id}
-                {update.image ? ` · ${update.image}` : ''}
+                {buildImage(update.image, update.image_id, ' · ')}
               </dd>
             </dl>
             <PluginUpdateDifference difference={update.difference} />

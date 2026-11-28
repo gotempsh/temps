@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { expect, test } from 'bun:test'
+import { cleanup, fireEvent, render } from '@testing-library/react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { installBrowserWindow } from '@/test/dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { RepositoryCatalogPlugin } from '@/api/client/types.gen'
 import { MemoryRouter } from 'react-router'
@@ -10,6 +12,9 @@ import {
   deployPluginPath,
   filterRepositoryCatalog,
 } from './RepositoryCatalog'
+import { CatalogImageActions } from './RepositoryCatalog-components'
+
+installBrowserWindow()
 
 const plugin: RepositoryCatalogPlugin = {
   name: 'example',
@@ -46,10 +51,13 @@ test('catalog searches names, summaries, authors and repositories and combines c
   expect(filterRepositoryCatalog([plugin], 'missing', '')).toEqual([])
 })
 
+const IMAGE = `registry.example.com/acme/example@sha256:${'a'.repeat(64)}`
+
 function renderCatalog({
   available = true,
   added = [] as string[],
   plugins = [plugin],
+  canAdd = true,
 } = {}) {
   const client = new QueryClient()
   client.setQueryData(['repository-plugin-catalog'], {
@@ -63,7 +71,10 @@ function renderCatalog({
     return renderToStaticMarkup(
       <QueryClientProvider client={client}>
         <MemoryRouter>
-          <RepositoryCatalog addedNames={added} />
+          <RepositoryCatalog
+            addedNames={added}
+            onAdd={canAdd ? () => {} : undefined}
+          />
         </MemoryRouter>
       </QueryClientProvider>
     )
@@ -84,10 +95,64 @@ test('a listing links to its exact source and to deploying its repository as a s
   // A plugin kept in a subdirectory says which one to deploy.
   expect(html).toContain('<code>plugins/demo</code>')
   expect(html).toContain('not a security audit')
-  // Adding from the image is named first; the repository is the other way.
-  expect(html).toContain('temps plugin add --image &lt;image&gt;')
-  expect(html).toContain('Add plugin')
+  // A listing published as source only has no image to add from.
+  expect(html).not.toContain('Copy command')
+  expect(html).not.toContain('>Add plugin</button>')
   expect(html).not.toContain('Added</')
+})
+
+test('a listing that offers an image is added from it, not deployed from its repository', () => {
+  const html = renderCatalog({ plugins: [{ ...plugin, image: IMAGE }] })
+  expect(html).toContain('>Add plugin</button>')
+  expect(html).toContain(`title="Add Example plugin from the image ${IMAGE}"`)
+  expect(html).toContain('Copy command')
+  // The source stays one click away, to review what the image was built from.
+  expect(html).toContain('Review source')
+  expect(html).not.toContain('Copy Git link')
+  expect(html).not.toContain('/projects/new?source=git-url')
+})
+
+test('an image listing gives the command to someone who cannot add plugins, and no button', () => {
+  const html = renderCatalog({
+    plugins: [{ ...plugin, image: IMAGE }],
+    canAdd: false,
+  })
+  expect(html).toContain('Copy command')
+  expect(html).not.toContain('>Add plugin</button>')
+})
+
+test('adding from a listing hands over its image and the plugin name', () => {
+  const chosen: unknown[] = []
+  const view = render(
+    <CatalogImageActions
+      title="Example plugin"
+      choice={{ image: IMAGE, name: 'example' }}
+      added={false}
+      onAdd={(choice) => chosen.push(choice)}
+    />
+  )
+  fireEvent.click(view.getByRole('button', { name: 'Add plugin' }))
+  expect(chosen).toEqual([{ image: IMAGE, name: 'example' }])
+  cleanup()
+
+  // A plugin that is already added is not offered again.
+  const added = render(
+    <CatalogImageActions
+      title="Example plugin"
+      choice={{ image: IMAGE, name: 'example' }}
+      added
+      onAdd={() => {}}
+    />
+  )
+  expect(added.queryByRole('button', { name: 'Add plugin' })).toBeNull()
+  cleanup()
+})
+
+test('a listing is found by the image it offers', () => {
+  const listed = { ...plugin, image: IMAGE }
+  expect(filterRepositoryCatalog([listed], 'acme/example', '')).toEqual([
+    listed,
+  ])
 })
 
 test('nothing in the catalogue installs a plugin', () => {

@@ -16,7 +16,6 @@ import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { CopyButton } from '@/components/ui/copy-button'
 import {
   Dialog,
   DialogContent,
@@ -29,9 +28,9 @@ import { Input } from '@/components/ui/input'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useDebounce } from '@/hooks/useDebounce'
-import { useAddServicePlugin } from '@/hooks/usePlugins'
+import { SegmentedControl } from '@/components/ui/segmented-control'
+import { useAddPluginFromImage, useAddServicePlugin } from '@/hooks/usePlugins'
 import {
-  PLUGIN_IMAGE_COMMAND,
   addServiceFailure,
   pluginTierSummary,
   servicePluginPath,
@@ -43,11 +42,12 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { Status } from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
 import { AlertCircle, Info, Loader2 } from 'lucide-react'
-import { useEffect, useId } from 'react'
+import { useEffect, useId, useState } from 'react'
 import { Controller, useForm, useWatch } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { PluginImageForm, type PluginImageChoice } from './PluginImageForm'
 
 /** How many services the picker lists at once; search narrows the rest. */
 const SERVICE_CHOICES = 8
@@ -73,36 +73,6 @@ export function PluginTierBadge({ plugin }: { plugin: ServicePluginResponse }) {
     <Badge variant="outline" title={summary.detail}>
       {summary.label}
     </Badge>
-  )
-}
-
-/**
- * The preferred way to add a plugin: one command that deploys its image as a
- * service and adds it. Shown wherever a plugin is added, so it is found
- * without the documentation.
- */
-export function PluginFromImage() {
-  return (
-    <div className="space-y-2 rounded-lg border p-3 text-left text-sm">
-      <p className="font-medium">From an image</p>
-      <p className="text-muted-foreground">
-        One command creates the service, deploys the plugin&apos;s image and
-        adds it. Run it again with a new image to deploy an update, which waits
-        for your approval.
-      </p>
-      <div className="flex min-w-0 items-center gap-2">
-        <code className="min-w-0 flex-1 rounded bg-muted px-2 py-1 text-xs [overflow-wrap:anywhere]">
-          {PLUGIN_IMAGE_COMMAND}
-        </code>
-        <CopyButton
-          value={PLUGIN_IMAGE_COMMAND}
-          label="Copy the command that adds a plugin from an image"
-          className="h-8 shrink-0 rounded-md border bg-background px-3"
-        >
-          Copy command
-        </CopyButton>
-      </div>
-    </div>
   )
 }
 
@@ -317,27 +287,121 @@ const schema = z.object({
 
 type Values = z.infer<typeof schema>
 
+/** Where the plugin that is added comes from. */
+type PluginSource = 'image' | 'service'
+
+const PLUGIN_SOURCES = [
+  { value: 'image', label: 'From an image' },
+  { value: 'service', label: 'From a service' },
+] as const
+
 /**
- * Make a deployed service a plugin. Always reachable: on a server that cannot
- * run plugins as services it says what a plugin service is and what is
- * missing instead of hiding the action.
+ * Add a plugin: from its image, which creates the service, deploys the image
+ * and adds it in one go, or from a service that is already deployed. Always
+ * reachable: on a server that cannot run plugins as services it says what a
+ * plugin service is and what is missing instead of hiding the action.
  */
 export function AddServicePluginDialog({
   open,
   onOpenChange,
   services,
+  image,
   onSensitiveError,
   onAdded,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   services: PluginServicesResponse | undefined
+  /** An image to start with, for example the one a catalogue listing offers. */
+  image?: PluginImageChoice
   onSensitiveError: (error: unknown, retry: () => void) => boolean
   /** The plugin that was just added, so what it asks for can be shown. */
   onAdded?: (name: string) => void
 }) {
   const configured = services?.configured !== false
   const add = useAddServicePlugin()
+  const fromImage = useAddPluginFromImage()
+  const [source, setSource] = useState<PluginSource>('image')
+  const busy = add.isPending || fromImage.isPending
+  // Closing goes back to the image, so the dialog always opens on it.
+  const change = (next: boolean) => {
+    if (busy) return
+    if (!next) setSource('image')
+    onOpenChange(next)
+  }
+  const close = () => change(false)
+  const added = (name: string) => onAdded?.(name)
+  return (
+    <Dialog open={open} onOpenChange={change}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Add a plugin</DialogTitle>
+          <DialogDescription>
+            A plugin is an ordinary service built with the Temps plugin SDK. It
+            starts with no permissions.
+          </DialogDescription>
+        </DialogHeader>
+        <fieldset disabled={busy} className="min-w-0">
+          <SegmentedControl
+            label="Where the plugin comes from"
+            value={source}
+            onValueChange={setSource}
+            options={PLUGIN_SOURCES}
+          />
+        </fieldset>
+        {!configured && (
+          <Alert>
+            <Info className="size-4" />
+            <AlertTitle>This server cannot run plugins as services</AlertTitle>
+            <AlertDescription className="break-words">
+              {services?.reason ??
+                'This Temps process deploys no services, so it has none to run a plugin as.'}
+            </AlertDescription>
+          </Alert>
+        )}
+        {/* Both stay mounted, so switching keeps what was entered. */}
+        <div hidden={source !== 'image'}>
+          <PluginImageForm
+            open={open}
+            configured={configured}
+            initial={image}
+            flow={fromImage}
+            onSensitiveError={onSensitiveError}
+            onAdded={added}
+            onCancel={close}
+          />
+        </div>
+        <div hidden={source !== 'service'}>
+          <DeployedServiceForm
+            open={open}
+            configured={configured}
+            add={add}
+            onSensitiveError={onSensitiveError}
+            onAdded={added}
+            onCancel={close}
+          />
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/** Make a service that is already deployed a plugin. */
+function DeployedServiceForm({
+  open,
+  configured,
+  add,
+  onSensitiveError,
+  onAdded,
+  onCancel,
+}: {
+  open: boolean
+  configured: boolean
+  add: ReturnType<typeof useAddServicePlugin>
+  onSensitiveError: (error: unknown, retry: () => void) => boolean
+  onAdded: (name: string) => void
+  onCancel: () => void
+}) {
   const form = useForm<Values>({
     resolver: zodResolver(schema),
     defaultValues: { search: '', projectId: 0, environmentId: 0 },
@@ -383,8 +447,8 @@ export function AddServicePluginDialog({
       toast.success(
         `${added.display_name ?? added.name} is now a plugin. It can use Temps only as far as you allow.`
       )
-      onOpenChange(false)
-      onAdded?.(added.name)
+      onCancel()
+      onAdded(added.name)
     } catch (error) {
       // Any other failure is shown by the app-wide mutation error handler
       // with the server's reason, and repeated below the form.
@@ -393,97 +457,64 @@ export function AddServicePluginDialog({
   }
   const errors = form.formState.errors
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        if (!add.isPending) onOpenChange(next)
-      }}
-    >
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Add a plugin</DialogTitle>
-          <DialogDescription>
-            A plugin is an ordinary service built with the Temps plugin SDK. It
-            starts with no permissions.
-          </DialogDescription>
-        </DialogHeader>
-        <PluginFromImage />
-        <p className="text-sm font-medium">From a service that is deployed</p>
-        {!configured && (
-          <Alert>
-            <Info className="size-4" />
-            <AlertTitle>This server cannot run plugins as services</AlertTitle>
-            <AlertDescription className="break-words">
-              {services?.reason ??
-                'This Temps process deploys no services, so it has none to run a plugin as.'}
-            </AlertDescription>
-          </Alert>
-        )}
-        <form className="space-y-4" onSubmit={form.handleSubmit(submit)}>
-          <fieldset
-            disabled={!configured || add.isPending}
-            className="space-y-4"
-          >
-            <Controller
-              control={form.control}
-              name="projectId"
-              render={({ field }) => (
-                <ServiceChoice
-                  search={search}
-                  onSearch={(value) => setValue('search', value)}
-                  loading={projects.isPending && configured}
-                  failed={projects.isError}
-                  services={projects.data?.projects ?? []}
-                  total={projects.data?.total ?? 0}
-                  value={field.value}
-                  onChange={(id) => {
-                    field.onChange(id)
-                    setValue('environmentId', 0)
-                  }}
-                  error={errors.projectId?.message}
-                />
-              )}
+    <form className="space-y-4" onSubmit={form.handleSubmit(submit)}>
+      <fieldset disabled={!configured || add.isPending} className="space-y-4">
+        <Controller
+          control={form.control}
+          name="projectId"
+          render={({ field }) => (
+            <ServiceChoice
+              search={search}
+              onSearch={(value) => setValue('search', value)}
+              loading={projects.isPending && configured}
+              failed={projects.isError}
+              services={projects.data?.projects ?? []}
+              total={projects.data?.total ?? 0}
+              value={field.value}
+              onChange={(id) => {
+                field.onChange(id)
+                setValue('environmentId', 0)
+              }}
+              error={errors.projectId?.message}
             />
-            <Controller
-              control={form.control}
-              name="environmentId"
-              render={({ field }) => (
-                <EnvironmentChoice
-                  chosen={projectId > 0}
-                  loading={environments.isPending}
-                  failed={environments.isError}
-                  environments={environments.data ?? []}
-                  value={field.value}
-                  onChange={field.onChange}
-                  error={errors.environmentId?.message}
-                />
-              )}
-            />
-          </fieldset>
-          {add.isError && (
-            <p role="alert" className="text-sm text-destructive break-words">
-              {addServiceFailure(add.error)}
-            </p>
           )}
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              disabled={add.isPending}
-              onClick={() => onOpenChange(false)}
-            >
-              Cancel
-            </Button>
-            <Button type="submit" disabled={!configured || add.isPending}>
-              {add.isPending && (
-                <Loader2 className="mr-2 size-4 animate-spin" />
-              )}
-              {add.isPending ? 'Connecting…' : 'Add plugin'}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+        />
+        <Controller
+          control={form.control}
+          name="environmentId"
+          render={({ field }) => (
+            <EnvironmentChoice
+              chosen={projectId > 0}
+              loading={environments.isPending}
+              failed={environments.isError}
+              environments={environments.data ?? []}
+              value={field.value}
+              onChange={field.onChange}
+              error={errors.environmentId?.message}
+            />
+          )}
+        />
+      </fieldset>
+      {add.isError && (
+        <p role="alert" className="text-sm text-destructive break-words">
+          {addServiceFailure(add.error)}
+        </p>
+      )}
+      <DialogFooter>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={add.isPending}
+          onClick={onCancel}
+        >
+          Cancel
+        </Button>
+        <Button type="submit" disabled={!configured || add.isPending}>
+          {add.isPending && <Loader2 className="mr-2 size-4 animate-spin" />}
+          {add.isPending ? 'Connecting…' : 'Add plugin'}
+        </Button>
+      </DialogFooter>
+    </form>
   )
 }
 
