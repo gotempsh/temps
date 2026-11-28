@@ -74,6 +74,11 @@ impl From<ProjectIpAccessError> for Problem {
                     .with_title("IP Access Policy Changed")
                     .with_detail(error.to_string())
             }
+            ProjectIpAccessError::RevisionMismatch { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Policy Changed Since Read")
+                    .with_detail(error.to_string())
+            }
             ProjectIpAccessError::WouldLockOutCaller { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Policy Would Lock You Out")
@@ -344,7 +349,7 @@ pub async fn get_project_ip_access(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Project not found", body = ProblemDetails),
-        (status = 409, description = "Policy would lock out the caller", body = ProblemDetails),
+        (status = 409, description = "Policy would lock out the caller, or the stored policy is no longer at `expected_revision`", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -472,7 +477,7 @@ pub async fn get_environment_ip_access(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Project or environment not found", body = ProblemDetails),
-        (status = 409, description = "Policy would lock out the caller", body = ProblemDetails),
+        (status = 409, description = "Policy would lock out the caller, or the stored policy is no longer at `expected_revision`", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -678,6 +683,24 @@ mod tests {
         });
         let body = serde_json::to_string(&problem.body).unwrap_or_default();
         assert!(body.contains('3') && body.contains('4'), "body: {body}");
+    }
+
+    #[test]
+    fn a_stale_save_is_a_conflict_the_console_can_tell_from_a_lockout() {
+        let problem = Problem::from(ProjectIpAccessError::RevisionMismatch {
+            scope: "project 3".into(),
+            expected: 41,
+            stored: 42,
+        });
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_string(&problem.body).unwrap_or_default();
+        // The console offers "Save anyway" for the lockout title only.
+        assert!(body.contains("Policy Changed Since Read"), "body: {body}");
+        assert!(!body.contains("Lock You Out"), "body: {body}");
+        assert!(
+            body.contains("project 3") && body.contains("41") && body.contains("42"),
+            "body: {body}"
+        );
     }
 
     // ---- routes -------------------------------------------------------

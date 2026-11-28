@@ -62595,6 +62595,11 @@
             "format": "int32",
             "type": "integer"
           },
+          "revision": {
+            "description": "Changes on every save of this scope's policy; `0` when nothing is\nstored. Send it back as `expected_revision` to save only if nobody\nsaved in between.",
+            "format": "int64",
+            "type": "integer"
+          },
           "updated_at": {
             "example": "2026-10-13T09:30:00Z",
             "format": "date-time",
@@ -78440,6 +78445,14 @@
               "$ref": "#/components/schemas/IpAccessCidrEntry"
             },
             "type": "array"
+          },
+          "expected_revision": {
+            "description": "The `revision` of the policy this list was built from (`0` when\nnothing was stored). When set, the save is refused with 409 if the\nstored policy changed since, so a read-modify-write never overwrites\na save made in between. Omit it to replace the list unconditionally.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "mode": {
             "$ref": "#/components/schemas/IpAccessMode",
@@ -170605,7 +170618,7 @@
                 }
               }
             },
-            "description": "Policy would lock out the caller"
+            "description": "Policy would lock out the caller, or the stored policy is no longer at `expected_revision`"
           },
           "500": {
             "content": {
@@ -181879,7 +181892,7 @@
                 }
               }
             },
-            "description": "Policy would lock out the caller"
+            "description": "Policy would lock out the caller, or the stored policy is no longer at `expected_revision`"
           },
           "500": {
             "content": {

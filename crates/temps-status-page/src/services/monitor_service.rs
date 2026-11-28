@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use temps_config::ConfigService;
 use temps_core::uptime_monitor_ip_access::{
-    monitor_source_addresses, UptimeMonitorIpAccessSlot, UptimeMonitorIpBlock,
+    monitor_source_addresses, UptimeMonitorIpAccess, UptimeMonitorIpAccessError,
+    UptimeMonitorIpAccessSlot, UptimeMonitorIpBlock,
 };
 use temps_core::{Job, JobQueue, MonitorCreatedJob, UtcDateTime};
 use temps_entities::{environments, status_checks, status_monitors};
@@ -288,6 +289,31 @@ fn keep_newest_points<T>(rows: &mut Vec<T>, limit: u64) -> bool {
     truncated
 }
 
+/// The block that explains a check which recorded `last_check_error`.
+///
+/// A refused check records the block's message for the one address it
+/// connected from, so each address is evaluated on its own and the block
+/// whose message is the recorded one is it. Any other failure (the app's own
+/// 404 or 500, a probe that went straight to the public address, a policy
+/// that has changed since) matches none and is left unexplained.
+async fn block_behind_check(
+    access: &dyn UptimeMonitorIpAccess,
+    project_id: i32,
+    environment_id: i32,
+    addresses: &[std::net::IpAddr],
+    last_check_error: &str,
+) -> Result<Option<UptimeMonitorIpBlock>, UptimeMonitorIpAccessError> {
+    for address in addresses {
+        let block = access
+            .monitor_block(project_id, environment_id, std::slice::from_ref(address))
+            .await?;
+        if let Some(block) = block.filter(|block| block.message == last_check_error) {
+            return Ok(Some(block));
+        }
+    }
+    Ok(None)
+}
+
 impl MonitorService {
     pub fn new(db: Arc<DatabaseConnection>, config_service: Arc<ConfigService>) -> Self {
         Self {
@@ -318,15 +344,17 @@ impl MonitorService {
         let _ = self.monitor_ip_access.set(slot);
     }
 
-    /// Whether the policy governing `monitor`'s environment refuses any
-    /// address Temps' monitor connects from on this server. Only a managed
+    /// The IP access block behind `monitor`'s latest check, when that check
+    /// was refused by the policy governing its environment. Only a managed
     /// environment monitor goes through the local proxy, so only it can be
     /// refused this way. A policy that cannot be read is logged and reported
     /// as no block: the status itself still loads.
     async fn ip_access_block(
         &self,
         monitor: &status_monitors::Model,
+        last_check_error: Option<&str>,
     ) -> Option<UptimeMonitorIpBlock> {
+        let last_check_error = last_check_error?;
         if !monitor.is_managed
             || super::checks::MonitorCheckKind::from_stored(&monitor.check_kind)
                 != super::checks::MonitorCheckKind::Environment
@@ -337,9 +365,14 @@ impl MonitorService {
         let access = self.monitor_ip_access.get()?.get()?;
         let server = self.config_service.get_server_config();
         let addresses = monitor_source_addresses(&server.address, server.tls_address.as_deref());
-        match access
-            .monitor_block(monitor.project_id, environment_id, &addresses)
-            .await
+        match block_behind_check(
+            access.as_ref(),
+            monitor.project_id,
+            environment_id,
+            &addresses,
+            last_check_error,
+        )
+        .await
         {
             Ok(block) => block,
             Err(error) => {
@@ -1572,6 +1605,7 @@ impl MonitorService {
             avg_response_time: Option<Decimal>,
             last_check_status: Option<String>,
             last_check_at: Option<UtcDateTime>,
+            last_check_error: Option<String>,
         }
 
         let monitor = self.find_monitor_model(monitor_id).await?;
@@ -1584,6 +1618,7 @@ impl MonitorService {
                     status,
                     response_time_ms,
                     checked_at,
+                    error_message,
                     ROW_NUMBER() OVER (ORDER BY checked_at DESC) as rn
                 FROM status_checks
                 WHERE monitor_id = $1
@@ -1596,14 +1631,15 @@ impl MonitorService {
                 FROM recent_checks
             ),
             latest AS (
-                SELECT status, checked_at
+                SELECT status, checked_at, error_message
                 FROM recent_checks
                 WHERE rn = 1
             )
             SELECT
                 s.avg_response_time,
                 l.status as last_check_status,
-                l.checked_at as last_check_at
+                l.checked_at as last_check_at,
+                l.error_message as last_check_error
             FROM stats s
             CROSS JOIN latest l
         "#;
@@ -1619,6 +1655,7 @@ impl MonitorService {
             avg_response_time: None,
             last_check_status: None,
             last_check_at: None,
+            last_check_error: None,
         });
 
         let coverage = self.uptime_coverage(&monitor, start_time, end_time).await?;
@@ -1631,7 +1668,8 @@ impl MonitorService {
         let ip_access_block = if current_status == "operational" {
             None
         } else {
-            self.ip_access_block(&monitor).await
+            self.ip_access_block(&monitor, stats.last_check_error.as_deref())
+                .await
         };
 
         let decimal_to_f64 = |d: Decimal| -> Option<f64> { d.to_string().parse::<f64>().ok() };
@@ -1677,6 +1715,108 @@ mod tests {
         );
         let too_wide = validate_uptime_range(7, end - widest - chrono::Duration::days(1), end);
         assert!(matches!(too_wide, Err(StatusPageError::Validation(m)) if m.contains("monitor 7")));
+    }
+
+    /// A policy that refuses exactly `blocked` and admits every other
+    /// address.
+    struct Refuses {
+        blocked: Vec<std::net::IpAddr>,
+    }
+
+    #[async_trait::async_trait]
+    impl UptimeMonitorIpAccess for Refuses {
+        async fn monitor_block(
+            &self,
+            project_id: i32,
+            environment_id: i32,
+            monitor_addresses: &[std::net::IpAddr],
+        ) -> Result<Option<UptimeMonitorIpBlock>, UptimeMonitorIpAccessError> {
+            use temps_core::uptime_monitor_ip_access::*;
+            let blocked: Vec<std::net::IpAddr> = monitor_addresses
+                .iter()
+                .copied()
+                .filter(|address| self.blocked.contains(address))
+                .collect();
+            Ok((!blocked.is_empty()).then(|| {
+                UptimeMonitorIpBlock::new(
+                    project_id,
+                    Some(environment_id),
+                    IpAccessPolicyScope::Project,
+                    IpAccessMode::Allow,
+                    UptimeMonitorBlockReason::NotAllowListed,
+                    monitor_addresses,
+                    &blocked,
+                    Vec::new(),
+                )
+            }))
+        }
+    }
+
+    fn ip(value: &str) -> std::net::IpAddr {
+        value.parse().expect("test IP is valid")
+    }
+
+    /// HTTP on IPv4 loopback, HTTPS on IPv6 loopback.
+    fn listeners() -> Vec<std::net::IpAddr> {
+        vec![ip("127.0.0.1"), ip("::1")]
+    }
+
+    /// The message a check refused while connecting from `address` records.
+    async fn refused_from(access: &Refuses, address: &str) -> String {
+        access
+            .monitor_block(5, 9, &[ip(address)])
+            .await
+            .expect("readable")
+            .expect("refused")
+            .message
+    }
+
+    #[tokio::test]
+    async fn the_block_shown_is_the_one_for_the_address_the_check_came_from() {
+        let access = Refuses {
+            blocked: vec![ip("::1")],
+        };
+        let recorded = refused_from(&access, "::1").await;
+        let block = block_behind_check(&access, 5, 9, &listeners(), &recorded)
+            .await
+            .expect("readable")
+            .expect("the latest check was refused");
+        assert_eq!(block.blocked_addresses, vec!["::1"]);
+        assert_eq!(block.suggested_cidrs, vec!["::1/128"]);
+    }
+
+    #[tokio::test]
+    async fn an_app_failure_is_not_blamed_on_a_listener_the_check_did_not_use() {
+        // The policy refuses the HTTPS listener's address, but the latest
+        // check went over HTTP and the app answered 404.
+        let access = Refuses {
+            blocked: vec![ip("::1")],
+        };
+        let block = block_behind_check(
+            &access,
+            5,
+            9,
+            &listeners(),
+            "HTTP 404 Not Found (after 1 attempts)",
+        )
+        .await
+        .expect("readable");
+        assert!(block.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_list_fixed_since_the_check_shows_no_block() {
+        let before = Refuses {
+            blocked: vec![ip("127.0.0.1")],
+        };
+        let recorded = refused_from(&before, "127.0.0.1").await;
+        let after = Refuses {
+            blocked: Vec::new(),
+        };
+        let block = block_behind_check(&after, 5, 9, &listeners(), &recorded)
+            .await
+            .expect("readable");
+        assert!(block.is_none());
     }
 
     #[tokio::test]

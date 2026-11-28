@@ -176,6 +176,9 @@ pub(crate) struct ProbeLookups {
     addresses: Option<Arc<dyn EnvironmentAddresses>>,
     /// Whether the project's own IP access policy refuses the monitor.
     ip_access: Option<Arc<dyn UptimeMonitorIpAccess>>,
+    /// Roots the local HTTPS follow-up trusts besides the system's. Always
+    /// empty outside tests, which serve it with a self-signed certificate.
+    tls_roots: Vec<reqwest::Certificate>,
 }
 
 impl ProbeLookups {
@@ -183,7 +186,7 @@ impl ProbeLookups {
     fn with_addresses(addresses: Arc<dyn EnvironmentAddresses>) -> Self {
         Self {
             addresses: Some(addresses),
-            ip_access: None,
+            ..Self::default()
         }
     }
 }
@@ -706,6 +709,7 @@ impl HealthCheckService {
         ProbeLookups {
             addresses: self.environment_addresses.as_ref().and_then(|s| s.get()),
             ip_access: self.monitor_ip_access.as_ref().and_then(|s| s.get()),
+            tls_roots: Vec::new(),
         }
     }
 
@@ -1104,6 +1108,7 @@ impl HealthCheckService {
         let ProbeLookups {
             addresses,
             ip_access,
+            tls_roots,
         } = lookups;
         // NOTE: the monitor's slot is claimed by the *caller*, before this is
         // dispatched — `run_all_checks` via `claim_due_monitor` (a CAS that
@@ -1374,7 +1379,7 @@ impl HealthCheckService {
             }
         }
 
-        let (probe_client, is_local_probe, local_tls_listener, mut local_listener) = if let Some(
+        let (probe_client, is_local_probe, local_tls_listener, probe_listener) = if let Some(
             client,
         ) =
             pinned_public_client
@@ -1446,6 +1451,11 @@ impl HealthCheckService {
         let mut total_response_time_ms = 0i32;
 
         for attempt in 0..=MAX_RETRIES {
+            // The listener this attempt's answer comes through: the probe's
+            // own, until an HTTPS follow-up below answers through the TLS
+            // listener. Reset every attempt, since each one starts again
+            // through `probe_client`.
+            let mut local_listener = probe_listener.clone();
             if attempt > 0 {
                 // Exponential backoff: 100ms, 200ms, 400ms, 800ms (capped at 2000ms)
                 let delay =
@@ -1537,7 +1547,11 @@ impl HealthCheckService {
                             )
                             .await;
                         };
-                        let tls_client = match local_proxy_client(&https_url, tls_listener) {
+                        let tls_client = match local_proxy_client_with_roots(
+                            &https_url,
+                            tls_listener,
+                            &tls_roots,
+                        ) {
                             Ok(client) => client,
                             Err(error) => {
                                 return Self::record_check(
@@ -2387,23 +2401,7 @@ mod tests {
         hostname: &str,
         response: &'static [u8],
     ) -> (SocketAddr, reqwest::Certificate) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let rcgen::CertifiedKey { cert, signing_key } =
-            rcgen::generate_simple_self_signed(vec![hostname.to_string()])
-                .expect("generate test TLS certificate");
-        let cert_pem = cert.pem();
-        let key_pem = signing_key.serialize_pem();
-        let cert_chain = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-            .expect("parse test certificate");
-        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
-            .expect("parse test private key")
-            .expect("test private key is present");
-        let server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
-            .expect("build test TLS server config");
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let (acceptor, root) = test_tls_acceptor(hostname);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test TLS listener");
@@ -2426,8 +2424,30 @@ mod tests {
                 .await
                 .expect("write HTTPS response");
         });
+        (address, root)
+    }
+
+    /// A TLS acceptor with a self-signed certificate for `hostname`, and the
+    /// root a client needs to trust it.
+    fn test_tls_acceptor(hostname: &str) -> (tokio_rustls::TlsAcceptor, reqwest::Certificate) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec![hostname.to_string()])
+                .expect("generate test TLS certificate");
+        let cert_pem = cert.pem();
+        let key_pem = signing_key.serialize_pem();
+        let cert_chain = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse test certificate");
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
+            .expect("parse test private key")
+            .expect("test private key is present");
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .expect("build test TLS server config");
         (
-            address,
+            tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
             reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("parse reqwest test root"),
         )
     }
@@ -3512,7 +3532,6 @@ mod tests {
     /// project's IP access policy answering `blocks`. Returns the recorded
     /// check and the addresses the policy was asked about.
     async fn refused_local_probe(blocks: bool) -> (StatusCheckCompletedJob, Vec<std::net::IpAddr>) {
-        use sea_orm::{DatabaseBackend, MockDatabase};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local proxy listener");
@@ -3526,6 +3545,21 @@ mod tests {
                 .await
                 .expect("answer the probe");
         });
+        let outcome = run_local_probe(proxy_address, None, Vec::new(), blocks).await;
+        proxy.await.expect("the local proxy was probed");
+        outcome
+    }
+
+    /// Run one managed check of `proj-env-1.localho.st` through local proxy
+    /// listeners at `http_address` (and `tls_address`, trusted through
+    /// `tls_roots`), with the project's IP access policy answering `blocks`.
+    async fn run_local_probe(
+        http_address: SocketAddr,
+        tls_address: Option<SocketAddr>,
+        tls_roots: Vec<reqwest::Certificate>,
+        blocks: bool,
+    ) -> (StatusCheckCompletedJob, Vec<std::net::IpAddr>) {
+        use sea_orm::{DatabaseBackend, MockDatabase};
         let mut monitor = make_monitor(1, Some(1));
         monitor.is_managed = true;
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -3540,9 +3574,9 @@ mod tests {
             })]]);
         let db = Arc::new(persisted_check(db, &monitor, "degraded").into_connection());
         let config = temps_config::ServerConfig::new(
-            proxy_address.to_string(),
+            http_address.to_string(),
             "postgres://localhost/test".to_string(),
-            None,
+            tls_address.map(|address| address.to_string()),
             None,
         )
         .expect("build test ServerConfig");
@@ -3567,11 +3601,11 @@ mod tests {
             ProbeLookups {
                 addresses: Some(addresses),
                 ip_access: Some(ip_access.clone()),
+                tls_roots,
             },
         )
         .await
         .expect("the check is recorded");
-        proxy.await.expect("the local proxy was probed");
         let check = queue
             .0
             .lock()
@@ -3584,6 +3618,86 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         (check, asked)
+    }
+
+    /// The first attempt is upgraded to HTTPS and answered with 503 through
+    /// the TLS listener; the retry goes out over HTTP again and gets 403.
+    /// That 403 came through the HTTP listener, so the policy is asked about
+    /// its address (IPv4 loopback), not the TLS listener's (IPv6 loopback).
+    #[tokio::test]
+    async fn a_retry_is_explained_by_the_listener_it_went_through() {
+        let hostname = "proj-env-1.localho.st";
+        let Ok(tls_listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            println!("IPv6 loopback is not available here, skipping");
+            return;
+        };
+        let tls_address = tls_listener
+            .local_addr()
+            .expect("read TLS listener address");
+        let (acceptor, root) = test_tls_acceptor(hostname);
+        let tls = tokio::spawn(async move {
+            let (stream, _) = tls_listener
+                .accept()
+                .await
+                .expect("accept the HTTPS follow-up");
+            let mut stream = acceptor.accept(stream).await.expect("TLS handshake");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read the follow-up");
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("answer the follow-up");
+        });
+
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP listener");
+        let http_address = http_listener
+            .local_addr()
+            .expect("read HTTP listener address");
+        let http = tokio::spawn(async move {
+            // First the proxy's own force-HTTPS redirect, then a refusal.
+            for answer in ["redirect", "refuse"] {
+                let (mut stream, _) = http_listener.accept().await.expect("accept the probe");
+                let mut request = [0_u8; 2048];
+                let size = stream.read(&mut request).await.expect("read the probe");
+                let request = String::from_utf8_lossy(&request[..size]).to_string();
+                let response = if answer == "redirect" {
+                    let path = request
+                        .split_whitespace()
+                        .nth(1)
+                        .expect("request line has a path");
+                    format!(
+                        "HTTP/1.1 301 Moved Permanently\r\nLocation: https://{hostname}{path}\r\n\
+                         X-Temps-Proxy-Https-Redirect: 1\r\nX-Temps-Proxy-Probe-Capable: 1\r\n\
+                         Connection: close\r\nContent-Length: 0\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                        .to_string()
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("answer the probe");
+            }
+        });
+
+        let (check, asked) =
+            run_local_probe(http_address, Some(tls_address), vec![root], true).await;
+        http.await.expect("both HTTP attempts were answered");
+        tls.await.expect("the HTTPS follow-up was answered");
+
+        assert_eq!(check.status, "degraded");
+        assert_eq!(
+            asked,
+            vec!["127.0.0.1".parse::<std::net::IpAddr>().expect("ip")],
+            "asked about the TLS listener's address instead of the HTTP one"
+        );
+        let message = check.error_message.expect("a reason is recorded");
+        assert!(message.contains("connects from 127.0.0.1"), "{message}");
     }
 
     #[tokio::test]

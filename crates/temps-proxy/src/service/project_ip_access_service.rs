@@ -26,6 +26,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 use temps_core::uptime_monitor_ip_access::{IpAccessPolicyScope, UptimeMonitorIpBlock};
 use temps_core::ways_in::{private_allow_list_message, AddressWayIn, EnvironmentWaysIn};
+use temps_core::ProjectIpGate;
 use temps_entities::project_ip_access_rules::{self, IpAccessCidrEntry, IpAccessCidrs};
 use temps_entities::{environments, projects};
 use thiserror::Error;
@@ -107,6 +108,19 @@ pub enum ProjectIpAccessError {
     )]
     ConcurrentUpdate { scope: String },
 
+    /// The save named the revision it was built from, and the stored policy
+    /// has been saved again since. Not retried: the caller re-reads it.
+    #[error(
+        "The IP access policy for {scope} was saved again since it was read (expected revision \
+         {expected}, stored revision {stored}); reload it and apply the change to what is \
+         stored now"
+    )]
+    RevisionMismatch {
+        scope: String,
+        expected: i64,
+        stored: i64,
+    },
+
     /// ADR 064 D9: an allow list of only private ranges on an environment
     /// with an address visitors reach through a tunnel or a `behind_proxy`
     /// ingress. Those hand the proxy the visitor's internet address, so such
@@ -172,6 +186,12 @@ pub struct SetProjectIpAccessRequest {
     /// with 409 so an operator cannot lock themselves out by accident.
     #[serde(default)]
     pub acknowledge_lockout: bool,
+    /// The `revision` of the policy this list was built from (`0` when
+    /// nothing was stored). When set, the save is refused with 409 if the
+    /// stored policy changed since, so a read-modify-write never overwrites
+    /// a save made in between. Omit it to replace the list unconditionally.
+    #[serde(default)]
+    pub expected_revision: Option<i64>,
 }
 
 /// One scope's stored policy.
@@ -189,6 +209,11 @@ pub struct ProjectIpAccessResponse {
     pub max_cidrs: usize,
     #[schema(value_type = Option<String>, format = "date-time", example = "2026-10-13T09:30:00Z")]
     pub updated_at: Option<DateTime<Utc>>,
+    /// Changes on every save of this scope's policy; `0` when nothing is
+    /// stored. Send it back as `expected_revision` to save only if nobody
+    /// saved in between.
+    #[serde(default)]
+    pub revision: i64,
     /// Things the operator should know about the saved policy, such as Temps
     /// not being able to tell how visitors arrive (ADR 064 D9), or the policy
     /// refusing Temps' own uptime monitor.
@@ -211,6 +236,7 @@ impl ProjectIpAccessResponse {
             cidrs: Vec::new(),
             max_cidrs: MAX_CIDRS_PER_POLICY,
             updated_at: None,
+            revision: 0,
             warnings: Vec::new(),
             uptime_monitor_block: None,
         }
@@ -229,6 +255,7 @@ impl From<project_ip_access_rules::Model> for ProjectIpAccessResponse {
             cidrs: model.cidrs.0,
             max_cidrs: MAX_CIDRS_PER_POLICY,
             updated_at: Some(model.updated_at),
+            revision: model.revision,
             warnings: Vec::new(),
             uptime_monitor_block: None,
         }
@@ -435,10 +462,20 @@ pub struct ProjectIpAccessService {
     /// How visitors reach each address, for the D9 check. Attached once the
     /// ingress plugin has registered it; without it the check is skipped.
     ways_in: OnceLock<Arc<dyn EnvironmentWaysIn>>,
-    /// The addresses Temps' managed uptime monitor connects from on this
-    /// server, from the configured proxy listeners. Empty when they are not
-    /// known, which skips the monitor check.
-    monitor_addresses: Vec<IpAddr>,
+    /// Temps' managed uptime monitor, checked against every policy so a list
+    /// that refuses it says so. `None` skips the check.
+    monitor: Option<MonitorCheck>,
+}
+
+/// What the monitor check needs to know about this server.
+struct MonitorCheck {
+    /// The addresses the monitor connects from, from the configured proxy
+    /// listeners.
+    addresses: Vec<IpAddr>,
+    /// The gate the proxy enforces project IP policies with. A saved list
+    /// explains a refused check only while that gate decides from the saved
+    /// lists: a plugin gate may admit or refuse the monitor on other grounds.
+    gate: Arc<dyn ProjectIpGate>,
 }
 
 impl ProjectIpAccessService {
@@ -446,16 +483,39 @@ impl ProjectIpAccessService {
         Self {
             db,
             ways_in: OnceLock::new(),
-            monitor_addresses: Vec::new(),
+            monitor: None,
         }
     }
 
     /// Check every policy against the addresses Temps' uptime monitor
     /// connects from (see
-    /// [`temps_core::uptime_monitor_ip_access::monitor_source_addresses`]).
-    pub fn with_monitor_addresses(mut self, addresses: Vec<IpAddr>) -> Self {
-        self.monitor_addresses = addresses;
+    /// [`temps_core::uptime_monitor_ip_access::monitor_source_addresses`]),
+    /// for as long as `gate`, the one the proxy enforces policies with,
+    /// decides from the saved lists.
+    pub fn with_monitor_addresses(
+        mut self,
+        addresses: Vec<IpAddr>,
+        gate: Arc<dyn ProjectIpGate>,
+    ) -> Self {
+        self.monitor = Some(MonitorCheck { addresses, gate });
         self
+    }
+
+    /// Whether the proxy enforces the saved lists, so they are what refuses
+    /// (or admits) the monitor.
+    pub(crate) fn saved_lists_enforced(&self) -> bool {
+        self.monitor
+            .as_ref()
+            .is_some_and(|monitor| monitor.gate.reads_project_ip_access_rules())
+    }
+
+    /// The monitor addresses to check the saved lists against; empty when
+    /// the saved lists are not what the proxy enforces.
+    fn monitor_addresses(&self) -> &[IpAddr] {
+        match &self.monitor {
+            Some(monitor) if self.saved_lists_enforced() => &monitor.addresses,
+            _ => &[],
+        }
     }
 
     /// Record on `response` whether `governing` (the policy in force for the
@@ -476,7 +536,7 @@ impl ProjectIpAccessService {
             scope,
             &row.mode,
             row.cidrs.0.clone(),
-            &self.monitor_addresses,
+            self.monitor_addresses(),
         );
         if let Some(block) = block {
             response.warnings.push(block.message.clone());
@@ -618,7 +678,7 @@ impl ProjectIpAccessService {
             Some(row) => ProjectIpAccessResponse::from(row.clone()),
             None => ProjectIpAccessResponse::unconfigured(project_id, environment_id),
         };
-        if self.monitor_addresses.is_empty() {
+        if self.monitor_addresses().is_empty() {
             return Ok(response);
         }
         // An environment without a list of its own is governed by the
@@ -688,13 +748,30 @@ impl ProjectIpAccessService {
         // Two writers creating the same scope at once both see no row and both
         // insert; the unique index rejects the second. That writer retries
         // once, finds the row the first one made, and updates it.
+        // A save that names the revision it was built from is checked against
+        // the retried read too, so it still cannot overwrite the first save.
+        let expected = request.expected_revision;
         let saved = match self
-            .upsert(project_id, environment_id, policy.mode, &cidrs, updated_by)
+            .upsert(
+                project_id,
+                environment_id,
+                policy.mode,
+                &cidrs,
+                updated_by,
+                expected,
+            )
             .await
         {
             Err(ProjectIpAccessError::ConcurrentUpdate { .. }) => {
-                self.upsert(project_id, environment_id, policy.mode, &cidrs, updated_by)
-                    .await
+                self.upsert(
+                    project_id,
+                    environment_id,
+                    policy.mode,
+                    &cidrs,
+                    updated_by,
+                    expected,
+                )
+                .await
             }
             other => other,
         }
@@ -731,6 +808,7 @@ impl ProjectIpAccessService {
         mode: IpAccessMode,
         cidrs: &IpAccessCidrs,
         updated_by: Option<i32>,
+        expected_revision: Option<i64>,
     ) -> Result<project_ip_access_rules::Model, ProjectIpAccessError> {
         let txn = self.db.begin().await?;
         let mut query = project_ip_access_rules::Entity::find()
@@ -741,7 +819,22 @@ impl ProjectIpAccessService {
             }
             None => query.filter(project_ip_access_rules::Column::EnvironmentId.is_null()),
         };
+        if expected_revision.is_some() {
+            // Hold the row until commit, so a concurrent save cannot land
+            // between the comparison and this write.
+            query = query.lock_exclusive();
+        }
         let existing = query.one(&txn).await?;
+        if let Some(expected) = expected_revision {
+            let stored = existing.as_ref().map_or(0, |row| row.revision);
+            if stored != expected {
+                return Err(ProjectIpAccessError::RevisionMismatch {
+                    scope: scope_label(project_id, environment_id),
+                    expected,
+                    stored,
+                });
+            }
+        }
 
         let saved = match existing {
             Some(row) => {
@@ -1199,6 +1292,7 @@ mod tests {
                     mode: IpAccessMode::Allow,
                     cidrs: vec![entry("100.64.0.0/10")],
                     acknowledge_lockout: false,
+                    expected_revision: None,
                 },
                 Some(ip("203.0.113.9")),
                 Some(1),
@@ -1231,6 +1325,7 @@ mod tests {
                     mode: IpAccessMode::Deny,
                     cidrs: vec![entry("203.0.113.0/24")],
                     acknowledge_lockout: false,
+                    expected_revision: None,
                 },
                 Some(ip("::ffff:203.0.113.9")),
                 Some(1),
@@ -1260,6 +1355,7 @@ mod tests {
                     mode: IpAccessMode::Allow,
                     cidrs: vec![],
                     acknowledge_lockout: false,
+                    expected_revision: None,
                 },
                 Some(ip("203.0.113.9")),
                 Some(1),
@@ -1294,6 +1390,7 @@ mod tests {
                     mode: IpAccessMode::Allow,
                     cidrs: vec![entry("100.64.0.0/10")],
                     acknowledge_lockout: false,
+                    expected_revision: None,
                 },
                 Some(ip("100.100.1.1")),
                 Some(1),
@@ -1410,6 +1507,7 @@ mod tests {
                     mode: IpAccessMode::Allow,
                     cidrs: vec![entry("100.64.0.0/10")],
                     acknowledge_lockout: true,
+                    expected_revision: None,
                 },
                 None,
                 Some(1),
@@ -1446,6 +1544,7 @@ mod tests {
                     mode: IpAccessMode::Allow,
                     cidrs: vec![entry("203.0.113.0/24")],
                     acknowledge_lockout: true,
+                    expected_revision: None,
                 },
                 None,
                 Some(1),
@@ -1520,6 +1619,7 @@ mod tests {
                     mode: IpAccessMode::Deny,
                     cidrs: vec![entry("198.51.100.0/24")],
                     acknowledge_lockout: true,
+                    expected_revision: None,
                 },
                 None,
                 Some(1),
@@ -1556,6 +1656,7 @@ mod tests {
                     mode: IpAccessMode::Deny,
                     cidrs: vec![entry("198.51.100.0/24")],
                     acknowledge_lockout: true,
+                    expected_revision: None,
                 },
                 None,
                 None,
@@ -1585,6 +1686,7 @@ mod tests {
                     mode: IpAccessMode::Deny,
                     cidrs: vec![entry("198.51.100.0/24")],
                     acknowledge_lockout: true,
+                    expected_revision: None,
                 },
                 None,
                 None,
@@ -1821,5 +1923,112 @@ mod tests {
             .expect("test succeeds");
         assert!(response.allowed);
         assert_eq!(response.matched_cidr.as_deref(), Some("10.0.0.0/8"));
+    }
+
+    fn deny_request(expected_revision: Option<i64>) -> SetProjectIpAccessRequest {
+        SetProjectIpAccessRequest {
+            mode: IpAccessMode::Deny,
+            cidrs: vec![entry("198.51.100.0/24")],
+            acknowledge_lockout: true,
+            expected_revision,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_save_built_from_the_stored_revision_goes_through_under_a_row_lock() {
+        let stored = rule_row(5, None, "deny", &["192.0.2.0/24"]);
+        let saved = project_ip_access_rules::Model {
+            revision: 2,
+            ..rule_row(5, None, "deny", &["198.51.100.0/24"])
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![id_row(5)]])
+                .append_query_results(vec![vec![stored]])
+                .append_query_results(vec![vec![saved]])
+                .into_connection(),
+        );
+        let service = ProjectIpAccessService::new(Arc::clone(&db));
+
+        let response = service
+            .set(5, None, deny_request(Some(1)), None, Some(1))
+            .await
+            .expect("the stored policy is still at revision 1");
+        assert_eq!(response.revision, 2);
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .map_err(|_| "the service still holds the database handle")
+            .expect("service dropped its handle")
+            .into_transaction_log();
+        let sql: Vec<String> = log
+            .iter()
+            .flat_map(|txn| txn.statements().iter().map(|s| s.sql.clone()))
+            .collect();
+        assert!(
+            sql.iter()
+                .any(|s| s.contains("project_ip_access_rules") && s.contains("FOR UPDATE")),
+            "the stored row is locked before it is compared: {sql:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_built_from_an_older_revision_is_refused_without_writing() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            // Saved again (revision 1) after the caller read revision 0.
+            .append_query_results(vec![vec![rule_row(5, None, "allow", &["192.0.2.7/32"])]])
+            // Nothing for an UPDATE: reaching one fails the test.
+            .into_connection();
+        let service = ProjectIpAccessService::new(Arc::new(db));
+
+        let error = service
+            .set(5, None, deny_request(Some(0)), None, Some(1))
+            .await
+            .expect_err("a save from a stale read is refused");
+        match error {
+            ProjectIpAccessError::RevisionMismatch {
+                scope,
+                expected,
+                stored,
+            } => {
+                assert_eq!(scope, "project 5");
+                assert_eq!((expected, stored), (0, 1));
+            }
+            other => panic!("expected RevisionMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_retry_after_a_create_race_still_checks_the_revision() {
+        let duplicate = sea_orm::DbErr::Exec(sea_orm::RuntimeErr::Internal(
+            "duplicate key value violates unique constraint".to_string(),
+        ));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            .append_query_results(vec![vec![id_row(9)]])
+            // Nothing stored, as the caller read it (revision 0) ...
+            .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+            // ... but another writer creates the scope first.
+            .append_query_errors(vec![duplicate])
+            .append_query_results(vec![vec![rule_row(5, Some(9), "allow", &["192.0.2.7/32"])]])
+            .into_connection();
+        let service = ProjectIpAccessService::new(Arc::new(db));
+
+        let error = service
+            .set(5, Some(9), deny_request(Some(0)), None, None)
+            .await
+            .expect_err("the other writer's list is not overwritten");
+        assert!(
+            matches!(
+                error,
+                ProjectIpAccessError::RevisionMismatch {
+                    expected: 0,
+                    stored: 1,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
     }
 }

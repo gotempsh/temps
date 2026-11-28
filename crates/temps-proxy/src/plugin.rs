@@ -159,7 +159,10 @@ impl TempsPlugin for ProxyPlugin {
             // side; enforcement is the gate installed in the proxy slot).
             // Every policy is also checked against the addresses Temps' own
             // uptime monitor connects from, so a list that refuses it says so
-            // instead of the monitor reporting a bare 403.
+            // instead of the monitor reporting a bare 403. Only while the gate
+            // the proxy ends up enforcing (resolved after every plugin has
+            // registered) decides from these saved lists: behind a plugin's
+            // gate they explain nothing.
             let monitor_addresses = server_config
                 .as_ref()
                 .map(|config| {
@@ -170,7 +173,10 @@ impl TempsPlugin for ProxyPlugin {
                 })
                 .unwrap_or_default();
             let project_ip_access_service = Arc::new(
-                ProjectIpAccessService::new(db.clone()).with_monitor_addresses(monitor_addresses),
+                ProjectIpAccessService::new(db.clone()).with_monitor_addresses(
+                    monitor_addresses,
+                    ip_gate_slot.clone() as Arc<dyn temps_core::ProjectIpGate>,
+                ),
             );
             // The status page registers before this plugin and reads the
             // slot when a managed check is refused.

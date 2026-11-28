@@ -29410,6 +29410,12 @@ export type ProjectIpAccessResponse = {
     max_cidrs: number;
     mode: IpAccessMode;
     project_id: number;
+    /**
+     * Changes on every save of this scope's policy; `0` when nothing is
+     * stored. Send it back as `expected_revision` to save only if nobody
+     * saved in between.
+     */
+    revision?: number;
     updated_at?: string | null;
     uptime_monitor_block?: UptimeMonitorIpBlock | null;
     /**
@@ -36591,6 +36597,13 @@ export type SetProjectIpAccessRequest = {
      * CIDRs (IPv4 or IPv6). A bare address is a single host. At most 256.
      */
     cidrs: Array<IpAccessCidrEntry>;
+    /**
+     * The `revision` of the policy this list was built from (`0` when
+     * nothing was stored). When set, the save is refused with 409 if the
+     * stored policy changed since, so a read-modify-write never overwrites
+     * a save made in between. Omit it to replace the list unconditionally.
+     */
+    expected_revision?: number | null;
     /**
      * `disabled` keeps the list but enforces nothing; `allow` admits only
      * listed clients; `deny` blocks listed clients.
@@ -89555,7 +89568,7 @@ export type PutEnvironmentIpAccessErrors = {
      */
     404: ProblemDetails;
     /**
-     * Policy would lock out the caller
+     * Policy would lock out the caller, or the stored policy is no longer at `expected_revision`
      */
     409: ProblemDetails;
     /**
@@ -96715,7 +96728,7 @@ export type PutProjectIpAccessErrors = {
      */
     404: ProblemDetails;
     /**
-     * Policy would lock out the caller
+     * Policy would lock out the caller, or the stored policy is no longer at `expected_revision`
      */
     409: ProblemDetails;
     /**

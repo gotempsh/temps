@@ -230,7 +230,18 @@ impl UptimeMonitorIpBlock {
         };
         let list = format!("this {}'s IP access list", policy_scope.noun());
         let from = join(&blocked_addresses);
-        let effect = "so every check is answered with HTTP 403 and the app's health is unverified";
+        // Only the probes from the blocked addresses are refused: with HTTP
+        // on loopback and HTTPS on a public address, one can pass while the
+        // other is answered with 403.
+        let effect = format!(
+            "so the monitor's checks from {} are answered with HTTP 403 and the app's health is \
+             unverified",
+            if blocked.len() == 1 {
+                "that address"
+            } else {
+                "those addresses"
+            }
+        );
         let message = match reason {
             UptimeMonitorBlockReason::NotAllowListed => format!(
                 "Blocked by {list}: Temps' uptime monitor connects from {from}, which the list \
@@ -249,7 +260,8 @@ impl UptimeMonitorIpBlock {
             ),
             UptimeMonitorBlockReason::Unreadable => format!(
                 "Blocked by {list}: the saved list cannot be read, so it refuses every address, \
-                 including Temps' uptime monitor at {from}, {effect}. Save the list again."
+                 including Temps' uptime monitor at {from}, so every check is answered with HTTP \
+                 403 and the app's health is unverified. Save the list again."
             ),
         };
         Self {
@@ -435,6 +447,16 @@ mod tests {
             block.message
         );
         assert!(block.message.contains("Add 203.0.113.10/32"));
+        // Loopback is admitted, so only the probes from the public address
+        // are refused, not every check.
+        assert!(
+            block
+                .message
+                .contains("the monitor's checks from that address are answered with HTTP 403"),
+            "{}",
+            block.message
+        );
+        assert!(!block.message.contains("every check"), "{}", block.message);
     }
 
     #[test]

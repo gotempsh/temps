@@ -120,7 +120,9 @@ impl UptimeMonitorIpAccess for ProjectIpAccessService {
         environment_id: i32,
         monitor_addresses: &[IpAddr],
     ) -> Result<Option<UptimeMonitorIpBlock>, UptimeMonitorIpAccessError> {
-        if monitor_addresses.is_empty() {
+        // Behind a plugin gate the saved lists are not what the proxy
+        // enforces, so they cannot explain the 403.
+        if monitor_addresses.is_empty() || !self.saved_lists_enforced() {
             return Ok(None);
         }
         let governing = self
@@ -188,7 +190,7 @@ mod tests {
         std::collections::BTreeMap::from([("id", sea_orm::Value::Int(Some(id)))])
     }
 
-    /// The reported shape: an operator address plus the tailnet ranges.
+    /// A private app's list: one operator address plus the tailnet ranges.
     const OPERATOR_AND_TAILNET: &[&str] =
         &["198.51.100.7/32", "100.64.0.0/10", "fd7a:115c:a1e0::/48"];
 
@@ -196,6 +198,32 @@ mod tests {
     /// public address.
     fn monitor() -> Vec<IpAddr> {
         vec![ip("127.0.0.1"), ip("203.0.113.10")]
+    }
+
+    /// A gate that, like the proxy's built-in one, does or does not decide
+    /// from the saved lists.
+    struct Gate {
+        reads_saved_lists: bool,
+    }
+
+    impl temps_core::ProjectIpGate for Gate {
+        fn is_allowed(&self, _project_id: i32, _environment_id: i32, _ip: IpAddr) -> bool {
+            true
+        }
+
+        fn reads_project_ip_access_rules(&self) -> bool {
+            self.reads_saved_lists
+        }
+    }
+
+    /// The service as the proxy plugin builds it behind the built-in gate.
+    fn service(db: sea_orm::DatabaseConnection) -> ProjectIpAccessService {
+        ProjectIpAccessService::new(Arc::new(db)).with_monitor_addresses(
+            monitor(),
+            Arc::new(Gate {
+                reads_saved_lists: true,
+            }),
+        )
     }
 
     fn evaluate(mode: &str, cidrs: &[&str]) -> Option<UptimeMonitorIpBlock> {
@@ -296,7 +324,7 @@ mod tests {
                 &["127.0.0.1/32", "203.0.113.10/32"],
             )]])
             .into_connection();
-        let service = ProjectIpAccessService::new(Arc::new(db));
+        let service = service(db);
         let block = service
             .monitor_block(5, 9, &monitor())
             .await
@@ -309,7 +337,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![row(Some(9), "allow", OPERATOR_AND_TAILNET)]])
             .into_connection();
-        let service = ProjectIpAccessService::new(Arc::new(db));
+        let service = service(db);
         let block = service
             .monitor_block(5, 9, &monitor())
             .await
@@ -325,7 +353,7 @@ mod tests {
             .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
             .append_query_results(vec![vec![row(None, "allow", OPERATOR_AND_TAILNET)]])
             .into_connection();
-        let service = ProjectIpAccessService::new(Arc::new(db));
+        let service = service(db);
         let block = service
             .monitor_block(5, 9, &monitor())
             .await
@@ -340,7 +368,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_errors(vec![sea_orm::DbErr::Custom("connection reset".into())])
             .into_connection();
-        let service = ProjectIpAccessService::new(Arc::new(db));
+        let service = service(db);
         let error = service
             .monitor_block(5, 9, &monitor())
             .await
@@ -356,7 +384,7 @@ mod tests {
             .append_query_results(vec![vec![id_row(5)]])
             .append_query_results(vec![vec![row(None, "allow", OPERATOR_AND_TAILNET)]])
             .into_connection();
-        let service = ProjectIpAccessService::new(Arc::new(db)).with_monitor_addresses(monitor());
+        let service = service(db);
         let response = service.get(5, None).await.expect("get succeeds");
         let block = response.uptime_monitor_block.expect("blocked");
         assert_eq!(block.policy_scope, IpAccessPolicyScope::Project);
@@ -374,7 +402,7 @@ mod tests {
             .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
             .append_query_results(vec![vec![row(None, "allow", OPERATOR_AND_TAILNET)]])
             .into_connection();
-        let service = ProjectIpAccessService::new(Arc::new(db)).with_monitor_addresses(monitor());
+        let service = service(db);
         let response = service.get(5, Some(9)).await.expect("get succeeds");
         assert!(!response.configured);
         let block = response.uptime_monitor_block.expect("blocked");
@@ -388,6 +416,33 @@ mod tests {
             .append_query_results(vec![vec![row(None, "allow", OPERATOR_AND_TAILNET)]])
             .into_connection();
         let service = ProjectIpAccessService::new(Arc::new(db));
+        let response = service.get(5, None).await.expect("get succeeds");
+        assert!(response.uptime_monitor_block.is_none());
+        assert!(response.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn behind_a_plugin_gate_the_saved_lists_explain_nothing() {
+        // The saved list would refuse the monitor, but the proxy enforces a
+        // plugin's gate instead, so a 403 is not this list's doing.
+        let gate = Arc::new(Gate {
+            reads_saved_lists: false,
+        });
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            .append_query_results(vec![vec![row(None, "allow", OPERATOR_AND_TAILNET)]])
+            .into_connection();
+        let service =
+            ProjectIpAccessService::new(Arc::new(db)).with_monitor_addresses(monitor(), gate);
+
+        // Reads nothing: the mock's rows are the GET's below, which would
+        // fail had this consumed them.
+        let block = service
+            .monitor_block(5, 9, &monitor())
+            .await
+            .expect("nothing to read");
+        assert!(block.is_none());
+
         let response = service.get(5, None).await.expect("get succeeds");
         assert!(response.uptime_monitor_block.is_none());
         assert!(response.warnings.is_empty());
