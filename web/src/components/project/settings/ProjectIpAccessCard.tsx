@@ -80,12 +80,14 @@ import {
   showsEntries,
   entriesToSave,
   fixesOwnList,
+  isLockoutError,
   monitorBlockSettingsPath,
   withMonitorEntries,
   type IpAccessFormValues,
   type IpAccessFormMode,
   type IpAccessMode,
 } from './ip-access'
+import { allowMonitor, allowMonitorNotice } from './allow-monitor'
 
 interface ProjectIpAccessCardProps {
   projectId: number
@@ -116,16 +118,6 @@ const MODES: { value: IpAccessFormMode; hint: string }[] = [
   },
   { value: 'deny', hint: 'Listed addresses get a 403, everyone else is fine.' },
 ]
-
-/**
- * The 409 for "this save would lock you out". Another 409 (a concurrent
- * update) must not offer the "Save anyway" override, so the title decides.
- */
-function isLockoutError(error: unknown): boolean {
-  if (typeof error !== 'object' || error === null) return false
-  const problem = error as { status?: unknown; title?: unknown }
-  return problem.status === 409 && problem.title === 'Policy Would Lock You Out'
-}
 
 const IP_ACCESS_SECTION_ID = 'ip-access'
 
@@ -219,9 +211,11 @@ export function ProjectIpAccessCard({
   const mode = useWatch({ control: form.control, name: 'mode' })
   const currentCidrs = useWatch({ control: form.control, name: 'cidrs' })
 
+  // A save refused because it would lock the operator out, and how to
+  // send it again with the lockout acknowledged.
   const [lockout, setLockout] = useState<{
     detail: string
-    request: SetProjectIpAccessRequest
+    confirm: () => void
   } | null>(null)
   const [confirmRemove, setConfirmRemove] = useState(false)
   const [probe, setProbe] = useState('')
@@ -269,7 +263,7 @@ export function ProjectIpAccessCard({
       if (isLockoutError(error)) {
         setLockout({
           detail: problemDetail(error, 'This change would lock you out.'),
-          request: body,
+          confirm: () => save.mutate({ ...body, acknowledge_lockout: true }),
         })
         return
       }
@@ -421,23 +415,52 @@ export function ProjectIpAccessCard({
     monitorBlock !== null &&
     fixesOwnList(monitorBlock, isEnvironment) &&
     monitorBlock.suggested_cidrs.length > 0
-  const allowMonitor = () => {
-    if (!policy || !monitorBlock || isDirty) return
-    save.mutate(
-      toRequest(
-        {
-          mode: policy.mode,
-          cidrs: withMonitorEntries(policy.cidrs, monitorBlock).map(
-            (entry) => ({
-              cidr: entry.cidr,
-              description: entry.description ?? '',
-            })
-          ),
-        },
-        false
+  // Entries the list would need to drop before the monitor's fit.
+  const monitorOverflow =
+    policy && monitorBlock
+      ? Math.max(
+          0,
+          withMonitorEntries(policy.cidrs, monitorBlock).length -
+            policy.max_cidrs
+        )
+      : 0
+  const allowMonitorMutation = useMutation({
+    mutationFn: (acknowledgeLockout: boolean) => {
+      if (!monitorBlock) {
+        return Promise.reject(new Error('Nothing blocks the uptime monitor'))
+      }
+      return allowMonitor(monitorBlock, acknowledgeLockout)
+    },
+    onSuccess: (outcome) => {
+      setLockout(null)
+      if (outcome.kind === 'saved') {
+        queryClient.setQueryData(queryKey, outcome.saved)
+        form.reset(valuesFor(outcome.saved))
+        setChangedElsewhere(false)
+        setProbeResult(null)
+        toast.success('Monitor allowed. The next check will reach the app.')
+        return
+      }
+      queryClient.invalidateQueries({ queryKey })
+      if (outcome.kind === 'already-allowed') {
+        toast.success(allowMonitorNotice(outcome))
+      } else {
+        toast.error(allowMonitorNotice(outcome))
+      }
+    },
+    onError: (error) => {
+      if (isLockoutError(error)) {
+        setLockout({
+          detail: problemDetail(error, 'This change would lock you out.'),
+          confirm: () => allowMonitorMutation.mutate(true),
+        })
+        return
+      }
+      toast.error(
+        problemDetail(error, 'Could not add the monitor to the IP access list')
       )
-    )
-  }
+    },
+  })
 
   const title = isEnvironment ? 'IP access for this environment' : 'IP access'
   // Other sections and the uptime monitor link here (Shield entries, a
@@ -535,22 +558,36 @@ export function ProjectIpAccessCard({
             <AlertDescription className="space-y-3">
               <p className="[overflow-wrap:anywhere]">{monitorBlock.message}</p>
               {allowMonitorHere ? (
-                <Button
-                  type="button"
-                  size="sm"
-                  onClick={allowMonitor}
-                  disabled={isDirty || save.isPending}
-                  title={
-                    isDirty
-                      ? 'Save or discard your changes first'
-                      : `Add ${monitorBlock.suggested_cidrs.join(', ')} as "${monitorBlock.suggested_description}"`
-                  }
-                >
-                  {save.isPending && (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                <>
+                  {monitorOverflow > 0 && (
+                    <p>
+                      The list is full. Remove {monitorOverflow}{' '}
+                      {monitorOverflow === 1 ? 'entry' : 'entries'} to make room
+                      for the monitor.
+                    </p>
                   )}
-                  Allow monitor
-                </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={() => allowMonitorMutation.mutate(false)}
+                    disabled={
+                      isDirty ||
+                      monitorOverflow > 0 ||
+                      save.isPending ||
+                      allowMonitorMutation.isPending
+                    }
+                    title={
+                      isDirty
+                        ? 'Save or discard your changes first'
+                        : `Add ${monitorBlock.suggested_cidrs.join(', ')} as "${monitorBlock.suggested_description}"`
+                    }
+                  >
+                    {allowMonitorMutation.isPending && (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    )}
+                    Allow monitor
+                  </Button>
+                </>
               ) : !fixesOwnList(monitorBlock, isEnvironment) && projectSlug ? (
                 <Button asChild type="button" size="sm" variant="outline">
                   <Link
@@ -851,9 +888,7 @@ export function ProjectIpAccessCard({
             <AlertDialogCancel>Keep editing</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {
-                if (lockout) {
-                  save.mutate({ ...lockout.request, acknowledge_lockout: true })
-                }
+                lockout?.confirm()
               }}
             >
               Save anyway

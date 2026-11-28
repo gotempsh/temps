@@ -9,30 +9,37 @@
  * adds the addresses the monitor connects from to the list that refuses it,
  * keeping every other entry, and the settings link opens that list.
  */
-import {
-  getEnvironmentIpAccess,
-  getProjectIpAccess,
-  putEnvironmentIpAccess,
-  putProjectIpAccess,
-  type UptimeMonitorIpBlock,
-} from '@/api/client'
+import { type UptimeMonitorIpBlock } from '@/api/client'
 import {
   getCurrentMonitorStatusQueryKey,
   getEnvironmentIpAccessQueryKey,
   getProjectIpAccessQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import { problemDetail } from '@/lib/api-problem'
 import { queryKeyPrefix } from '@/lib/refresh'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Callout } from '@temps-sdk/ds'
 import { Loader2 } from 'lucide-react'
+import { useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import {
-  monitorBlockSettingsPath,
-  withMonitorEntries,
-} from './settings/ip-access'
+  allowMonitor,
+  allowMonitorNotice,
+  allowMonitorTarget,
+} from './settings/allow-monitor'
+import { isLockoutError, monitorBlockSettingsPath } from './settings/ip-access'
 
 interface MonitorIpAccessWarningProps {
   block: UptimeMonitorIpBlock
@@ -46,63 +53,51 @@ export function MonitorIpAccessWarning({
   projectSlug,
 }: MonitorIpAccessWarningProps) {
   const queryClient = useQueryClient()
-  const projectId = block.project_id
-  const environmentId =
-    block.policy_scope === 'environment' ? block.environment_id : null
+  const [lockoutDetail, setLockoutDetail] = useState<string | null>(null)
+
+  const refresh = () => {
+    const { projectId, environmentId } = allowMonitorTarget(block)
+    queryClient.invalidateQueries({
+      queryKey:
+        environmentId != null
+          ? getEnvironmentIpAccessQueryKey({
+              path: { project_id: projectId, environment_id: environmentId },
+            })
+          : getProjectIpAccessQueryKey({ path: { project_id: projectId } }),
+    })
+    queryClient.invalidateQueries({
+      queryKey: queryKeyPrefix(getCurrentMonitorStatusQueryKey, {
+        path: { monitor_id: monitorId },
+      }),
+    })
+  }
 
   const allow = useMutation({
-    mutationFn: async () => {
-      // Read the list right before replacing it, so every entry someone
-      // else saved meanwhile is kept.
-      const current =
-        environmentId != null
-          ? await getEnvironmentIpAccess({
-              path: { project_id: projectId, environment_id: environmentId },
-              throwOnError: true,
-            })
-          : await getProjectIpAccess({
-              path: { project_id: projectId },
-              throwOnError: true,
-            })
-      const body = {
-        mode: current.data.mode,
-        cidrs: withMonitorEntries(current.data.cidrs, block).map((entry) => ({
-          cidr: entry.cidr,
-          description: entry.description ?? null,
-        })),
-        acknowledge_lockout: false,
+    mutationFn: (acknowledgeLockout: boolean) =>
+      allowMonitor(block, acknowledgeLockout),
+    onSuccess: (outcome) => {
+      setLockoutDetail(null)
+      refresh()
+      switch (outcome.kind) {
+        case 'saved':
+          toast.success('Monitor allowed. The next check will reach the app.')
+          return
+        case 'already-allowed':
+          toast.success(allowMonitorNotice(outcome))
+          return
+        case 'changed':
+        case 'full':
+          toast.error(allowMonitorNotice(outcome))
+          return
       }
-      if (environmentId != null) {
-        await putEnvironmentIpAccess({
-          path: { project_id: projectId, environment_id: environmentId },
-          body,
-          throwOnError: true,
-        })
-      } else {
-        await putProjectIpAccess({
-          path: { project_id: projectId },
-          body,
-          throwOnError: true,
-        })
-      }
-    },
-    onSuccess: () => {
-      toast.success('Monitor allowed. The next check will reach the app.')
-      queryClient.invalidateQueries({
-        queryKey:
-          environmentId != null
-            ? getEnvironmentIpAccessQueryKey({
-                path: { project_id: projectId, environment_id: environmentId },
-              })
-            : getProjectIpAccessQueryKey({ path: { project_id: projectId } }),
-      })
-      queryClient.invalidateQueries({
-        queryKey: queryKeyPrefix(getCurrentMonitorStatusQueryKey, {
-          path: { monitor_id: monitorId },
-        }),
-      })
     },
     onError: (error) => {
+      if (isLockoutError(error)) {
+        setLockoutDetail(
+          problemDetail(error, 'This change would lock you out.')
+        )
+        return
+      }
       toast.error(
         problemDetail(error, 'Could not add the monitor to the IP access list')
       )
@@ -118,7 +113,7 @@ export function MonitorIpAccessWarning({
         {canAllow && (
           <Button
             size="sm"
-            onClick={() => allow.mutate()}
+            onClick={() => allow.mutate(false)}
             disabled={allow.isPending}
             title={`Add ${block.suggested_cidrs.join(', ')} to the list as "${block.suggested_description}"`}
           >
@@ -134,6 +129,26 @@ export function MonitorIpAccessWarning({
           </Link>
         </Button>
       </div>
+
+      <AlertDialog
+        open={lockoutDetail !== null}
+        onOpenChange={(open) => {
+          if (!open) setLockoutDetail(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>This would lock you out</AlertDialogTitle>
+            <AlertDialogDescription>{lockoutDetail}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={() => allow.mutate(true)}>
+              Save anyway
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Callout>
   )
 }

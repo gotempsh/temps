@@ -161,6 +161,19 @@ test('a list that refuses the uptime monitor says so and offers the fix', () => 
   expect(markup).toContain('Add 203.0.113.10/32 as')
 })
 
+test('a full list says what to remove before the monitor fits', () => {
+  const full = Array.from({ length: 256 }, (_, i) => ({
+    cidr: `10.0.${i}.0/24`,
+  }))
+  const markup = render({
+    data: { ...allowList, cidrs: full, uptime_monitor_block: monitorBlock },
+  })
+  expect(markup).toContain(
+    'The list is full. Remove 1 entry to make room for the monitor.'
+  )
+  expect(markup).toMatch(/<button[^>]*disabled=""[^>]*>Allow monitor/)
+})
+
 test('a list that lets the monitor in shows no monitor warning', () => {
   const markup = render({ data: allowList })
   expect(markup).not.toContain('blocks the uptime monitor')
