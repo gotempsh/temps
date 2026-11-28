@@ -319,7 +319,7 @@ impl SourceControlService {
                 [project_id.into()],
             ))
             .await?
-            .ok_or(ErrorTrackingError::ProjectNotFound)?;
+            .ok_or(ErrorTrackingError::ProjectNotFound { project_id })?;
         Ok(row.try_get("", "slug")?)
     }
 

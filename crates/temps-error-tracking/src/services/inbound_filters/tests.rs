@@ -206,3 +206,41 @@ async fn a_reload_from_the_database_picks_up_rules_written_elsewhere() {
     registry.reload(db.as_ref()).await.expect("reload");
     assert!(registry.evaluate(&event).is_some());
 }
+
+#[tokio::test]
+async fn a_missing_project_is_project_not_found_for_list_and_create() {
+    let test_db = test_db!("inbound filter missing project");
+    let db = test_db.connection_arc();
+    let service = InboundFilterService::new(db.clone(), Arc::new(InboundFilterRegistry::new()));
+
+    let listed = service.list(999_999).await;
+    assert!(
+        matches!(
+            listed,
+            Err(ErrorTrackingError::ProjectNotFound {
+                project_id: 999_999
+            })
+        ),
+        "{listed:?}"
+    );
+
+    // Before this check the insert hit the project foreign key and the SQL
+    // error came back as a 500.
+    let created = service
+        .create(
+            999_999,
+            InboundFilterKind::ErrorMessage,
+            Some("TypeError: *".into()),
+            true,
+        )
+        .await;
+    assert!(
+        matches!(
+            created,
+            Err(ErrorTrackingError::ProjectNotFound {
+                project_id: 999_999
+            })
+        ),
+        "{created:?}"
+    );
+}

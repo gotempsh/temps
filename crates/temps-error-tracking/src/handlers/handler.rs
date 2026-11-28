@@ -378,11 +378,14 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
     fn from(err: ErrorTrackingError) -> Self {
         use temps_core::problemdetails;
         match err {
-            ErrorTrackingError::GroupNotFound
-            | ErrorTrackingError::EventNotFound
-            | ErrorTrackingError::ProjectNotFound => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Not Found")
-                .with_detail(err.to_string()),
+            ErrorTrackingError::ProjectNotFound { project_id } => {
+                temps_core::api_problems::project_not_found(project_id)
+            }
+            ErrorTrackingError::GroupNotFound | ErrorTrackingError::EventNotFound => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Not Found")
+                    .with_detail(err.to_string())
+            }
             ErrorTrackingError::GroupsNotFound {
                 project_id,
                 ref group_ids,
@@ -723,7 +726,7 @@ impl axum::response::IntoResponse for ErrorTrackingError {
                 StatusCode::BAD_REQUEST,
                 format!("Validation error: {}", msg),
             ),
-            ErrorTrackingError::ProjectNotFound => {
+            ErrorTrackingError::ProjectNotFound { .. } => {
                 (StatusCode::NOT_FOUND, "Project not found".to_string())
             }
             ErrorTrackingError::AlertRuleLimitReached { .. } => {

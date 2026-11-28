@@ -33,6 +33,20 @@ pub const METHOD_NOT_ALLOWED_PROBLEM_TYPE: &str = "https://temps.sh/probs/method
 /// could not read (malformed JSON, a wrong type, a missing field).
 pub const INVALID_REQUEST_PROBLEM_TYPE: &str = "https://temps.sh/probs/invalid-request";
 
+/// `type` of the 404 for a project-scoped request whose project does not
+/// exist (or was deleted). Shared so every project-scoped endpoint answers a
+/// missing project the same way, whichever crate serves it.
+pub const PROJECT_NOT_FOUND_PROBLEM_TYPE: &str = "https://temps.sh/probs/project-not-found";
+
+/// The 404 for a project-scoped request whose project does not exist.
+pub fn project_not_found(project_id: i32) -> Problem {
+    problemdetails::new(StatusCode::NOT_FOUND)
+        .with_type(PROJECT_NOT_FOUND_PROBLEM_TYPE)
+        .with_title("Project Not Found")
+        .with_detail(format!("Project {project_id} not found"))
+        .with_value("project_id", project_id)
+}
+
 /// Longest request path echoed back in a detail.
 const MAX_ECHOED_PATH_CHARS: usize = 256;
 

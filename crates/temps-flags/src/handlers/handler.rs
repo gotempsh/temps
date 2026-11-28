@@ -161,6 +161,10 @@ impl From<FlagError> for Problem {
                 .with_title("Feature Flag Not Found")
                 .with_detail(error.to_string()),
 
+            FlagError::ProjectNotFound { project_id } => {
+                temps_core::api_problems::project_not_found(project_id)
+            }
+
             FlagError::EnvironmentNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Environment Not Found")
                 .with_detail(error.to_string()),

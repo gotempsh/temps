@@ -64,6 +64,7 @@ impl InboundFilterService {
     /// Every rule of a project, oldest first. At most
     /// [`MAX_FILTERS_PER_PROJECT`] rows.
     pub async fn list(&self, project_id: i32) -> Result<Vec<InboundFilter>, ErrorTrackingError> {
+        self.require_project(project_id).await?;
         let pending = self.registry.pending_drops();
         error_inbound_filters::Entity::find()
             .filter(error_inbound_filters::Column::ProjectId.eq(project_id))
@@ -93,6 +94,7 @@ impl InboundFilterService {
         enabled: bool,
     ) -> Result<InboundFilter, ErrorTrackingError> {
         let pattern = validate_pattern(kind, pattern)?;
+        self.require_project(project_id).await?;
         let existing = error_inbound_filters::Entity::find()
             .filter(error_inbound_filters::Column::ProjectId.eq(project_id))
             .count(self.db.as_ref())
@@ -178,6 +180,16 @@ impl InboundFilterService {
             .await?;
         self.reload().await;
         to_filter(row, &Default::default())
+    }
+
+    /// A missing (or deleted) project is a 404 naming it: not an empty
+    /// listing, and not a foreign-key violation surfaced as a 500 on create.
+    async fn require_project(&self, project_id: i32) -> Result<(), ErrorTrackingError> {
+        if temps_entities::projects::live_project_exists(self.db.as_ref(), project_id).await? {
+            Ok(())
+        } else {
+            Err(ErrorTrackingError::ProjectNotFound { project_id })
+        }
     }
 
     async fn find(

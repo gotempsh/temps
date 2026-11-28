@@ -525,6 +525,10 @@ impl ErrorAlertService {
         &self,
         project_id: i32,
     ) -> Result<Vec<error_alert_rules::Model>, ErrorTrackingError> {
+        // A missing project is a 404, not an empty list of rules.
+        if !temps_entities::projects::live_project_exists(self.db.as_ref(), project_id).await? {
+            return Err(ErrorTrackingError::ProjectNotFound { project_id });
+        }
         let rules = error_alert_rules::Entity::find()
             .filter(error_alert_rules::Column::ProjectId.eq(project_id))
             .order_by_desc(error_alert_rules::Column::CreatedAt)
@@ -612,7 +616,7 @@ impl ErrorAlertService {
             .is_none()
         {
             txn.rollback().await?;
-            return Err(ErrorTrackingError::ProjectNotFound);
+            return Err(ErrorTrackingError::ProjectNotFound { project_id });
         }
         let existing = error_alert_rules::Entity::find()
             .filter(error_alert_rules::Column::ProjectId.eq(project_id))
@@ -1240,10 +1244,18 @@ mod tests {
             .await
             .expect("another project is not affected");
 
-        let missing = create_numbered_rule(&service, project.id + 100_000, 0).await;
+        let missing_id = project.id + 100_000;
+        let missing = create_numbered_rule(&service, missing_id, 0).await;
         assert!(
-            matches!(missing, Err(ErrorTrackingError::ProjectNotFound)),
+            matches!(missing, Err(ErrorTrackingError::ProjectNotFound { project_id }) if project_id == missing_id),
             "{missing:?}"
+        );
+
+        // Listing a missing project is the same 404, not an empty list.
+        let listed = service.list_rules(missing_id).await;
+        assert!(
+            matches!(listed, Err(ErrorTrackingError::ProjectNotFound { project_id }) if project_id == missing_id),
+            "{listed:?}"
         );
     }
 }

@@ -211,8 +211,8 @@ pub enum ErrorTrackingError {
     #[error("Validation error: {0}")]
     Validation(String),
 
-    #[error("Project not found")]
-    ProjectNotFound,
+    #[error("Project {project_id} not found")]
+    ProjectNotFound { project_id: i32 },
 
     /// The project already has the maximum number of error alert rules.
     /// Maps to HTTP 409 Conflict.

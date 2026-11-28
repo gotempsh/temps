@@ -13,6 +13,9 @@ pub enum FlagError {
     #[error("Feature flag '{key}' already exists in project {project_id}")]
     DuplicateKey { project_id: i32, key: String },
 
+    #[error("Project {project_id} not found")]
+    ProjectNotFound { project_id: i32 },
+
     #[error("Environment {environment_id} does not belong to project {project_id}")]
     EnvironmentNotInProject {
         project_id: i32,

@@ -341,6 +341,10 @@ pub async fn get_environments(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
+    state
+        .environment_service
+        .require_project(project_id)
+        .await?;
     let environments = state
         .environment_service
         .get_environments(project_id)

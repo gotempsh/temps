@@ -282,6 +282,7 @@ impl FlagService {
         page_size: Option<u64>,
     ) -> Result<(Vec<FlagWithEnvironments>, u64), FlagError> {
         let (page, page_size) = normalize_pagination(page, page_size);
+        self.require_project(project_id).await?;
 
         let mut query =
             feature_flags::Entity::find().filter(feature_flags::Column::ProjectId.eq(project_id));
@@ -323,6 +324,16 @@ impl FlagService {
             .collect();
 
         Ok((entries, total))
+    }
+
+    /// A missing (or deleted) project is [`FlagError::ProjectNotFound`]: a
+    /// 404, not an empty listing or a foreign-key violation on insert.
+    async fn require_project(&self, project_id: i32) -> Result<(), FlagError> {
+        if temps_entities::projects::live_project_exists(self.db.as_ref(), project_id).await? {
+            Ok(())
+        } else {
+            Err(FlagError::ProjectNotFound { project_id })
+        }
     }
 
     pub async fn get(&self, project_id: i32, key: &str) -> Result<FlagWithEnvironments, FlagError> {
@@ -369,6 +380,7 @@ impl FlagService {
                 reason: e.to_string(),
             })?;
 
+        self.require_project(project_id).await?;
         let existing = feature_flags::Entity::find()
             .filter(feature_flags::Column::ProjectId.eq(project_id))
             .filter(feature_flags::Column::Key.eq(&request.key))
@@ -1312,6 +1324,51 @@ mod tests {
         }
     }
 
+    /// The row `live_project_exists` selects (only the id column).
+    fn project_id_row(id: i32) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([("id".to_string(), sea_orm::Value::from(id))])
+    }
+
+    fn no_project() -> Vec<std::collections::BTreeMap<String, sea_orm::Value>> {
+        Vec::new()
+    }
+
+    #[tokio::test]
+    async fn listing_a_missing_project_is_project_not_found() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).append_query_results([no_project()]);
+        assert!(matches!(
+            service_with(db).list(999_999, false, None, None).await,
+            Err(FlagError::ProjectNotFound {
+                project_id: 999_999
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn creating_under_a_missing_project_is_project_not_found_before_inserting() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).append_query_results([no_project()]);
+        let result = service_with(db)
+            .create(
+                999_999,
+                CreateFlag {
+                    key: "new-checkout".to_string(),
+                    value_type: FlagValueType::Bool,
+                    default_value: serde_json::json!(false),
+                    description: None,
+                    client_visible: false,
+                    variants: Vec::new(),
+                    exposure_sample_rate: 0.0,
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(FlagError::ProjectNotFound {
+                project_id: 999_999
+            })
+        ));
+    }
+
     fn service_with(db: MockDatabase) -> FlagService {
         FlagService::new(Arc::new(db.into_connection()))
     }
@@ -1419,6 +1476,7 @@ mod tests {
     #[tokio::test]
     async fn create_rejects_a_duplicate_key() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![project_id_row(1)]])
             // The existence probe finds a flag already using this key.
             .append_query_results([vec![flag_model(1, 1, "checkout.v2", "bool")]]);
 

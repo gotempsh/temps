@@ -75,6 +75,9 @@ pub enum EnvironmentError {
     #[error("{0}")]
     NotFound(String),
 
+    #[error("Project {project_id} not found")]
+    ProjectNotFound { project_id: i32 },
+
     #[error("Database error: {reason}")]
     DatabaseError { reason: String },
 
@@ -134,6 +137,9 @@ impl From<EnvironmentError> for Problem {
         match error {
             EnvironmentError::NotFound(msg) => {
                 temps_core::error_builder::not_found().detail(msg).build()
+            }
+            EnvironmentError::ProjectNotFound { project_id } => {
+                temps_core::api_problems::project_not_found(project_id)
             }
             EnvironmentError::InvalidInput(msg) => {
                 temps_core::error_builder::bad_request().detail(msg).build()
@@ -585,6 +591,17 @@ impl EnvironmentService {
         }
 
         Ok(environment)
+    }
+
+    /// Fails with [`EnvironmentError::ProjectNotFound`] unless the project
+    /// exists and is not deleted. API listings call it first, so a missing
+    /// project is a 404 instead of an empty list.
+    pub async fn require_project(&self, project_id: i32) -> Result<(), EnvironmentError> {
+        if projects::live_project_exists(self.db.as_ref(), project_id).await? {
+            Ok(())
+        } else {
+            Err(EnvironmentError::ProjectNotFound { project_id })
+        }
     }
 
     pub async fn get_environments(
@@ -2247,6 +2264,41 @@ mod tests {
             Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
         ));
         EnvironmentService::new(Arc::new(db), config_service)
+    }
+
+    /// #2097: a missing (or deleted) project is `ProjectNotFound` naming it, so
+    /// listing its environments is a 404 instead of an empty 200.
+    #[tokio::test]
+    async fn require_project_names_a_missing_project() {
+        let missing = make_service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([
+                    Vec::<std::collections::BTreeMap<String, sea_orm::Value>>::new(),
+                ])
+                .into_connection(),
+        );
+        assert!(matches!(
+            missing.require_project(42).await,
+            Err(EnvironmentError::ProjectNotFound { project_id: 42 })
+        ));
+        let problem =
+            temps_core::problemdetails::Problem::from(EnvironmentError::ProjectNotFound {
+                project_id: 42,
+            });
+        assert_eq!(problem.status_code, axum::http::StatusCode::NOT_FOUND);
+
+        let present = make_service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![std::collections::BTreeMap::from([(
+                    "id".to_string(),
+                    sea_orm::Value::from(42),
+                )])]])
+                .into_connection(),
+        );
+        present
+            .require_project(42)
+            .await
+            .expect("the project exists");
     }
 
     #[tokio::test]

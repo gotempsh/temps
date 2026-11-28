@@ -641,7 +641,7 @@ impl AttachmentService {
                 [project_id.into()],
             ))
             .await?
-            .ok_or(ErrorTrackingError::ProjectNotFound)?;
+            .ok_or(ErrorTrackingError::ProjectNotFound { project_id })?;
         let used: i64 = usage.try_get("", "bytes")?;
         let quota: i64 = usage.try_get("", "quota_bytes")?;
         // The same file for the same owner: unique by name and content.
@@ -703,7 +703,7 @@ impl AttachmentService {
                 [project_id.into(), owner.kind().into(), owner.id().into()],
             ))
             .await?
-            .ok_or(ErrorTrackingError::ProjectNotFound)?;
+            .ok_or(ErrorTrackingError::ProjectNotFound { project_id })?;
         let owner_files: i64 = owned.try_get("", "files")?;
         let owner_bytes: i64 = owned.try_get("", "bytes")?;
         let next_ordinal: i32 = owned.try_get("", "next_ordinal")?;
@@ -1375,7 +1375,7 @@ impl AttachmentService {
                 [project_id.into()],
             ))
             .await?
-            .ok_or(ErrorTrackingError::ProjectNotFound)?
+            .ok_or(ErrorTrackingError::ProjectNotFound { project_id })?
             .try_get("", "quota_bytes")?;
         // The totals are read in the same statement, so the answer is the
         // committed state and nothing that can fail runs after the commit.
@@ -1387,7 +1387,7 @@ impl AttachmentService {
                 [project_id.into(), quota_bytes.into()],
             ))
             .await?
-            .ok_or(ErrorTrackingError::ProjectNotFound)?;
+            .ok_or(ErrorTrackingError::ProjectNotFound { project_id })?;
         let used_bytes: i64 = saved.try_get("", "bytes")?;
         let files: i64 = saved.try_get("", "files")?;
         let quota_bytes: i64 = saved.try_get("", "quota_bytes")?;
