@@ -1,6 +1,6 @@
 ---
 name: temps
-description: Manage, deploy, operate, and instrument applications with Temps. Use this skill whenever the user mentions Temps, `@temps-sdk/cli`, deploying or migrating an app to Temps, projects, environments, services, domains, backups, edge rules (request blocking, redirects, bot challenges), logs, monitoring, analytics, browser Performance Insights/Core Web Vitals, observability, error tracking, OpenTelemetry, tracing, session replay, or Temps Cloud. Also use it when preparing an application for production on Temps even if the user does not explicitly ask for the CLI. Route to focused references, proactively detect missing observability during create/link/deploy journeys, and use the documented `bunx` or `npx` CLI invocations with explicit target contexts.
+description: Install, manage, deploy, operate, and instrument applications with Temps. Use this skill whenever the user mentions Temps, installing or self-hosting Temps on this computer or a server, connecting an AI client to Temps over MCP, `@temps-sdk/cli`, deploying or migrating an app to Temps, projects, environments, services, domains, backups, edge rules (request blocking, redirects, bot challenges), logs, monitoring, analytics, browser Performance Insights/Core Web Vitals, observability, error tracking, OpenTelemetry, tracing, session replay, or Temps Cloud. Also use it when preparing an application for production on Temps even if the user does not explicitly ask for the CLI. Route to focused references, proactively detect missing observability during create/link/deploy journeys, and use the documented `bunx` or `npx` CLI invocations with explicit target contexts.
 ---
 
 # Temps
@@ -15,8 +15,8 @@ Python 3.9+ for the bundled read-only capability detector.
 
 ## Required workflow
 
-1. Classify the task: application preparation, deployment, platform operation,
-   observability, recovery, or diagnosis.
+1. Classify the task: installation, application preparation, deployment,
+   platform operation, observability, recovery, or diagnosis.
 2. Inspect before changing anything. Identify the current Temps context,
    target project/environment, and existing setup. For a named application,
    check the instance's curated app catalog before creating a repository,
@@ -75,6 +75,8 @@ When the user opts in:
 
 | Intent | Read |
 |---|---|
+| Install or self-host Temps (this computer, an existing server, or a new one), or follow the temps.sh install prompt | [howtos/install-temps.md](howtos/install-temps.md) |
+| Connect Claude Code, Claude Desktop, Codex, Cursor or another AI client to a Temps instance | [howtos/install-temps.md](howtos/install-temps.md#connect-the-ai-client), then [references/commands/mcp.md](references/commands/mcp.md) |
 | Authenticate, select a server, or execute CLI operations | [references/cli-runtime.md](references/cli-runtime.md), then [references/commands/INDEX.md](references/commands/INDEX.md) |
 | Provision a catalog application such as Keycloak or Browserless, including a single-service template | [howtos/curated-services.md](howtos/curated-services.md) |
 | Create, link, deploy, or migrate an application | [howtos/deploy-application.md](howtos/deploy-application.md), [references/runtime-contract.md](references/runtime-contract.md) |
