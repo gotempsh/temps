@@ -76,6 +76,13 @@ impl From<BackupError> for Problem {
                 .with_title("Invalid S3 Endpoint")
                 .with_detail(error.to_string()),
 
+            BackupError::ScheduleHasNoTargets { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_type(SCHEDULE_HAS_NO_TARGETS_PROBLEM_TYPE)
+                    .with_title("Backup Schedule Would Back Up Nothing")
+                    .with_detail(error.to_string())
+            }
+
             BackupError::Schedule(ref msg) => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Schedule Error")
                 .with_detail(msg.clone()),
@@ -210,6 +217,11 @@ impl From<BackupError> for Problem {
 pub const DEFAULT_SOURCE_CONFLICT_PROBLEM_TYPE: &str =
     "https://temps.sh/probs/s3-source-default-conflict";
 
+/// Problem `type` for a schedule create, update or detach that would leave
+/// the schedule with no databases and without the control plane.
+pub const SCHEDULE_HAS_NO_TARGETS_PROBLEM_TYPE: &str =
+    "https://temps.sh/probs/backup-schedule-has-no-targets";
+
 /// Problem `type` for a backup request that failed for a transient reason.
 pub const TEMPORARILY_UNAVAILABLE_PROBLEM_TYPE: &str =
     "https://temps.sh/probs/backup-temporarily-unavailable";
@@ -265,6 +277,7 @@ fn internal_failure_summary(error: &BackupError) -> (&'static str, &'static str)
         BackupError::Internal { .. }
         | BackupError::Validation(_)
         | BackupError::InvalidS3Endpoint { .. }
+        | BackupError::ScheduleHasNoTargets { .. }
         | BackupError::S3Unreachable { .. }
         | BackupError::Schedule(_)
         | BackupError::NotFound { .. }
@@ -1463,7 +1476,9 @@ async fn attach_schedule_services(
 }
 
 /// Detach a single external service from a backup schedule. Returns `204` when
-/// the service was detached, and `404` when it wasn't attached to the schedule.
+/// the service was detached, `404` when it wasn't attached to the schedule, and
+/// `400` when it is the last database of a schedule that does not include the
+/// control plane (the schedule would back up nothing).
 #[utoipa::path(
     tag = "Backups",
     delete,
@@ -1474,6 +1489,7 @@ async fn attach_schedule_services(
     ),
     responses(
         (status = 204, description = "Service detached"),
+        (status = 400, description = "Detaching would leave the schedule with nothing to back up", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "The service is not attached to this schedule", body = ProblemDetails),
@@ -3875,6 +3891,26 @@ mod tests {
         assert!(problem.body["detail"]
             .as_str()
             .is_some_and(|detail| detail.contains("'primary'")));
+    }
+
+    #[test]
+    fn schedule_with_no_targets_is_a_400_with_a_stable_type() {
+        let problem = Problem::from(BackupError::ScheduleHasNoTargets {
+            schedule: "id 12".to_string(),
+            operation: "detach service 7 from".to_string(),
+        });
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(problem.body["type"], SCHEDULE_HAS_NO_TARGETS_PROBLEM_TYPE);
+        assert_eq!(
+            problem.body["title"],
+            "Backup Schedule Would Back Up Nothing"
+        );
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("detach service 7 from backup schedule id 12"),
+            "{detail}"
+        );
+        assert!(detail.contains("Turn on the control plane"), "{detail}");
     }
 
     /// The secret key an operator (or the assistant, through a secret slot)

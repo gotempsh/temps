@@ -136,12 +136,14 @@ impl BackupService {
                 "service_ids cannot be set when target_all_services=true".to_string(),
             ));
         }
+        // Only the control plane, with no databases, is a valid schedule:
+        // it is what restores an instance (projects, environment variables,
+        // domains, users). Only a schedule with nothing at all is refused.
         if !target_all && !include_control_plane && request.service_ids.is_empty() {
-            return Err(BackupError::Validation(
-                "A schedule must include the control plane, at least one specific database, \
-                 or all databases."
-                    .to_string(),
-            ));
+            return Err(BackupError::ScheduleHasNoTargets {
+                schedule: format!("'{}'", request.name),
+                operation: "create".to_string(),
+            });
         }
 
         // Resolve S3 source: explicit id OR fall back to the default source.
@@ -517,23 +519,65 @@ impl BackupService {
     ///
     /// Returns `true` if a row was removed, `false` if nothing was attached.
     /// Does not raise `NotFound` when the membership row is absent — callers
-    /// can treat detach as idempotent.
+    /// can treat detach as idempotent. Raises `NotFound` when the schedule
+    /// does not exist.
+    ///
+    /// Detaching the last database leaves a control-plane-only schedule when
+    /// the schedule includes the control plane. Without it the schedule
+    /// would back up nothing, so that detach is refused with
+    /// [`BackupError::ScheduleHasNoTargets`] and nothing changes.
     pub async fn detach_service_from_schedule(
         &self,
         schedule_id: i32,
         service_id: i32,
     ) -> Result<bool, BackupError> {
-        use sea_orm::EntityTrait;
+        use sea_orm::{EntityTrait, QuerySelect, TransactionTrait};
+
+        // Lock the schedule so a concurrent update or detach cannot pass the
+        // "still backs something up" check below at the same time as this one.
+        let txn = self.db.begin().await?;
+        let schedule = temps_entities::backup_schedules::Entity::find_by_id(schedule_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "BackupSchedule".to_string(),
+                detail: format!(
+                    "Backup schedule {schedule_id} not found while detaching service {service_id}"
+                ),
+            })?;
 
         let result = temps_entities::backup_schedule_services::Entity::delete_by_id((
             schedule_id,
             service_id,
         ))
-        .exec(self.db.as_ref())
+        .exec(&txn)
         .await
         .map_err(BackupError::Database)?;
+        let removed = result.rows_affected > 0;
 
-        Ok(result.rows_affected > 0)
+        // Detaching the last database is fine when the schedule still backs
+        // up the control plane (it becomes a control-plane-only schedule);
+        // without it the schedule would back up nothing, so refuse and roll
+        // the delete back.
+        if removed && !schedule.target_all_services && !schedule.include_control_plane {
+            let remaining = temps_entities::backup_schedule_services::Entity::find()
+                .filter(
+                    temps_entities::backup_schedule_services::Column::ScheduleId.eq(schedule_id),
+                )
+                .count(&txn)
+                .await?;
+            if remaining == 0 {
+                txn.rollback().await?;
+                return Err(BackupError::ScheduleHasNoTargets {
+                    schedule: format!("id {schedule_id}"),
+                    operation: format!("detach service {service_id} from"),
+                });
+            }
+        }
+
+        txn.commit().await?;
+        Ok(removed)
     }
 
     /// List the external services attached to a given schedule, ordered by
@@ -813,11 +857,10 @@ impl BackupService {
                 .await?
         };
         if !final_target_all && !final_include_cp && final_service_count == 0 {
-            return Err(BackupError::Validation(
-                "Schedule would have nothing to back up: select at least one specific database, \
-                 enable the control plane, or target all databases."
-                    .to_string(),
-            ));
+            return Err(BackupError::ScheduleHasNoTargets {
+                schedule: format!("id {id}"),
+                operation: "update".to_string(),
+            });
         }
 
         active.updated_at = Set(Utc::now());

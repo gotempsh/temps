@@ -141,6 +141,22 @@ pub enum BackupError {
         reason: String,
     },
 
+    /// A schedule would back up nothing: it targets neither all databases
+    /// nor any selected one, and it does not include the Temps control
+    /// plane. A schedule that includes only the control plane is valid.
+    /// Nothing was saved.
+    #[error(
+        "Cannot {operation} backup schedule {schedule}: it would back up nothing, because it \
+         includes no databases and does not include the Temps control plane. Turn on the \
+         control plane, select at least one database, or choose all databases"
+    )]
+    ScheduleHasNoTargets {
+        /// The schedule, as `'name'` on create and `id N` afterwards.
+        schedule: String,
+        /// What was attempted: `create`, `update` or `detach service N from`.
+        operation: String,
+    },
+
     #[error("Access denied to {resource}: {detail}")]
     Forbidden { resource: String, detail: String },
 

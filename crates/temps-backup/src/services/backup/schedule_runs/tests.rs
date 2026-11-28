@@ -337,11 +337,18 @@ async fn integration_fan_out_skips_control_plane_when_flag_off() {
         .expect("list");
     assert_eq!(after_attach.len(), 1);
 
-    // Flip-empty test: updating to include_control_plane=false with
-    // *no* attached services (we'll detach first) must fail.
-    svc.detach_service_from_schedule(schedule.id, svc_pg.id)
+    // Flip-empty test: neither detaching the only service nor clearing the
+    // selection may leave a schedule without the control plane and with no
+    // databases.
+    let err = svc
+        .detach_service_from_schedule(schedule.id, svc_pg.id)
         .await
-        .expect("detach");
+        .expect_err("detaching the only target must be rejected");
+    assert!(
+        matches!(err, BackupError::ScheduleHasNoTargets { .. }),
+        "expected ScheduleHasNoTargets, got {:?}",
+        err
+    );
     let err = svc
         .update_backup_schedule(
             schedule.id,
@@ -355,17 +362,27 @@ async fn integration_fan_out_skips_control_plane_when_flag_off() {
                 tags: None,
                 target_all_services: None,
                 include_control_plane: Some(false),
-                service_ids: None,
+                service_ids: Some(vec![]),
             },
             temps_core::BackupScheduleAuthority::InstanceAdmin,
         )
         .await
         .expect_err("empty fan-out must be rejected");
     assert!(
-        matches!(err, BackupError::Validation(ref msg) if msg.contains("nothing to back up")),
-        "expected Validation error, got {:?}",
+        matches!(err, BackupError::ScheduleHasNoTargets { ref operation, .. } if operation == "update"),
+        "expected ScheduleHasNoTargets, got {:?}",
         err
     );
+    assert_eq!(
+        svc.list_services_for_schedule(schedule.id)
+            .await
+            .expect("list")
+            .len(),
+        1,
+        "a refused change leaves the selection as it was"
+    );
+    // The cleanup below drops the schedule first, which cascades the
+    // membership.
 
     // Cleanup: schedule has no children, so the cascade can drop it.
     let _ = temps_entities::backup_schedules::Entity::delete_by_id(schedule.id)
@@ -519,6 +536,49 @@ async fn concurrent_triggers_start_exactly_one_run() {
         again,
         ScheduleRunOutcome::AlreadyInFlight { existing_run_id } if existing_run_id == started[0]
     ));
+}
+
+/// A schedule that backs up only the control plane runs as exactly one
+/// control-plane backup whose expected-services snapshot is empty, which is
+/// what lets the run publish as a complete recovery set with no databases.
+#[tokio::test]
+async fn control_plane_only_run_records_one_control_plane_backup() {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use temps_test_utils::TestDatabase;
+
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(d) => d,
+        Err(e) => {
+            println!("TestDatabase unavailable, skipping: {e}");
+            return;
+        }
+    };
+    let db = test_db.db.clone();
+    let schedule = insert_control_plane_schedule(db.as_ref()).await;
+    assert!(!schedule.target_all_services && schedule.include_control_plane);
+    let service = make_scope_test_service(db.clone());
+
+    let outcome = service
+        .enqueue_scheduled_run(&schedule, TriggerSource::Manual, None)
+        .await
+        .expect("a control-plane-only schedule has something to back up");
+    let ScheduleRunOutcome::Started { run_id, jobs } = outcome else {
+        panic!("expected a started run, got {outcome:?}");
+    };
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(jobs[0].engine, "control_plane");
+    assert_eq!(jobs[0].target_service_id, None);
+
+    let backups = temps_entities::backups::Entity::find()
+        .filter(temps_entities::backups::Column::ScheduleRunId.eq(Some(run_id)))
+        .all(db.as_ref())
+        .await
+        .expect("list run backups");
+    assert_eq!(backups.len(), 1);
+    let metadata: serde_json::Value =
+        serde_json::from_str(&backups[0].metadata).expect("control-plane metadata is JSON");
+    assert_eq!(metadata["engine"], "control_plane");
+    assert_eq!(metadata["expected_service_ids"], serde_json::json!([]));
 }
 
 /// An S3 source that names its backing service, so resolving it takes one

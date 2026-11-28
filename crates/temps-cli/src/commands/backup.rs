@@ -2407,6 +2407,18 @@ mod tests {
         assert!(error.to_string().contains("postgres-test"));
     }
 
+    /// A schedule that backs up only the control plane publishes a recovery
+    /// set with no external-service backups; that set is complete and
+    /// restorable, not an empty or partial one.
+    #[test]
+    fn recovery_set_with_only_the_control_plane_is_restorable() {
+        let mut value = metadata();
+        value.external_service_backups.clear();
+
+        BackupCommand::validate_recovery_set(&value, "recovery-uuid")
+            .expect("a control-plane-only recovery set is complete");
+    }
+
     #[test]
     fn recovery_set_rejects_metadata_identity_mismatch() {
         let value = metadata();
