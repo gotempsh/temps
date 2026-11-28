@@ -3702,6 +3702,56 @@ mod tests {
         test_db.cleanup_all_tables().await.ok();
     }
 
+    /// #2109: the two providers of one route deleted at the same time must not
+    /// both go (each counting the other as the route's remaining provider):
+    /// one is deleted, the other is refused, and the route keeps a provider.
+    #[tokio::test]
+    async fn concurrent_deletes_of_a_routes_two_providers_leave_it_one() {
+        let Some((test_db, state)) = console_flow_state().await else {
+            return;
+        };
+        let mut ids = Vec::new();
+        for name in ["first", "second"] {
+            let (_, created) = create_webhook(
+                &state,
+                serde_json::json!({"name": name, "config": {"url": "https://hooks.example.com/x"}}),
+            )
+            .await;
+            ids.push(created["id"].as_i64().expect("an id") as i32);
+        }
+        let route = state
+            .notification_routing_service
+            .create(CreateNotificationRoute {
+                name: "shared".to_string(),
+                enabled: true,
+                min_severity: "error".to_string(),
+                max_severity: "critical".to_string(),
+                provider_ids: ids.clone(),
+            })
+            .await
+            .expect("route should be created");
+
+        let service = state.notification_service.clone();
+        let (a, b) = tokio::join!(
+            service.delete_provider(ids[0]),
+            service.delete_provider(ids[1])
+        );
+        let deleted = [&a, &b].iter().filter(|r| matches!(r, Ok(true))).count();
+        let refused = [&a, &b]
+            .iter()
+            .filter(|r| matches!(r, Err(NotificationError::ProviderInUse { .. })))
+            .count();
+        assert_eq!((deleted, refused), (1, 1), "{a:?} / {b:?}");
+        let after = state
+            .notification_routing_service
+            .get(route.id)
+            .await
+            .expect("route should load");
+        assert_eq!(after.provider_ids.len(), 1, "the route keeps one provider");
+
+        test_db.cleanup_all_tables().await.ok();
+    }
+
     /// #2109: deleting a route's only provider used to leave the route enabled
     /// with `provider_ids: []`.
     #[tokio::test]

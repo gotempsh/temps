@@ -3335,6 +3335,13 @@ impl NotificationService {
     /// Routes (id, name) whose only provider is `provider_id`, other than the
     /// provider's own catch-all route, sorted by id. Three queries, whatever
     /// the number of routes.
+    ///
+    /// The routes using the provider are locked (in id order, so overlapping
+    /// deletes cannot deadlock) before their other providers are read. Two
+    /// providers of one route deleted at once would otherwise each count the
+    /// other as the route's remaining provider and both succeed, leaving the
+    /// route with none: with the lock, the second waits for the first to
+    /// commit, then reads the route without it and refuses (#2109).
     async fn routes_only_served_by<C: sea_orm::ConnectionTrait>(
         db: &C,
         provider_id: i32,
@@ -3352,6 +3359,17 @@ impl NotificationService {
             return Ok(Vec::new());
         }
 
+        let routes = notification_routes::Entity::find()
+            .filter(notification_routes::Column::Id.is_in(route_ids.iter().copied()))
+            .order_by_asc(notification_routes::Column::Id)
+            .lock_exclusive()
+            .all(db)
+            .await
+            .map_err(NotificationError::provider_database(
+                provider_id,
+                "lock the routes using",
+            ))?;
+
         let shared: std::collections::HashSet<i32> = notification_route_providers::Entity::find()
             .filter(notification_route_providers::Column::RouteId.is_in(route_ids.iter().copied()))
             .filter(notification_route_providers::Column::ProviderId.ne(provider_id))
@@ -3364,25 +3382,9 @@ impl NotificationService {
             .into_iter()
             .map(|assignment| assignment.route_id)
             .collect();
-        let only_this: Vec<i32> = route_ids
-            .into_iter()
-            .filter(|route_id| !shared.contains(route_id))
-            .collect();
-        if only_this.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let routes = notification_routes::Entity::find()
-            .filter(notification_routes::Column::Id.is_in(only_this))
-            .order_by_asc(notification_routes::Column::Id)
-            .all(db)
-            .await
-            .map_err(NotificationError::provider_database(
-                provider_id,
-                "load the routes served only by",
-            ))?;
         Ok(routes
             .into_iter()
+            .filter(|route| !shared.contains(&route.id))
             // Its catch-all route is deleted with it (ON DELETE CASCADE).
             .filter(|route| route.catch_all_provider_id != Some(provider_id))
             .map(|route| (route.id, route.name))
