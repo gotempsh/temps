@@ -9,8 +9,8 @@ use crate::routing::{
     RouteTestDelivery, RouteTestDeliveryStatus, UpdateNotificationRoute,
 };
 use crate::services::{
-    NotificationPreferences, NotificationPreferencesService, NotificationProviderCreateError,
-    NotificationProviderRevealError, NotificationService, TlsMode,
+    NotificationPreferences, NotificationPreferencesService, NotificationProviderConfigError,
+    NotificationProviderCreateError, NotificationProviderRevealError, NotificationService, TlsMode,
 };
 use crate::telegram::TELEGRAM_PROVIDER_TYPE;
 use axum::{
@@ -370,15 +370,23 @@ pub struct CreateNotificationEmailProviderRequest {
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateSlackProviderRequest {
+    /// New name; must not be empty or only whitespace.
     pub name: Option<String>,
-    pub config: SlackConfig,
+    /// Replacement config. Omit it to keep the stored one (for example to
+    /// rename or disable the provider). Send `***` for a masked secret to
+    /// keep its stored value.
+    pub config: Option<SlackConfig>,
     pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateNotificationEmailProviderRequest {
+    /// New name; must not be empty or only whitespace.
     pub name: Option<String>,
-    pub config: EmailConfig,
+    /// Replacement config. Omit it to keep the stored one (for example to
+    /// rename or disable the provider). Send `***` for a masked secret to
+    /// keep its stored value.
+    pub config: Option<EmailConfig>,
     pub enabled: Option<bool>,
 }
 
@@ -402,9 +410,9 @@ pub struct WebhookConfig {
     #[serde(default)]
     #[schema(example = json!({"Authorization": "Bearer your-token", "X-Custom-Header": "custom-value"}))]
     pub headers: std::collections::BTreeMap<String, SecretString>,
-    /// Request timeout in seconds. Defaults to 30.
+    /// Request timeout in seconds, from 1 to 120. Defaults to 30.
     #[serde(default = "default_timeout_secs")]
-    #[schema(example = 30)]
+    #[schema(example = 30, minimum = 1, maximum = 120)]
     pub timeout_secs: u64,
 }
 
@@ -443,8 +451,12 @@ pub struct CreateWebhookProviderRequest {
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateWebhookProviderRequest {
+    /// New name; must not be empty or only whitespace.
     pub name: Option<String>,
-    pub config: WebhookConfig,
+    /// Replacement config. Omit it to keep the stored one (for example to
+    /// rename or disable the provider). Send `***` for a masked secret to
+    /// keep its stored value.
+    pub config: Option<WebhookConfig>,
     pub enabled: Option<bool>,
 }
 
@@ -496,8 +508,12 @@ pub struct CreateCloudflareProviderRequest {
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateCloudflareProviderRequest {
+    /// New name; must not be empty or only whitespace.
     pub name: Option<String>,
-    pub config: CloudflareConfig,
+    /// Replacement config. Omit it to keep the stored one (for example to
+    /// rename or disable the provider). Send `***` for a masked secret to
+    /// keep its stored value.
+    pub config: Option<CloudflareConfig>,
     pub enabled: Option<bool>,
 }
 
@@ -565,8 +581,12 @@ pub struct CreateTelegramProviderRequest {
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateTelegramProviderRequest {
+    /// New name; must not be empty or only whitespace.
     pub name: Option<String>,
-    pub config: TelegramConfig,
+    /// Replacement config. Omit it to keep the stored one (for example to
+    /// rename or disable the provider). Send `***` for a masked secret to
+    /// keep its stored value.
+    pub config: Option<TelegramConfig>,
     pub enabled: Option<bool>,
 }
 
@@ -683,10 +703,7 @@ async fn get_notification_provider(
             };
             Ok((StatusCode::OK, Json(response)).into_response())
         }
-        Ok(None) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-            .title("Provider not found")
-            .detail("The requested notification provider does not exist")
-            .build()),
+        Ok(None) => Err(provider_not_found(id)),
         Err(e) => {
             error!("Failed to get notification provider {}: {}", id, e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -862,6 +879,38 @@ impl From<UpdateProviderRequest> for crate::services::UpdateProviderRequest {
     }
 }
 
+/// Problem type of a 404 for a notification provider ID that does not exist.
+pub const NOTIFICATION_PROVIDER_NOT_FOUND_PROBLEM_TYPE: &str =
+    "https://temps.sh/probs/notification-provider-not-found";
+/// Problem type of a typed endpoint called with another type's provider ID.
+pub const NOTIFICATION_PROVIDER_TYPE_MISMATCH_PROBLEM_TYPE: &str =
+    "https://temps.sh/probs/notification-provider-type-mismatch";
+/// Problem type of a provider delete that would leave routes with no provider.
+pub const NOTIFICATION_PROVIDER_IN_USE_PROBLEM_TYPE: &str =
+    "https://temps.sh/probs/notification-provider-in-use";
+/// Problem type of a provider config or name refused before it is stored.
+pub const INVALID_NOTIFICATION_PROVIDER_PROBLEM_TYPE: &str =
+    "https://temps.sh/probs/invalid-notification-provider";
+/// Problem type of a notification route request or lookup that failed.
+pub const NOTIFICATION_ROUTE_PROBLEM_TYPE: &str = "https://temps.sh/probs/notification-route";
+
+fn provider_not_found(provider_id: i32) -> Problem {
+    ErrorBuilder::new(StatusCode::NOT_FOUND)
+        .type_(NOTIFICATION_PROVIDER_NOT_FOUND_PROBLEM_TYPE)
+        .title("Notification Provider Not Found")
+        .detail(NotificationError::ProviderNotFound { provider_id }.to_string())
+        .value("provider_id", provider_id)
+        .build()
+}
+
+fn invalid_provider_config(error: &NotificationProviderConfigError) -> Problem {
+    ErrorBuilder::new(StatusCode::BAD_REQUEST)
+        .type_(INVALID_NOTIFICATION_PROVIDER_PROBLEM_TYPE)
+        .title("Invalid provider configuration")
+        .detail(error.to_string())
+        .build()
+}
+
 fn notification_provider_write_problem(error: &NotificationError, title: &'static str) -> Problem {
     if let NotificationError::ConfigMerge(validation_error) = error {
         return ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -869,19 +918,21 @@ fn notification_provider_write_problem(error: &NotificationError, title: &'stati
             .detail(validation_error.to_string())
             .build();
     }
-    if let NotificationError::ProviderTypeMismatch { .. } = error {
-        // From the type-specific endpoint's point of view there is no such
-        // provider; the detail names the type the ID actually belongs to.
-        return ErrorBuilder::new(StatusCode::NOT_FOUND)
-            .title("Provider not found")
+    if let NotificationError::ProviderTypeMismatch { actual, .. } = error {
+        // The ID exists but belongs to another type: refusing with 409 and
+        // the stored type says what to call instead, and nothing was written.
+        return ErrorBuilder::new(StatusCode::CONFLICT)
+            .type_(NOTIFICATION_PROVIDER_TYPE_MISMATCH_PROBLEM_TYPE)
+            .title("Notification Provider Type Mismatch")
             .detail(error.to_string())
+            .value("provider_type", actual.as_str())
             .build();
     }
+    if let NotificationError::ProviderNotFound { provider_id } = error {
+        return provider_not_found(*provider_id);
+    }
     if let NotificationError::InvalidProviderConfig(config_error) = error {
-        return ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("Invalid provider configuration")
-            .detail(config_error.to_string())
-            .build();
+        return invalid_provider_config(config_error);
     }
 
     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -896,10 +947,7 @@ fn notification_provider_create_problem(
 ) -> Problem {
     match error {
         NotificationProviderCreateError::InvalidConfig { source, .. } => {
-            ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                .title("Invalid provider configuration")
-                .detail(source.to_string())
-                .build()
+            invalid_provider_config(source)
         }
         NotificationProviderCreateError::Serialization { .. }
         | NotificationProviderCreateError::Encryption { .. }
@@ -979,10 +1027,7 @@ async fn update_notification_provider(
             };
             Ok((StatusCode::OK, Json(response)))
         }
-        Ok(None) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-            .title("Provider not found")
-            .detail("The requested notification provider does not exist")
-            .build()),
+        Ok(None) => Err(provider_not_found(id)),
         Err(e) => {
             error!("Failed to update notification provider {}: {}", id, e);
             Err(notification_provider_write_problem(
@@ -1000,6 +1045,7 @@ async fn update_notification_provider(
     responses(
         (status = 204, description = "Successfully deleted provider"),
         (status = 404, description = "Provider not found"),
+        (status = 409, description = "A route lists only this provider; deleting it would leave the route with none"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1032,10 +1078,15 @@ async fn delete_notification_provider(
 
             Ok(StatusCode::NO_CONTENT)
         }
-        Ok(false) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-            .title("Provider not found")
-            .detail("The requested notification provider does not exist")
-            .build()),
+        Ok(false) => Err(provider_not_found(id)),
+        Err(e @ NotificationError::ProviderInUse { .. }) => {
+            Err(ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_(NOTIFICATION_PROVIDER_IN_USE_PROBLEM_TYPE)
+                .title("Notification Provider In Use")
+                .detail(e.to_string())
+                .value("provider_id", id)
+                .build())
+        }
         Err(e) => {
             error!("Failed to delete notification provider {}: {}", id, e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -1093,19 +1144,19 @@ async fn test_notification_provider(
                 }),
             ))
         }
+        // A destination that refuses or cannot be reached is `Ok` with
+        // `success: false`; an error here is about the provider itself.
+        Err(NotificationError::ProviderNotFound { provider_id }) => {
+            Err(provider_not_found(provider_id))
+        }
         Err(e) => {
             error!("Failed to test notification provider {}: {}", id, e);
-            Ok((
-                if e.to_string().contains("not found") {
-                    StatusCode::NOT_FOUND
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                },
-                Json(TestProviderResponse {
-                    success: false,
-                    message: Some(format!("Test failed: {}", e)),
-                }),
-            ))
+            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Failed to test notification provider")
+                .detail(format!(
+                    "Notification provider {id} could not be loaded for the test: {e}"
+                ))
+                .build())
         }
     }
 }
@@ -1257,6 +1308,7 @@ async fn create_notification_email_provider(
         (status = 200, description = "Successfully updated Slack provider", body = NotificationProviderResponse),
         (status = 400, description = "Invalid minimum severity or provider configuration"),
         (status = 404, description = "Provider not found"),
+        (status = 409, description = "The provider is of another type; nothing was changed"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1276,15 +1328,14 @@ async fn update_slack_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersWrite);
     info!("Updating Slack notification provider {}", id);
-    let config = request.config.into_stored_value();
     let update_request = UpdateProviderRequest {
         name: request.name,
-        config: Some(config),
+        config: request.config.map(SlackConfig::into_stored_value),
         enabled: request.enabled,
     };
     match app_state
         .notification_service
-        .update_provider(id, update_request.into())
+        .update_provider_of_type(id, "slack", update_request.into())
         .await
     {
         Ok(Some(provider)) => {
@@ -1319,10 +1370,7 @@ async fn update_slack_provider(
             };
             Ok((StatusCode::OK, Json(response)))
         }
-        Ok(None) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-            .title("Provider not found")
-            .detail("The requested Slack notification provider does not exist")
-            .build()),
+        Ok(None) => Err(provider_not_found(id)),
         Err(e) => {
             error!("Failed to update Slack notification provider {}: {}", id, e);
             Err(notification_provider_write_problem(
@@ -1342,6 +1390,7 @@ async fn update_slack_provider(
         (status = 200, description = "Successfully updated Email provider", body = NotificationProviderResponse),
         (status = 400, description = "Invalid minimum severity or provider configuration"),
         (status = 404, description = "Provider not found"),
+        (status = 409, description = "The provider is of another type; nothing was changed"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1361,15 +1410,14 @@ async fn update_notification_email_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersWrite);
     info!("Updating Email notification provider {}", id);
-    let config = request.config.into_stored_value();
     let update_request = UpdateProviderRequest {
         name: request.name,
-        config: Some(config),
+        config: request.config.map(EmailConfig::into_stored_value),
         enabled: request.enabled,
     };
     match app_state
         .notification_service
-        .update_provider(id, update_request.into())
+        .update_provider_of_type(id, "email", update_request.into())
         .await
     {
         Ok(Some(provider)) => {
@@ -1404,10 +1452,7 @@ async fn update_notification_email_provider(
             };
             Ok((StatusCode::OK, Json(response)))
         }
-        Ok(None) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-            .title("Provider not found")
-            .detail("The requested Email notification provider does not exist")
-            .build()),
+        Ok(None) => Err(provider_not_found(id)),
         Err(e) => {
             error!("Failed to update Email notification provider {}: {}", id, e);
             Err(notification_provider_write_problem(
@@ -1447,23 +1492,8 @@ async fn create_webhook_provider(
     permission_guard!(auth, NotificationProvidersCreate);
     info!("Creating Webhook notification provider {}", request.name);
 
-    // Validate URL format
-    if !request.config.url.starts_with("http://") && !request.config.url.starts_with("https://") {
-        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("Invalid webhook URL")
-            .detail("Webhook URL must start with http:// or https://")
-            .build());
-    }
-
-    // Validate HTTP method
-    let method = request.config.method.to_uppercase();
-    if !["POST", "PUT", "PATCH"].contains(&method.as_str()) {
-        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("Invalid HTTP method")
-            .detail("HTTP method must be POST, PUT, or PATCH")
-            .build());
-    }
-
+    // URL (scheme, address, resolution), method and timeout are checked by
+    // the service with the rules delivery applies, on every create path.
     let enabled = request.enabled.unwrap_or(true);
     let config = request.config.into_stored_value();
     match app_state
@@ -1519,6 +1549,7 @@ async fn create_webhook_provider(
         (status = 200, description = "Successfully updated Webhook provider", body = NotificationProviderResponse),
         (status = 400, description = "Invalid minimum severity or provider configuration"),
         (status = 404, description = "Provider not found"),
+        (status = 409, description = "The provider is of another type; nothing was changed"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1539,35 +1570,16 @@ async fn update_webhook_provider(
     permission_guard!(auth, NotificationProvidersWrite);
     info!("Updating Webhook notification provider {}", id);
 
-    // Validate URL format
-    if request.config.url != "***"
-        && !request.config.url.starts_with("http://")
-        && !request.config.url.starts_with("https://")
-    {
-        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("Invalid webhook URL")
-            .detail("Webhook URL must start with http:// or https://")
-            .build());
-    }
-
-    // Validate HTTP method
-    let method = request.config.method.to_uppercase();
-    if !["POST", "PUT", "PATCH"].contains(&method.as_str()) {
-        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("Invalid HTTP method")
-            .detail("HTTP method must be POST, PUT, or PATCH")
-            .build());
-    }
-
-    let config = request.config.into_stored_value();
+    // URL, method and timeout are checked by the service after the masked
+    // values are merged, with the rules delivery applies.
     let update_request = UpdateProviderRequest {
         name: request.name,
-        config: Some(config),
+        config: request.config.map(WebhookConfig::into_stored_value),
         enabled: request.enabled,
     };
     match app_state
         .notification_service
-        .update_provider(id, update_request.into())
+        .update_provider_of_type(id, "webhook", update_request.into())
         .await
     {
         Ok(Some(provider)) => {
@@ -1602,10 +1614,7 @@ async fn update_webhook_provider(
             };
             Ok((StatusCode::OK, Json(response)))
         }
-        Ok(None) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-            .title("Provider not found")
-            .detail("The requested Webhook notification provider does not exist")
-            .build()),
+        Ok(None) => Err(provider_not_found(id)),
         Err(e) => {
             error!(
                 "Failed to update Webhook notification provider {}: {}",
@@ -1697,6 +1706,7 @@ async fn create_cloudflare_provider(
         (status = 200, description = "Successfully updated Cloudflare provider", body = NotificationProviderResponse),
         (status = 400, description = "Invalid minimum severity or provider configuration"),
         (status = 404, description = "Provider not found"),
+        (status = 409, description = "The provider is of another type; nothing was changed"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1716,15 +1726,14 @@ async fn update_cloudflare_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersWrite);
     info!("Updating Cloudflare notification provider {}", id);
-    let config = request.config.into_stored_value();
     let update_request = UpdateProviderRequest {
         name: request.name,
-        config: Some(config),
+        config: request.config.map(CloudflareConfig::into_stored_value),
         enabled: request.enabled,
     };
     match app_state
         .notification_service
-        .update_provider(id, update_request.into())
+        .update_provider_of_type(id, "cloudflare", update_request.into())
         .await
     {
         Ok(Some(provider)) => {
@@ -1759,10 +1768,7 @@ async fn update_cloudflare_provider(
             };
             Ok((StatusCode::OK, Json(response)))
         }
-        Ok(None) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-            .title("Provider not found")
-            .detail("The requested Cloudflare notification provider does not exist")
-            .build()),
+        Ok(None) => Err(provider_not_found(id)),
         Err(e) => {
             error!(
                 "Failed to update Cloudflare notification provider {}: {}",
@@ -1844,6 +1850,7 @@ async fn create_telegram_provider(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Provider not found"),
+        (status = 409, description = "The provider is of another type; nothing was changed"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1865,7 +1872,7 @@ async fn update_telegram_provider(
     info!("Updating Telegram notification provider {}", id);
     let update_request = UpdateProviderRequest {
         name: request.name,
-        config: Some(request.config.into_stored_value()),
+        config: request.config.map(TelegramConfig::into_stored_value),
         enabled: request.enabled,
     };
     let provider = app_state
@@ -1882,14 +1889,7 @@ async fn update_telegram_provider(
                 "Failed to update Telegram notification provider",
             )
         })?
-        .ok_or_else(|| {
-            ErrorBuilder::new(StatusCode::NOT_FOUND)
-                .title("Provider not found")
-                .detail(format!(
-                    "Telegram notification provider {id} does not exist"
-                ))
-                .build()
-        })?;
+        .ok_or_else(|| provider_not_found(id))?;
 
     let audit = NotificationProviderAudit {
         context: make_audit_context(&auth, &metadata),
@@ -2288,8 +2288,16 @@ pub struct TriggerDigestResponse {
 pub struct CreateNotificationRouteRequest {
     pub name: String,
     pub enabled: Option<bool>,
+    /// Lowest severity the route matches: debug, info, warning, error,
+    /// critical or emergency. Case-insensitive; stored lower-case.
+    #[schema(example = "error")]
     pub min_severity: String,
+    /// Highest severity the route matches, same values as `min_severity`.
+    /// Case-insensitive; stored lower-case.
+    #[schema(example = "critical")]
     pub max_severity: String,
+    /// Providers that receive the matching notifications; at least one.
+    /// Duplicates are ignored and the stored list is sorted.
     pub provider_ids: Vec<i32>,
 }
 
@@ -2297,8 +2305,14 @@ pub struct CreateNotificationRouteRequest {
 pub struct UpdateNotificationRouteRequest {
     pub name: Option<String>,
     pub enabled: Option<bool>,
+    /// Lowest severity the route matches: debug, info, warning, error,
+    /// critical or emergency. Case-insensitive; stored lower-case.
     pub min_severity: Option<String>,
+    /// Highest severity the route matches, same values as `min_severity`.
+    /// Case-insensitive; stored lower-case.
     pub max_severity: Option<String>,
+    /// Replacement provider list; at least one when given. Duplicates are
+    /// ignored and the stored list is sorted.
     pub provider_ids: Option<Vec<i32>>,
 }
 
@@ -2339,6 +2353,7 @@ fn notification_route_problem(error: NotificationRouteError) -> Problem {
         error.to_string()
     };
     ErrorBuilder::new(status)
+        .type_(NOTIFICATION_ROUTE_PROBLEM_TYPE)
         .title(title)
         .detail(detail)
         .build()
@@ -2801,8 +2816,7 @@ mod tests {
             Extension(test_request_metadata()),
         )
         .await
-        .expect("the endpoint reports failures in its body")
-        .into_response();
+        .map_or_else(IntoResponse::into_response, IntoResponse::into_response);
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
@@ -2821,11 +2835,12 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["success"], false);
         assert_eq!(
-            body["message"],
-            "Test failed: Notification provider with ID 9 not found"
+            body["type"],
+            "https://temps.sh/probs/notification-provider-not-found"
         );
+        assert_eq!(body["provider_id"], 9);
+        assert_eq!(body["detail"], "Notification provider with ID 9 not found");
     }
 
     #[tokio::test]
@@ -2836,10 +2851,12 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            body["message"],
-            "Test failed: Failed to load the configuration for notification provider 9: \
-             Custom Error: connection lost"
+        assert_eq!(body["title"], "Failed to test notification provider");
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("notification provider 9")),
+            "{body}"
         );
     }
 
@@ -3375,6 +3392,423 @@ mod tests {
         test_db.cleanup_all_tables().await.ok();
     }
 
+    /// Status and JSON body of a handler result, success or problem.
+    async fn outcome<R: IntoResponse>(
+        result: Result<R, Problem>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = match result {
+            Ok(response) => response.into_response(),
+            Err(problem) => problem.into_response(),
+        };
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let json = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("body should be JSON")
+        };
+        (status, json)
+    }
+
+    async fn create_webhook(
+        state: &Arc<NotificationState>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let request: CreateWebhookProviderRequest =
+            serde_json::from_value(body).expect("create request should parse");
+        outcome(
+            create_webhook_provider(
+                State(state.clone()),
+                RequireAuth(test_auth_context()),
+                Extension(test_request_metadata()),
+                Json(request),
+            )
+            .await,
+        )
+        .await
+    }
+
+    async fn create_slack(
+        state: &Arc<NotificationState>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let request: CreateSlackProviderRequest =
+            serde_json::from_value(body).expect("create request should parse");
+        outcome(
+            create_slack_provider(
+                State(state.clone()),
+                RequireAuth(test_auth_context()),
+                Extension(test_request_metadata()),
+                Json(request),
+            )
+            .await,
+        )
+        .await
+    }
+
+    /// #2099: `PUT /notification-providers/slack/{id}` on a webhook provider
+    /// used to store a Slack config on it.
+    #[tokio::test]
+    async fn a_typed_update_of_another_types_provider_is_a_conflict_and_changes_nothing() {
+        let Some((test_db, state)) = console_flow_state().await else {
+            return;
+        };
+        let (status, created) = create_webhook(
+            &state,
+            serde_json::json!({"name": "ops", "config": {"url": "https://hooks.example.com/n"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"].as_i64().expect("an id") as i32;
+
+        let request: UpdateSlackProviderRequest = serde_json::from_value(serde_json::json!({
+            "name": "x",
+            "config": {"webhook_url": "https://hooks.slack.com/services/T000/B000/XXXX"}
+        }))
+        .expect("update request should parse");
+        let (status, problem) = outcome(
+            update_slack_provider(
+                State(state.clone()),
+                Path(id),
+                RequireAuth(test_auth_context()),
+                Extension(test_request_metadata()),
+                Json(request),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+        assert_eq!(
+            problem["type"],
+            NOTIFICATION_PROVIDER_TYPE_MISMATCH_PROBLEM_TYPE
+        );
+        assert_eq!(problem["provider_type"], "webhook");
+        assert!(
+            problem["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("'webhook'")),
+            "{problem}"
+        );
+
+        let stored = read_back_provider(&state, id).await;
+        assert_eq!(stored["name"], "ops");
+        assert_eq!(stored["provider_type"], "webhook");
+        assert_eq!(
+            revealed(&state, id, "url").await,
+            "https://hooks.example.com/n"
+        );
+        assert!(stored["config"].get("webhook_url").is_none(), "{stored}");
+
+        // A partial update (only the name) keeps the stored config.
+        let request: UpdateWebhookProviderRequest =
+            serde_json::from_value(serde_json::json!({"name": "renamed"}))
+                .expect("a name-only update should parse");
+        let (status, renamed) = outcome(
+            update_webhook_provider(
+                State(state.clone()),
+                Path(id),
+                RequireAuth(test_auth_context()),
+                Extension(test_request_metadata()),
+                Json(request),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{renamed}");
+        assert_eq!(renamed["name"], "renamed");
+        assert_eq!(
+            revealed(&state, id, "url").await,
+            "https://hooks.example.com/n"
+        );
+
+        test_db.cleanup_all_tables().await.ok();
+    }
+
+    /// #2099 and #2108: configs that could never deliver, and blank names, are
+    /// refused when saved instead of failing (or misbehaving) at send time.
+    #[tokio::test]
+    async fn provider_configs_and_names_are_validated_when_saved() {
+        let Some((test_db, state)) = console_flow_state().await else {
+            return;
+        };
+        for (config, expected) in [
+            (
+                serde_json::json!({"url": "http://127.0.0.1:9/"}),
+                "Loopback addresses are not allowed",
+            ),
+            (
+                serde_json::json!({"url": "https://hooks.example.com/x", "timeout_secs": 0}),
+                "between 1 and 120",
+            ),
+            (
+                serde_json::json!({"url": "https://hooks.example.com/x", "timeout_secs": 999999}),
+                "between 1 and 120",
+            ),
+            (
+                serde_json::json!({"url": "https://hooks.example.com/x", "method": "GET"}),
+                "method 'GET'",
+            ),
+        ] {
+            let (status, problem) = create_webhook(
+                &state,
+                serde_json::json!({"name": "hook", "config": config}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{config}: {problem}");
+            assert_eq!(problem["type"], INVALID_NOTIFICATION_PROVIDER_PROBLEM_TYPE);
+            assert!(
+                problem["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains(expected)),
+                "{config}: {problem}"
+            );
+        }
+
+        let (status, problem) = create_slack(
+            &state,
+            serde_json::json!({"name": "slack", "config": {"webhook_url": "https://example.com/not-slack"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+        assert!(
+            problem["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("https://hooks.slack.com/")),
+            "{problem}"
+        );
+
+        for name in ["", "   "] {
+            let (status, problem) = create_webhook(
+                &state,
+                serde_json::json!({"name": name, "config": {"url": "https://hooks.example.com/x"}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?}: {problem}");
+        }
+        assert!(
+            state
+                .notification_service
+                .list_providers()
+                .await
+                .expect("providers should list")
+                .is_empty(),
+            "nothing refused may be stored"
+        );
+
+        // A blank rename is refused too, and the bounds hold on update.
+        let (_, created) = create_webhook(
+            &state,
+            serde_json::json!({"name": "hook", "config": {"url": "https://hooks.example.com/x"}}),
+        )
+        .await;
+        let id = created["id"].as_i64().expect("an id") as i32;
+        for body in [
+            serde_json::json!({"name": " "}),
+            serde_json::json!({"config": {"url": "***", "timeout_secs": 0}}),
+        ] {
+            let request: UpdateWebhookProviderRequest =
+                serde_json::from_value(body.clone()).expect("update request should parse");
+            let (status, problem) = outcome(
+                update_webhook_provider(
+                    State(state.clone()),
+                    Path(id),
+                    RequireAuth(test_auth_context()),
+                    Extension(test_request_metadata()),
+                    Json(request),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {problem}");
+        }
+        let stored = read_back_provider(&state, id).await;
+        assert_eq!(stored["name"], "hook");
+        assert_eq!(stored["config"]["timeout_secs"], 30);
+
+        test_db.cleanup_all_tables().await.ok();
+    }
+
+    /// #2108: a missing provider is a typed 404 that names the ID, and a test
+    /// delivery to a destination that cannot be reached is a test result.
+    #[tokio::test]
+    async fn a_missing_provider_is_named_and_an_unreachable_destination_is_a_test_result() {
+        let Some((test_db, state)) = console_flow_state().await else {
+            return;
+        };
+        let (status, problem) = outcome(
+            get_notification_provider(
+                State(state.clone()),
+                Path(999_999),
+                RequireAuth(test_auth_context()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            problem["type"],
+            NOTIFICATION_PROVIDER_NOT_FOUND_PROBLEM_TYPE
+        );
+        assert_eq!(problem["provider_id"], 999_999);
+        assert!(
+            problem["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("999999")),
+            "{problem}"
+        );
+
+        // `.invalid` never resolves (RFC 6761), with or without a network.
+        let (status, created) = create_webhook(
+            &state,
+            serde_json::json!({"name": "nores", "config": {"url": "https://unresolvable.invalid/x"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"].as_i64().expect("an id") as i32;
+        let (status, result) = outcome(
+            test_notification_provider(
+                State(state.clone()),
+                Path(id),
+                RequireAuth(test_auth_context()),
+                Extension(test_request_metadata()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["success"], false);
+        assert!(
+            result["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("not delivered")),
+            "{result}"
+        );
+
+        let (status, problem) = outcome(
+            test_notification_provider(
+                State(state.clone()),
+                Path(999_999),
+                RequireAuth(test_auth_context()),
+                Extension(test_request_metadata()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{problem}");
+        assert_eq!(problem["provider_id"], 999_999);
+
+        test_db.cleanup_all_tables().await.ok();
+    }
+
+    /// #2109: deleting a route's only provider used to leave the route enabled
+    /// with `provider_ids: []`.
+    #[tokio::test]
+    async fn deleting_a_routes_only_provider_is_refused_and_names_the_route() {
+        let Some((test_db, state)) = console_flow_state().await else {
+            return;
+        };
+        let (_, first) = create_webhook(
+            &state,
+            serde_json::json!({"name": "ops", "config": {"url": "https://hooks.example.com/x"}}),
+        )
+        .await;
+        let first = first["id"].as_i64().expect("an id") as i32;
+        let route = state
+            .notification_routing_service
+            .create(CreateNotificationRoute {
+                name: "critical".to_string(),
+                enabled: true,
+                min_severity: "error".to_string(),
+                max_severity: "critical".to_string(),
+                provider_ids: vec![first],
+            })
+            .await
+            .expect("route should be created");
+
+        let delete = |id: i32| {
+            let state = state.clone();
+            async move {
+                outcome(
+                    delete_notification_provider(
+                        State(state),
+                        Path(id),
+                        RequireAuth(test_auth_context()),
+                        Extension(test_request_metadata()),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+
+        let (status, problem) = delete(first).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+        assert_eq!(problem["type"], NOTIFICATION_PROVIDER_IN_USE_PROBLEM_TYPE);
+        let detail = problem["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains(&format!("{} 'critical'", route.id)),
+            "{problem}"
+        );
+        assert!(
+            !detail.contains("All notifications"),
+            "its own catch-all route goes with it and is not in the way: {problem}"
+        );
+        let kept = state
+            .notification_routing_service
+            .get(route.id)
+            .await
+            .expect("route should load");
+        assert_eq!(kept.provider_ids, vec![first]);
+
+        // With a second provider on the route the delete goes through and
+        // the route keeps the other one.
+        let (_, second) = create_webhook(
+            &state,
+            serde_json::json!({"name": "backup", "config": {"url": "https://hooks.example.com/y"}}),
+        )
+        .await;
+        let second = second["id"].as_i64().expect("an id") as i32;
+        state
+            .notification_routing_service
+            .update(
+                route.id,
+                UpdateNotificationRoute {
+                    provider_ids: Some(vec![first, second]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("route should be updated");
+        let (status, body) = delete(first).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let after = state
+            .notification_routing_service
+            .get(route.id)
+            .await
+            .expect("route should load");
+        assert_eq!(after.provider_ids, vec![second]);
+
+        let (status, problem) = delete(first).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{problem}");
+        assert_eq!(problem["provider_id"], first);
+
+        test_db.cleanup_all_tables().await.ok();
+    }
+
+    /// #2109: route problems carry a problem type, never `""`.
+    #[tokio::test]
+    async fn route_problems_have_a_type() {
+        let (status, problem) = outcome::<StatusCode>(Err(notification_route_problem(
+            NotificationRouteError::RouteNotFound { route_id: 999_999 },
+        )))
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(problem["type"], NOTIFICATION_ROUTE_PROBLEM_TYPE);
+        assert!(problem.get("instance").is_none(), "{problem}");
+    }
+
     struct TestSetup {
         pub test_db: TestDatabase,
         #[allow(dead_code)] // held so the container is stopped on drop
@@ -3686,12 +4120,12 @@ mod tests {
 
         let request_body = UpdateSlackProviderRequest {
             name: Some("Updated Slack Provider".to_string()),
-            config: SlackConfig {
+            config: Some(SlackConfig {
                 webhook_url: "https://hooks.slack.com/services/UPDATED/WEBHOOK/URL"
                     .to_string()
                     .into(),
                 channel: Some("#updated-channel".to_string()),
-            },
+            }),
             enabled: Some(false),
         };
 
@@ -3705,7 +4139,7 @@ mod tests {
             .body(Body::from(
                 serde_json::json!({
                     "name": request_body.name,
-                    "config": request_body.config.into_stored_value(),
+                    "config": request_body.config.map(|config| config.into_stored_value()),
                     "enabled": request_body.enabled,
                 })
                 .to_string(),
@@ -3725,7 +4159,7 @@ mod tests {
 
         let request_body = UpdateNotificationEmailProviderRequest {
             name: Some("Updated Email Provider".to_string()),
-            config: EmailConfig {
+            config: Some(EmailConfig {
                 smtp_host: "updated-smtp.example.com".to_string(),
                 smtp_port: 587,
                 username: "updated@example.com".to_string(),
@@ -3736,7 +4170,7 @@ mod tests {
                 tls_mode: TlsMode::Starttls,
                 starttls_required: true,
                 accept_invalid_certs: false,
-            },
+            }),
             enabled: Some(false),
         };
 
@@ -3750,7 +4184,7 @@ mod tests {
             .body(Body::from(
                 serde_json::json!({
                     "name": request_body.name,
-                    "config": request_body.config.into_stored_value(),
+                    "config": request_body.config.map(|config| config.into_stored_value()),
                     "enabled": request_body.enabled,
                 })
                 .to_string(),
