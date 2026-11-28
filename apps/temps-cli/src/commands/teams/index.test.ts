@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
-import { parseRole, resolveProjectId, resolveTeamId, resolveUserId, slugify } from './index.js'
+import { buildTeamUpdateBody, parseRole, resolveProjectId, resolveTeamId, resolveUserId, slugify } from './index.js'
 
 describe('slugify', () => {
   test('lowercases and replaces non-alphanumeric runs with a single dash', () => {
@@ -17,6 +17,19 @@ describe('slugify', () => {
   test('truncates to 64 characters', () => {
     const long = 'a'.repeat(100)
     expect(slugify(long).length).toBe(64)
+  })
+})
+
+describe('buildTeamUpdateBody', () => {
+  test('a rename leaves the description out, so the stored one is kept', () => {
+    expect(buildTeamUpdateBody({ name: 'Platform' })).toEqual({ name: 'Platform' })
+  })
+
+  test('an explicit description is sent, and an empty one clears it', () => {
+    expect(buildTeamUpdateBody({ description: 'Runs the platform' })).toEqual({
+      description: 'Runs the platform',
+    })
+    expect(buildTeamUpdateBody({ description: '' })).toEqual({ description: '' })
   })
 })
 

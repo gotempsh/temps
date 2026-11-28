@@ -283,6 +283,21 @@ async function promptRole(message: string): Promise<TeamRole> {
   })) as TeamRole
 }
 
+/**
+ * The body of a team update: only what was asked for. The API keeps an
+ * absent description and clears it on `null` or `""`, so a rename must not
+ * send `description: null`.
+ */
+export function buildTeamUpdateBody(options: {
+  name?: string
+  description?: string
+}): { name?: string; description?: string } {
+  return {
+    ...(options.name ? { name: options.name } : {}),
+    ...(options.description !== undefined ? { description: options.description } : {}),
+  }
+}
+
 export function slugify(name: string): string {
   return name
     .toLowerCase()
@@ -448,7 +463,7 @@ async function updateTeamAction(
     const { data, error } = await updateTeam({
       client,
       path: { team_id: teamId },
-      body: { name: options.name ?? null, description: options.description ?? null }
+      body: buildTeamUpdateBody(options)
     })
     if (error) {
       throw new Error(getErrorMessage(error))
