@@ -99,7 +99,16 @@ bunx --bun @temps-sdk/cli plugin add --image <registry>/<repository>@sha256:<dig
 It creates the service, deploys the image like `temps deploy:image`, waits for it to be
 live and adds it. A tag works too, but only a digest is exactly what was reviewed. To
 release a new version run the same command with `--project <service>` and the new image:
-it waits for an administrator's approval.
+it waits for an administrator's approval. The console's **Settings → Plugins → Add
+plugin** takes an image and does the same in one step.
+
+While developing, no registry is needed: `plugin add --build` builds the Dockerfile in
+the current directory and uploads the image, and `plugin add --local-image <image>`
+uploads one the local Docker already has.
+
+Temps records the content each image resolved to and lists it with the image, so a tag
+that was moved shows as the same reference with other content. A running plugin never
+follows a moved tag; deploying it again is an update that waits.
 
 Alternatively deploy the repository like any app (a public repository needs no
 GitHub credential; for a nested plugin set the service's root directory to the plugin
@@ -164,6 +173,13 @@ screenshots relative to the plugin directory at a pinned source commit. Catalogs
 with subdirectories require schema version 2; older hosts reject them. Catalog
 installation pins the reviewed commit even when the listing tracks a moving branch. Run the catalog repository's documented validation
 and include install/runtime evidence in the PR.
+
+A generated catalog entry may also carry `image`: the image published for the listed
+version, named by digest (`<registry>/<repository>@sha256:<digest>`, an optional tag
+before the `@`). A host that supports it adds the plugin from that image in one step and
+keeps the link to the source; an image named only by a tag makes the catalog invalid.
+It requires schema version 2. Check the catalog repository's contribution guide for how
+its generator takes the image; do not hand-edit the generated file.
 
 Catalog validation installs dependencies without lifecycle scripts and compiles in a capped
 offline container after dependency resolution. A build-validation pass is not a runtime

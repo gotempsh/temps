@@ -58,10 +58,13 @@ temps plugin add --image registry.example.com/acme/my-plugin:1.0.0
 
 That creates the service, deploys the image the way `temps deploy:image` does and
 adds it as a plugin. Run it again with `--project <service>` and a new image to
-deploy an update, which waits for an administrator's approval. A service that is
-already deployed, from an image or from a repository, is added under
-**Settings > Plugins > Add plugin** (or `temps plugin add-service --project <id>
---environment <id>`). Logs, previews, rollback, resource limits and idle stop
+deploy an update, which waits for an administrator's approval. While developing,
+`temps plugin add --build` builds the Dockerfile in the current directory and
+uploads the image, and `temps plugin add --local-image <image>` uploads one your
+Docker already has; neither needs a registry. In the console, **Settings >
+Plugins > Add plugin** takes an image and does the same in one step, or adds a
+service that is already deployed, from an image or from a repository (`temps
+plugin add-service --project <id> --environment <id>`). Logs, previews, rollback, resource limits and idle stop
 are the service's own.
 
 `runPlugin` needs no configuration for this. Started without `--socket-path`, it
