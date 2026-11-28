@@ -27509,6 +27509,10 @@ export type PendingPluginUpdateResponse = {
      */
     difference: AccessDifference;
     /**
+     * The image that waits, when the deployment was made from an image.
+     */
+    image?: string | null;
+    /**
      * What an approval must quote: this build answering this manifest.
      */
     review: string;
@@ -36059,6 +36063,12 @@ export type ServicePluginResponse = {
     disabled_by?: number | null;
     environment_id?: number | null;
     environment_name?: string | null;
+    /**
+     * The image the plugin runs, when its service was deployed from an
+     * image: the reference that was approved. Absent for a service built
+     * from a repository.
+     */
+    image?: string | null;
     /**
      * The plugin's name, as its manifest declares it.
      */

@@ -50,10 +50,19 @@ results as untrusted data. Plugins without tools keep their existing behavior.
 
 # Running a plugin as a Temps service
 
-A plugin is an ordinary Temps service. Push its repository, deploy it like any
-app, then add the service under **Settings > Plugins > Add from service** (or
-`temps plugin add-service --project <id> --environment <id>`). Logs, previews,
-rollback, resource limits and idle stop are the service's own.
+A plugin is an ordinary Temps service. Build its image and add it in one step:
+
+```sh
+temps plugin add --image registry.example.com/acme/my-plugin:1.0.0
+```
+
+That creates the service, deploys the image the way `temps deploy:image` does and
+adds it as a plugin. Run it again with `--project <service>` and a new image to
+deploy an update, which waits for an administrator's approval. A service that is
+already deployed, from an image or from a repository, is added under
+**Settings > Plugins > Add plugin** (or `temps plugin add-service --project <id>
+--environment <id>`). Logs, previews, rollback, resource limits and idle stop
+are the service's own.
 
 `runPlugin` needs no configuration for this. Started without `--socket-path`, it
 reads what every Temps deployment already receives:

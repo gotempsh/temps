@@ -73,6 +73,12 @@ export function servicePluginStoragePath(
     : undefined
 }
 
+/**
+ * The one command that adds a plugin from its image: it creates the service,
+ * deploys the image and adds it. The same command deploys an update.
+ */
+export const PLUGIN_IMAGE_COMMAND = 'temps plugin add --image <image>'
+
 /** Where the limits of a plugin's service are changed. */
 export function servicePluginLimitsPath(
   plugin: ServicePluginResponse

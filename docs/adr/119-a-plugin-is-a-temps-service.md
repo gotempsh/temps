@@ -62,7 +62,7 @@ Removing a plugin revokes its actor and its grants and stops routing to it. The 
 
 ### D7. Surfaces
 
-`GET /x/plugins/services` lists service plugins with their state and is the capability endpoint (`configured`, `reason`, `setup_path`). `POST /x/plugins/services` adds one; it requires `SystemAdmin` and recent sensitive-action verification, and is audit-logged before Temps connects and with its outcome. `POST /x/plugins/{name}/uninstall` removes one. The console has **Add from service** on Settings > Plugins and shows each plugin's state and service; the CLI has `temps plugin services`, `temps plugin add-service` and `temps plugin remove`.
+`GET /x/plugins/services` lists service plugins with their state and is the capability endpoint (`configured`, `reason`, `setup_path`). `POST /x/plugins/services` adds one; it requires `SystemAdmin` and recent sensitive-action verification, and is audit-logged before Temps connects and with its outcome. `POST /x/plugins/{name}/uninstall` removes one. The console has **Add plugin** on Settings > Plugins and shows each plugin's state and service; the CLI has `temps plugin add --image`, `temps plugin services`, `temps plugin add-service` and `temps plugin remove`.
 
 The catalogue on Settings > Plugins is a list of repositories. Each listing links to its source at the listed commit and to the new-service flow with the repository filled in; nothing is installed from it.
 

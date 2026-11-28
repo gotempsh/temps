@@ -16,6 +16,7 @@ import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CopyButton } from '@/components/ui/copy-button'
 import {
   Dialog,
   DialogContent,
@@ -30,6 +31,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useDebounce } from '@/hooks/useDebounce'
 import { useAddServicePlugin } from '@/hooks/usePlugins'
 import {
+  PLUGIN_IMAGE_COMMAND,
   addServiceFailure,
   pluginTierSummary,
   servicePluginPath,
@@ -71,6 +73,36 @@ export function PluginTierBadge({ plugin }: { plugin: ServicePluginResponse }) {
     <Badge variant="outline" title={summary.detail}>
       {summary.label}
     </Badge>
+  )
+}
+
+/**
+ * The preferred way to add a plugin: one command that deploys its image as a
+ * service and adds it. Shown wherever a plugin is added, so it is found
+ * without the documentation.
+ */
+export function PluginFromImage() {
+  return (
+    <div className="space-y-2 rounded-lg border p-3 text-left text-sm">
+      <p className="font-medium">From an image</p>
+      <p className="text-muted-foreground">
+        One command creates the service, deploys the plugin&apos;s image and
+        adds it. Run it again with a new image to deploy an update, which waits
+        for your approval.
+      </p>
+      <div className="flex min-w-0 items-center gap-2">
+        <code className="min-w-0 flex-1 rounded bg-muted px-2 py-1 text-xs [overflow-wrap:anywhere]">
+          {PLUGIN_IMAGE_COMMAND}
+        </code>
+        <CopyButton
+          value={PLUGIN_IMAGE_COMMAND}
+          label="Copy the command that adds a plugin from an image"
+          className="h-8 shrink-0 rounded-md border bg-background px-3"
+        >
+          Copy command
+        </CopyButton>
+      </div>
+    </div>
   )
 }
 
@@ -369,13 +401,14 @@ export function AddServicePluginDialog({
     >
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Add a plugin from a service</DialogTitle>
+          <DialogTitle>Add a plugin</DialogTitle>
           <DialogDescription>
-            A plugin is an ordinary service built with the Temps plugin SDK.
-            Deploy it like any app, then choose it here. It starts with no
-            permissions.
+            A plugin is an ordinary service built with the Temps plugin SDK. It
+            starts with no permissions.
           </DialogDescription>
         </DialogHeader>
+        <PluginFromImage />
+        <p className="text-sm font-medium">From a service that is deployed</p>
         {!configured && (
           <Alert>
             <Info className="size-4" />
@@ -500,7 +533,7 @@ export function ServiceChoice({
       ) : services.length === 0 ? (
         <p className="text-sm text-muted-foreground">
           {search.trim() === ''
-            ? 'No services yet. Deploy the plugin as a service first.'
+            ? "No services yet. Deploy the plugin's image first."
             : 'No service matches that search.'}
         </p>
       ) : (

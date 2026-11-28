@@ -24,6 +24,8 @@ export interface PendingPluginUpdate {
   /** What an approval must quote: this build answering this manifest. */
   review: string;
   since?: string | null;
+  /** The image that waits, when the deployment was made from an image. */
+  image?: string | null;
   difference: AccessDifference;
 }
 
@@ -59,6 +61,8 @@ export interface ServicePlugin {
   disabled_by?: number | null;
   /** The limits the plugin's container runs with: those of its service. */
   resource_limits?: PluginResourceLimits | null;
+  /** The image the plugin runs, when its service was deployed from one. */
+  image?: string | null;
 }
 
 /** A plugin an earlier version installed as an executable; it never runs. */

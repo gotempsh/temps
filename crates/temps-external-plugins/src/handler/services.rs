@@ -62,6 +62,12 @@ pub struct ServicePluginResponse {
     /// of the deployment its service runs. Absent before it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<PluginResourceLimitsResponse>,
+    /// The image the plugin runs, when its service was deployed from an
+    /// image: the reference that was approved. Absent for a service built
+    /// from a repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "registry.example.com/acme/reports:1.2.0")]
+    pub image: Option<String>,
 }
 
 /// The limits a plugin's container runs with. They are the limits of its
@@ -108,6 +114,7 @@ impl From<ServicePluginView> for ServicePluginResponse {
             disabled_at: view.disabled_at,
             disabled_by: view.disabled_by,
             resource_limits: view.resource_limits.map(Into::into),
+            image: view.image,
         }
     }
 }

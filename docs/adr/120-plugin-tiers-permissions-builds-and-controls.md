@@ -80,6 +80,17 @@ Once a plugin runs, an administrator needs to stop it faster than they can inves
 - **Limits.** A plugin's container is its service's container, so its memory and CPU limits are the service's (`deployment_config` on the environment, snapshotted on each deployment and applied by the deployer). They are per plugin because each plugin is its own service, they are rows, and changing them is audited by the existing write path. The list of plugins reports, for each one, the limits of the deployment it is attached or pinned to, and says so when memory is not capped.
 - **Trail.** Each delegated call that changes something and reaches the platform's handler writes `EXTERNAL_PLUGIN_CHANGE_MADE` (the handler answered 2xx) or `EXTERNAL_PLUGIN_CHANGE_REFUSED` (anything else). The entry belongs to the acting user (`user_id`) and names the plugin actor, the method, the path and the status. Before this, the handler's own entry named the user and not the plugin, and the channel's entries named the plugin and no user. A change refused before it reaches a handler (missing permission, outside the write scope) has no acting user and stays recorded as denied to the plugin.
 
+### D7. An image is the preferred way to add and update a plugin
+
+A plugin is a service, and a service can be deployed from an image as well as built from a repository. Attaching reads only the environment's current deployment and its container, so a service deployed from an image is a plugin on the same terms: it receives the deployment token like any deployment, is pinned to the deployment that runs, and a new image is an update that waits.
+
+The image is the preferred route because it is the unit an administrator can review and pin. What runs is what was published, with nothing built on the server from a repository's default branch; an image named by digest cannot change after it was reviewed; and a release is one reference to pass around.
+
+- `temps plugin add --image <image>` creates a service for the image, deploys it through the same `deploy/image` operation as `temps deploy:image`, waits for it to be live and adds it as a plugin. It never deploys over an existing service that only shares the image's name; that takes `--project`.
+- The same command with `--project <service>` deploys a new image to a service that already is a plugin. It adds nothing: the deployment is an update, and the command prints what waits and how to approve it.
+- The list of plugins names the image a plugin runs (`image`) and the image that waits (`pending_update.image`), so the review of an update compares two references and not only two deployment numbers.
+- The console leads with the command wherever a plugin is added, and **Add plugin** still adds a service that is already deployed, from an image or from a repository.
+
 ## Decisions taken without a precedent in the code
 
 These were chosen conservatively and are for the owner to confirm:
@@ -103,3 +114,7 @@ These were chosen conservatively and are for the owner to confirm:
 17. **Resource limits are the service's, with its existing defaults**: 512 MB of memory for a new service and no CPU limit. No stricter default is applied because a service is a plugin, and no plugin-specific limit columns were added, since two sources for one container's limits would disagree.
 18. **There is no rate limit on a plugin's calls to Temps.** The channel protocol has no error a plugin could tell apart from a failure, so adding one changes the wire contract. Calls are bounded today by the plugin's permissions, the write scope and the AI call quota.
 19. **The change entry is written after the call, best effort.** A change that went through and whose entry could not be written is logged as an error and not undone; the entry written before the call (`EXTERNAL_PLUGIN_HOST_OPERATION_ALLOWED`) is still required, and the call is not made without it.
+20. **A tag is accepted and warned about, not refused.** The CLI says that a tag can be moved and recommends a digest. Refusing tags would make the first deployment of most published images fail.
+21. **The pin stays the deployment, not the image digest.** A registry image's digest is recorded only when the registry reports one, so the deployment is what every build has. A consequence that was not verified end to end: whether restarting or waking a deployment made from a tag can pick up content that tag was moved to on the same host. A digest reference rules it out.
+22. **The one-step command is in the CLI only.** The console adds a service that is already deployed; creating the service, deploying an image and adding it from one console form is not built.
+23. **The catalogue still lists repositories.** Its format has no image field, so a listing cannot offer its image yet; that is a change to the catalogue's format.

@@ -45,8 +45,9 @@ export function PluginPinnedBuild({
 }) {
   if (plugin.pinned_deployment_id == null) return null
   return (
-    <p className="mt-1 text-xs text-muted-foreground">
+    <p className="mt-1 text-xs text-muted-foreground [overflow-wrap:anywhere]">
       Pinned to deployment #{plugin.pinned_deployment_id}
+      {plugin.image ? ` of the image ${plugin.image}` : ''}
       {plugin.pending_update
         ? ` · deployment #${plugin.pending_update.deployment_id} waits for approval`
         : ' · a new deployment will wait for approval'}
@@ -234,13 +235,17 @@ export function PluginUpdateDialog({
               <dt className="text-muted-foreground">Version</dt>
               <dd>{pluginUpdateVersions(update.difference)}</dd>
               <dt className="text-muted-foreground">Approved build</dt>
-              <dd>
+              <dd className="[overflow-wrap:anywhere]">
                 {plugin.pinned_deployment_id != null
                   ? `Deployment #${plugin.pinned_deployment_id}`
                   : 'Not recorded'}
+                {plugin.image ? ` · ${plugin.image}` : ''}
               </dd>
               <dt className="text-muted-foreground">New build</dt>
-              <dd>Deployment #{update.deployment_id}</dd>
+              <dd className="[overflow-wrap:anywhere]">
+                Deployment #{update.deployment_id}
+                {update.image ? ` · ${update.image}` : ''}
+              </dd>
             </dl>
             <PluginUpdateDifference difference={update.difference} />
             <p className="text-sm text-muted-foreground">

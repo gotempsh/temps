@@ -329,6 +329,27 @@ impl Platform {
         deployment_id
     }
 
+    /// Deploy `image` to the service the way an image deployment records
+    /// it: no commit, and the image reference the client named.
+    pub(crate) async fn deploy_image(
+        &self,
+        binding: ServiceBinding,
+        port: u16,
+        image: &str,
+    ) -> i32 {
+        let deployment_id = self.deploy(binding, port).await;
+        self.db()
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE deployments SET commit_sha=NULL, commit_message=NULL, image_name=$2, \
+                     metadata=jsonb_build_object('externalImageRef', $2::text) WHERE id=$1",
+                [deployment_id.into(), image.into()],
+            ))
+            .await
+            .expect("image deployment");
+        deployment_id
+    }
+
     /// A user with this id, for what records who did something.
     pub(crate) async fn user(&self, id: i32) -> i32 {
         use sea_orm::IntoActiveModel;
@@ -1439,4 +1460,90 @@ async fn a_disabled_plugin_is_cut_off_at_once_and_stays_off_until_it_is_enabled(
         Some(ServicePluginState::Asleep)
     );
     assert_eq!(platform.waker.wakes.load(AtomicOrdering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_deployed_from_an_image_is_a_plugin_and_a_new_image_waits() {
+    let Some(platform) = platform("a plugin deployed from an image").await else {
+        return;
+    };
+    let first = serve_plugin("reports", TOKEN);
+    let binding = platform.service("reports-service").await;
+    let first_deployment = platform
+        .deploy_image(
+            binding,
+            first.port,
+            "registry.example.com/acme/reports:1.0.0",
+        )
+        .await;
+    let manager = platform.manager().await;
+
+    // No repository and no commit: the image is all there is, and it is
+    // enough.
+    let manifest = manager
+        .attach_service(binding, None)
+        .await
+        .expect("a service deployed from an image attaches");
+    assert_eq!(manifest.name, "reports");
+    assert_eq!(
+        pinned_deployment(&platform, "reports").await,
+        Some(first_deployment),
+        "the image deployment that runs is the approved build"
+    );
+    let (status, body) = through_proxy(&manager, "reports", "/items", true).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "three items"));
+
+    // Deploying another image is an update like any other: it waits.
+    let second = serve_plugin("reports", TOKEN);
+    let second_deployment = platform
+        .deploy_image(
+            binding,
+            second.port,
+            "registry.example.com/acme/reports:1.1.0",
+        )
+        .await;
+    first.stop();
+    eventually("the new image is held for review", || async {
+        waiting_update(&platform, "reports")
+            .await
+            .is_some_and(|update| update.deployment_id == second_deployment)
+    })
+    .await;
+    assert_eq!(
+        status_of(&manager, "reports")
+            .await
+            .map(|status| status.state),
+        Some(ServicePluginState::UpdateWaiting)
+    );
+    assert_eq!(
+        pinned_deployment(&platform, "reports").await,
+        Some(first_deployment),
+        "the pin does not follow the new image"
+    );
+
+    // The same tag deployed again is still another build.
+    let again = serve_plugin("reports", TOKEN);
+    let third_deployment = platform
+        .deploy_image(
+            binding,
+            again.port,
+            "registry.example.com/acme/reports:1.1.0",
+        )
+        .await;
+    second.stop();
+    // Nothing is connected while an update waits, so the next request to
+    // the plugin is what finds the newer deployment.
+    let (status, _) = through_proxy(&manager, "reports", "/items", true).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        waiting_update(&platform, "reports")
+            .await
+            .map(|update| update.deployment_id),
+        Some(third_deployment),
+        "the redeployed tag is held as its own build"
+    );
+    assert_eq!(
+        pinned_deployment(&platform, "reports").await,
+        Some(first_deployment)
+    );
 }

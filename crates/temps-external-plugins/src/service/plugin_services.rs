@@ -27,6 +27,8 @@ pub struct PendingUpdateView {
     /// What an approval must quote: this build answering this manifest.
     pub review: String,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// The image that waits, when the deployment was made from an image.
+    pub image: Option<String>,
     /// What it asks for compared with the approved build.
     pub difference: AccessDifference,
 }
@@ -90,6 +92,10 @@ pub struct ServicePluginView {
     /// The memory and CPU the plugin's container is limited to. `None`
     /// before the plugin has a deployment Temps knows.
     pub resource_limits: Option<PluginResourceLimits>,
+    /// The image the plugin runs, when its service was deployed from an
+    /// image instead of built from a repository: the reference that was
+    /// approved.
+    pub image: Option<String>,
 }
 
 impl ExternalPluginsService {
@@ -365,7 +371,20 @@ impl ExternalPluginsService {
                     .and_then(|plugin| plugin.pin.deployment_id)
             })
         };
-        let deployment_ids: Vec<i32> = statuses.iter().filter_map(deployment_of).collect();
+        // The deployment that waits is read too: its image is what an
+        // administrator is asked to approve.
+        let deployment_ids: Vec<i32> = statuses
+            .iter()
+            .filter_map(deployment_of)
+            .chain(stored.values().filter_map(|plugin| {
+                plugin
+                    .pin
+                    .pending
+                    .as_ref()
+                    .map(|pending| pending.deployment_id)
+            }))
+            .collect();
+        let mut images: HashMap<i32, String> = HashMap::new();
         let limits: HashMap<i32, PluginResourceLimits> = if deployment_ids.is_empty() {
             HashMap::new()
         } else {
@@ -374,16 +393,21 @@ impl ExternalPluginsService {
                 .select_only()
                 .column(deployments::Column::Id)
                 .column(deployments::Column::DeploymentConfig)
+                .column(deployments::Column::Metadata)
                 .filter(deployments::Column::Id.is_in(deployment_ids))
                 .into_tuple::<(
                     i32,
                     Option<temps_entities::deployment_config::DeploymentConfigSnapshot>,
+                    Option<deployments::DeploymentMetadata>,
                 )>()
                 .all(self.db.as_ref())
                 .await
                 .map_err(read)?
                 .into_iter()
-                .map(|(deployment_id, config)| {
+                .map(|(deployment_id, config, metadata)| {
+                    if let Some(image) = metadata.and_then(|metadata| metadata.external_image_ref) {
+                        images.insert(deployment_id, image);
+                    }
                     (
                         deployment_id,
                         PluginResourceLimits {
@@ -431,9 +455,12 @@ impl ExternalPluginsService {
                             deployment_id: pending.deployment_id,
                             review: pending.review.clone(),
                             since: pending.since,
+                            image: images.get(&pending.deployment_id).cloned(),
                             difference: pin.pending_difference()?,
                         })
                     }),
+                    image: deployment_of(&status)
+                        .and_then(|deployment_id| images.get(&deployment_id).cloned()),
                     own_storage: status
                         .binding
                         .and_then(|binding| own_storage.get(&binding.project_id))

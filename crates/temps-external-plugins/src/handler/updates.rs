@@ -18,6 +18,9 @@ pub struct PendingPluginUpdateResponse {
     /// Since when it waits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// The image that waits, when the deployment was made from an image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     /// What it asks for compared with the approved build.
     pub difference: AccessDifference,
 }
@@ -28,6 +31,7 @@ impl From<PendingUpdateView> for PendingPluginUpdateResponse {
             deployment_id: view.deployment_id,
             review: view.review,
             since: view.since,
+            image: view.image,
             difference: view.difference,
         }
     }
@@ -484,5 +488,97 @@ mod tests {
             .requested_permissions
             .contains(&PluginHostPermission::AiGenerate));
         assert!(grants.permissions.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plugin_deployed_from_an_image_is_listed_with_the_image_that_runs_and_the_one_that_waits(
+    ) {
+        let Some(platform) = platform("listing the image of a plugin").await else {
+            return;
+        };
+        let first = serve_plugin("reports", TOKEN);
+        let binding = platform.service("reports-service").await;
+        platform
+            .deploy_image(
+                binding,
+                first.port,
+                "registry.example.com/acme/reports:1.0.0",
+            )
+            .await;
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = state_on(&platform, audit.clone()).await;
+        let admin = || user_auth(Role::PlatformAdmin);
+        let (status, _) =
+            add_service_plugin(admin(), State(state.clone()), metadata(), add(binding))
+                .await
+                .expect("a service deployed from an image is added");
+        assert_eq!(status, StatusCode::CREATED);
+
+        let Json(listed) = get_plugin_services(admin(), State(state.clone()))
+            .await
+            .expect("list");
+        assert_eq!(
+            listed.plugins[0].image.as_deref(),
+            Some("registry.example.com/acme/reports:1.0.0")
+        );
+
+        let second = serve_plugin("reports", TOKEN);
+        let second_deployment = platform
+            .deploy_image(
+                binding,
+                second.port,
+                "registry.example.com/acme/reports:1.1.0",
+            )
+            .await;
+        first.stop();
+        eventually("the new image is listed as waiting", || async {
+            get_plugin_services(admin(), State(state.clone()))
+                .await
+                .is_ok_and(|Json(listed)| listed.plugins[0].pending_update.is_some())
+        })
+        .await;
+        let Json(listed) = get_plugin_services(admin(), State(state.clone()))
+            .await
+            .expect("list");
+        let plugin = &listed.plugins[0];
+        assert_eq!(
+            plugin.image.as_deref(),
+            Some("registry.example.com/acme/reports:1.0.0"),
+            "the approved image stays the plugin's image while another waits"
+        );
+        let pending = plugin.pending_update.as_ref().expect("an update waits");
+        assert_eq!(pending.deployment_id, second_deployment);
+        assert_eq!(
+            pending.image.as_deref(),
+            Some("registry.example.com/acme/reports:1.1.0")
+        );
+        let json = serde_json::to_value(plugin).expect("json");
+        assert_eq!(json["image"], "registry.example.com/acme/reports:1.0.0");
+        assert_eq!(
+            json["pending_update"]["image"],
+            "registry.example.com/acme/reports:1.1.0"
+        );
+
+        // A service built from a repository has no image to name.
+        let built = serve_plugin("audit-export", TOKEN);
+        let other = platform.service("audit-export-service").await;
+        platform.deploy(other, built.port).await;
+        let (status, _) = add_service_plugin(admin(), State(state.clone()), metadata(), add(other))
+            .await
+            .expect("a built service is added");
+        assert_eq!(status, StatusCode::CREATED);
+        let Json(listed) = get_plugin_services(admin(), State(state.clone()))
+            .await
+            .expect("list");
+        let built = listed
+            .plugins
+            .iter()
+            .find(|plugin| plugin.name == "audit-export")
+            .expect("listed");
+        assert!(built.image.is_none());
+        assert!(serde_json::to_value(built)
+            .expect("json")
+            .get("image")
+            .is_none());
     }
 }

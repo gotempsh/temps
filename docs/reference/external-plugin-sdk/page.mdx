@@ -27,7 +27,7 @@ Use `temps-plugin-sdk` to authenticate external plugin routes and call the Temps
 
 ## Security model {{ anchor: true, id: 'security-model' }}
 
-An external plugin runs as an ordinary Temps service: someone deploys its repository like any app, and an administrator adds that service as a plugin under **Settings → Plugins → Add from service**. Temps never runs plugin code itself. It connects to the service's running deployment over the network and mounts its routes at:
+An external plugin runs as an ordinary Temps service. The preferred way to add one is from its image: `temps plugin add --image <image>` creates the service, deploys the image the way `temps deploy:image` does and adds it as a plugin, and the same command with a new image deploys an update that waits for approval. A service that is already deployed, from an image or from a repository, is added under **Settings → Plugins → Add plugin**. Temps never runs plugin code itself. It connects to the service's running deployment over the network and mounts its routes at:
 
 ```text
 /api/x/{plugin-name}/*

@@ -24,6 +24,7 @@ import {
   ServicePluginNotice,
   ServicePluginOrigin,
   ServicePluginStatus,
+  PluginFromImage,
 } from './ServicePlugins'
 
 const plugin = (
@@ -303,4 +304,12 @@ test("a plugin's own data is the storage linked to its service", () => {
   expect(
     render(<PluginOwnStorage plugin={plugin({ service_slug: undefined })} />)
   ).toBe('')
+})
+
+test('adding a plugin from its image is one command that can be copied', () => {
+  const html = render(<PluginFromImage />)
+  expect(html).toContain('From an image')
+  expect(html).toContain('temps plugin add --image &lt;image&gt;')
+  expect(html).toContain('Copy command')
+  expect(html).toContain('waits for your approval')
 })

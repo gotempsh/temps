@@ -12,13 +12,16 @@ import { registerPluginGrantCommands } from "./grants.js";
 import { registerPluginServiceCommands } from "./services.js";
 import { registerPluginUpdateCommands } from "./updates.js";
 import { registerPluginControlCommands } from "./controls.js";
+import { registerPluginImageCommands } from "./image.js";
 
 export function registerPluginCommands(program: Command) {
   const plugin = program
     .command("plugin")
     .description(
-      "Create TypeScript plugins, add a deployed service as a plugin and manage its permissions",
+      "Add a plugin from its image, approve its updates and manage its permissions; create TypeScript plugins",
     );
+  // First: deploying an image is the way to add a plugin.
+  registerPluginImageCommands(plugin);
   registerPluginGrantCommands(plugin);
   registerPluginServiceCommands(plugin);
   registerPluginUpdateCommands(plugin);

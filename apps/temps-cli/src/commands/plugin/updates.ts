@@ -31,7 +31,7 @@ export function updateLines(plugin: ServicePlugin): string[] {
   const pinned =
     plugin.pinned_deployment_id == null
       ? "no build recorded yet"
-      : `deployment ${plugin.pinned_deployment_id}`;
+      : `deployment ${plugin.pinned_deployment_id}${plugin.image ? `, image ${plugin.image}` : ""}`;
   const update = plugin.pending_update;
   if (!update)
     return [
@@ -44,7 +44,7 @@ export function updateLines(plugin: ServicePlugin): string[] {
     : difference.version_to;
   const lines = [
     `Plugin ${plugin.name} is pinned to ${pinned}.`,
-    `Deployment ${update.deployment_id} (version ${versions}) waits for approval. The plugin is disconnected until then.`,
+    `Deployment ${update.deployment_id} (version ${versions}${update.image ? `, image ${update.image}` : ""}) waits for approval. The plugin is disconnected until then.`,
   ];
   const asked: Array<[string, string[]]> = [
     ["New permissions it asks for", difference.added_permissions],

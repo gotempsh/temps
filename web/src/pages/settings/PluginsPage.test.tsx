@@ -154,7 +154,7 @@ describe('PluginsPage', () => {
 
     expect(markup).toContain('Browse')
     expect(markup).toContain('Available plugins')
-    expect(markup).not.toContain('Add from service</button>')
+    expect(markup).not.toContain('Add plugin</button>')
     expect(markup).not.toContain('Reload plugins')
     // Which services are plugins is an administrator's view: a reader must
     // not even ask for it.
@@ -166,7 +166,7 @@ describe('PluginsPage', () => {
 
     const markup = renderPage()
 
-    expect(markup).toContain('Add from service</button>')
+    expect(markup).toContain('Add plugin</button>')
     expect(markup).toContain('Available plugins')
     expect(markup).toContain('aria-selected="true"')
     for (const removed of [
@@ -257,7 +257,7 @@ describe('PluginsPage', () => {
 
     expect(markup).toContain('No plugins are added.')
     expect(markup).toContain(
-      'Deploy a plugin as a service, then add that service here.'
+      'Add one from its image, or from a service that is already deployed.'
     )
     expect(markup).toContain('Reload plugins')
   })

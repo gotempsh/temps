@@ -90,10 +90,21 @@ its code/dependencies and still requires source review.
 ## 3. Deploy and test in Temps
 
 A plugin runs as an ordinary Temps service; Temps never builds or runs a plugin
-executable itself. Deploy the repository like any app (a public repository needs no
+executable itself. Prefer publishing an image and adding the plugin from it in one step:
+
+```sh
+bunx --bun @temps-sdk/cli plugin add --image <registry>/<repository>@sha256:<digest>
+```
+
+It creates the service, deploys the image like `temps deploy:image`, waits for it to be
+live and adds it. A tag works too, but only a digest is exactly what was reviewed. To
+release a new version run the same command with `--project <service>` and the new image:
+it waits for an administrator's approval.
+
+Alternatively deploy the repository like any app (a public repository needs no
 GitHub credential; for a nested plugin set the service's root directory to the plugin
 directory), wait for the deployment to be live, then choose **Settings → Plugins → Add
-from service** and pick that service and environment. Do not embed credentials in the
+plugin** and pick that service and environment. Do not embed credentials in the
 repository URL.
 
 If the configured CLI supports these commands:

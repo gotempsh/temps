@@ -137,7 +137,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`rollback`](#rollback) - Rollback to a previous deployment
 - [`open`](#open) - Open project URL in browser
 - [`cloud`](#cloud) - Temps Cloud
-- [`plugin`](#plugin) - Create TypeScript plugins, add a deployed service as a plugin and manage its permissions
+- [`plugin`](#plugin) - Add a plugin from its image, approve its updates and manage its permissions; create TypeScript plugins
 - [`setup`](#setup) - PoC: install Temps on an existing Linux VPS over SSH and save a client context
 - [`start`](#start) - Run Temps on this computer, sign in the CLI and add the Temps skill for your coding agent
 - [`stop`](#stop) - Stop the Temps server and database started by `temps start`
@@ -24274,10 +24274,11 @@ Get cloud capability
 
 ## `plugin`
 
-Create TypeScript plugins, add a deployed service as a plugin and manage its permissions
+Add a plugin from its image, approve its updates and manage its permissions; create TypeScript plugins
 
 **Subcommands:**
 
+- `add` - Deploy a plugin's image as a service and add it as a plugin, in one step; for a plugin that is already added, deploy the image as an update that waits for approval
 - `grants` - Inspect or replace a plugin's host API permissions and AI limits
 - `services` - List the plugins, the service each runs as and whether it is running; also lists plugins that no longer run, with the reason
 - `add-service` - Make a deployed service a plugin; it starts with no permissions
@@ -24292,6 +24293,22 @@ Create TypeScript plugins, add a deployed service as a plugin and manage its per
 - `build` - Build every platform selected in package.json; --all selects all six supported targets
 - `publish` - Build, publish native npm packages, verify ownership and submit for review; resumes interrupted releases
 - `api` - Api commands
+
+### `plugin add`
+
+Deploy a plugin's image as a service and add it as a plugin, in one step; for a plugin that is already added, deploy the image as an update that waits for approval
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--image <image>` | Image of the plugin, by digest or tag (e.g. registry.example.com/acme/reports:1.2.0) | - | Yes |
+| `-p, --project <project>` | Slug or id of an existing service to deploy the image to; without it a new service is created | - | No |
+| `--name <name>` | Name of the service to create (default: taken from the image) | - | No |
+| `-e, --environment <env>` | Environment name | `production` | No |
+| `--port <port>` | Port the plugin listens on, for a service that is created | `8080` | No |
+| `--health-check-path <path>` | Path the deployment is checked on; a plugin answers /health unless its manifest says otherwise | `/health` | No |
+| `--timeout <seconds>` | Seconds to wait for the deployment to be live | `300` | No |
 
 ### `plugin grants`
 

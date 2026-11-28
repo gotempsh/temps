@@ -23,6 +23,7 @@ import {
   deployPluginPath,
   filterRepositoryCatalog,
 } from './RepositoryCatalog-shared'
+import { PLUGIN_IMAGE_COMMAND } from '@/lib/plugin-services'
 
 /**
  * Plugins published as Git repositories. A plugin runs as a Temps service, so
@@ -143,8 +144,10 @@ export function RepositoryCatalog({
       ) : (
         <>
           <p className="text-sm text-muted-foreground">
-            Deploy a plugin as a service, then add it with Add from service.
-            Listings are not a security audit.
+            Add a plugin from its image with{' '}
+            <code className="text-xs">{PLUGIN_IMAGE_COMMAND}</code>, or deploy
+            its repository and choose Add plugin. Listings are not a security
+            audit.
           </p>
           <p
             role="status"

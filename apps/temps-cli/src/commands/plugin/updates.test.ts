@@ -56,6 +56,24 @@ test("a plugin on its approved build says so and that the next deployment will w
   expect(lines).toContain("will wait for approval");
 });
 
+test("a plugin deployed from an image names the approved image and the one that waits", () => {
+  const held = waiting();
+  const lines = updateLines({
+    ...held,
+    image: "registry.example.com/acme/reports:1.0.0",
+    pending_update: {
+      ...held.pending_update!,
+      image: "registry.example.com/acme/reports:1.1.0",
+    },
+  }).join("\n");
+  expect(lines).toContain(
+    "pinned to deployment 41, image registry.example.com/acme/reports:1.0.0",
+  );
+  expect(lines).toContain(
+    "Deployment 42 (version 1.0.0 -> 1.1.0, image registry.example.com/acme/reports:1.1.0) waits",
+  );
+});
+
 test("a waiting update that asks for nothing more is still called new code", () => {
   const lines = updateLines(waiting()).join("\n");
   expect(lines).toContain("is pinned to deployment 41");

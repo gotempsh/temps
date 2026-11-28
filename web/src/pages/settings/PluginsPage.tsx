@@ -233,7 +233,7 @@ export function PluginsPage() {
               disabled={managementPending}
               onClick={() => setAddingService(true)}
             >
-              <Plus className="mr-2 size-4" /> Add from service
+              <Plus className="mr-2 size-4" /> Add plugin
             </Button>
           )
         }
@@ -336,7 +336,7 @@ export function PluginsPage() {
                 <p className="mt-3 font-medium">No plugins are added.</p>
                 <p className="mt-1 text-sm text-muted-foreground">
                   {canManagePlugins
-                    ? 'Deploy a plugin as a service, then add that service here.'
+                    ? 'Add one from its image, or from a service that is already deployed.'
                     : 'Ask a system administrator to add one.'}
                 </p>
                 <Button

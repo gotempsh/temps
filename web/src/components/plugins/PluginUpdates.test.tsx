@@ -139,6 +139,16 @@ test('a plugin says which deployment it is pinned to and that the next one will 
   ).toBe('')
 })
 
+test('a plugin deployed from an image names the image it is pinned to', () => {
+  const image = 'registry.example.com/acme/reports:1.0.0'
+  const pinned = render(<PluginPinnedBuild plugin={plugin({ image })} />)
+  expect(pinned).toContain(`Pinned to deployment #41 of the image ${image}`)
+  // A service built from a repository has no image to name.
+  expect(render(<PluginPinnedBuild plugin={plugin({})} />)).not.toContain(
+    'of the image'
+  )
+})
+
 test('the notice lists the plugins whose update waits and says when one asks for more', () => {
   expect(
     render(

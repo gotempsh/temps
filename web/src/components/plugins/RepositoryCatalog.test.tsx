@@ -84,7 +84,9 @@ test('a listing links to its exact source and to deploying its repository as a s
   // A plugin kept in a subdirectory says which one to deploy.
   expect(html).toContain('<code>plugins/demo</code>')
   expect(html).toContain('not a security audit')
-  expect(html).toContain('Add from service')
+  // Adding from the image is named first; the repository is the other way.
+  expect(html).toContain('temps plugin add --image &lt;image&gt;')
+  expect(html).toContain('Add plugin')
   expect(html).not.toContain('Added</')
 })
 

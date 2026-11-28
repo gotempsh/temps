@@ -18,13 +18,21 @@
 
 ## Add a plugin to a self-hosted Temps server
 
-A plugin runs as an ordinary Temps service. Deploy the plugin's repository like any app, then sign in as a system administrator and add that service as a plugin:
+A plugin runs as an ordinary Temps service. The preferred way to add one is from its image. Sign in as a system administrator and run:
+
+```bash
+bunx --bun @temps-sdk/cli plugin add --image registry.example.com/acme/my-plugin:1.0.0
+```
+
+This creates a service named after the image, deploys the image the way `temps deploy:image` does, waits for it to be live and adds it as a plugin, pinned to that deployment. Name the image by digest (`repository@sha256:...`) to deploy exactly what you reviewed. To release a new version, run the command again with `--project <service>` and the new image: it is deployed and then waits for approval. Use `--name` to choose the service's name, `--port` for the port the plugin listens on and `--health-check-path` when its manifest does not use `/health`.
+
+A service that is already deployed, from an image or from a repository, is added by its ids:
 
 ```bash
 bunx --bun @temps-sdk/cli plugin add-service --project 7 --environment 9
 ```
 
-Use the numeric ids shown by `temps projects list` and `temps environments list`. In the console, open **Settings → Plugins → Add from service**. Temps connects to the service's running deployment; it does not run the plugin's code itself. A newly added plugin has no permissions.
+Use the numeric ids shown by `temps projects list` and `temps environments list`. In the console, open **Settings → Plugins → Add plugin**. Temps connects to the service's running deployment; it does not run the plugin's code itself. A newly added plugin has no permissions.
 
 `temps plugin services` lists each plugin, the service it runs as and whether it is running, stopped while idle or unavailable, with the reason. It also lists plugins an earlier version of Temps installed as executables: those no longer run. Deploy such a plugin as a service, remove its entry with `temps plugin remove my-plugin`, then add the service. Removing a plugin revokes its permissions; its service and the files it stored are kept.
 
