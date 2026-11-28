@@ -10,7 +10,10 @@ their steps by hand, and never pipe a downloaded script into a shell.
 
 ## 1. Choose the target
 
-Ask one question at a time, and only for what is still unknown:
+Ask one question at a time, and only for what is still unknown. When you have
+a tool for asking the user a question with choices (Claude Code's
+`AskUserQuestion`, for example), use it, with the targets below as the
+options; otherwise ask in chat:
 
 1. Where Temps should run:
    - **This computer**: to try Temps. Apps are reachable only from this
@@ -145,7 +148,31 @@ gotempsh/temps) is an alternative: the user enters the console URL and a key
 in the extension settings, never in the chat. See
 [the mcp reference](../references/commands/mcp.md).
 
-## Next
+## 6. First-run onboarding
 
-Offer to deploy the project in the current directory, following
-[Deploy an application](deploy-application.md).
+A new install opens the console's welcome flow (`<console URL>/welcome`) with
+four steps. Walk the user through the same steps in the conversation, in this
+order, and record each one on the server so the console shows the same
+progress. Ask before each step; the user may do it now or leave it for later.
+
+| Step | What to do | Record it |
+|---|---|---|
+| `host` | Report what this machine offers: CPU cores, memory, free disk, Docker, and whether ports 80/443 are free (read-only checks such as `docker info`, `df -h`). | `--done host` |
+| `reach` | Say how apps are reached now: on this computer only (`temps start`), or at the QuickStart sslip.io or custom domain (`temps setup`). If the user wants public access for a local install, point them to the welcome page's "Reach your apps" step instead of changing networking yourself. | `--done reach`, or `--later` with the reason |
+| `agents` | Done once [Connect the AI client](#connect-the-ai-client) succeeded for the tool you are running in. | `--done agents` |
+| `app` | Offer to deploy the project in the current directory, following [Deploy an application](deploy-application.md), or a template if the directory is empty. | `--done app`, or `--later` with the reason |
+
+Record progress with the same explicit context:
+
+```bash
+bunx @temps-sdk/cli@beta --target-context "$context" settings onboarding update --done host
+bunx @temps-sdk/cli@beta --target-context "$context" settings onboarding update \
+  --later '[{"step":"reach","reason":"Apps stay on this computer for now"}]'
+bunx @temps-sdk/cli@beta --target-context "$context" settings onboarding get --json
+```
+
+When every step is done or left for later, mark the flow finished with
+`settings onboarding update --completed` and give the user the console URL and
+the steps they left for later. A CLI before 0.2.0-beta.3 has no
+`settings onboarding`; then walk the same steps and tell the user the welcome
+page will still list them.
