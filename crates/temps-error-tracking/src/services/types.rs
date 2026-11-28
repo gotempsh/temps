@@ -139,6 +139,19 @@ pub enum ErrorTrackingError {
     #[error("Project {project_id} already has a '{kind}' inbound filter")]
     InboundFilterExists { project_id: i32, kind: String },
 
+    /// A pattern rule the project already has: same kind and the same
+    /// pattern ignoring case, which is how patterns match. Maps to HTTP 409.
+    #[error(
+        "Project {project_id} already has a '{kind}' inbound filter with pattern '{pattern}' \
+         (filter {filter_id}); patterns match case-insensitively"
+    )]
+    InboundPatternFilterExists {
+        project_id: i32,
+        kind: String,
+        pattern: String,
+        filter_id: i32,
+    },
+
     /// The project holds as many inbound filters as it may.
     /// Maps to HTTP 400 Bad Request.
     #[error("Project {project_id} already has the maximum of {limit} inbound filters")]

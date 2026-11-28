@@ -595,6 +595,19 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
                 .value("user_id", user_id)
                 .value("limit", limit)
                 .build(),
+            ErrorTrackingError::InboundPatternFilterExists {
+                project_id,
+                ref kind,
+                filter_id,
+                ..
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_("https://temps.sh/probs/error-inbound-filter-exists")
+                .title("Inbound Filter Already Exists")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("kind", kind.clone())
+                .value("filter_id", filter_id)
+                .build(),
             ErrorTrackingError::InboundFilterExists {
                 project_id,
                 ref kind,
@@ -758,6 +771,7 @@ impl axum::response::IntoResponse for ErrorTrackingError {
             | ErrorTrackingError::GroupIsMergeTarget { .. }
             | ErrorTrackingError::GroupNotMerged { .. }
             | ErrorTrackingError::InboundFilterExists { .. }
+            | ErrorTrackingError::InboundPatternFilterExists { .. }
             | ErrorTrackingError::SavedSearchExists { .. } => {
                 (StatusCode::CONFLICT, self.to_string())
             }

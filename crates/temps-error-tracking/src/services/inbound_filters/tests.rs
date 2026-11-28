@@ -244,3 +244,147 @@ async fn a_missing_project_is_project_not_found_for_list_and_create() {
         "{created:?}"
     );
 }
+
+/// #2112: concurrent creates cannot overshoot the per-project limit; the
+/// check runs under a lock in the inserting transaction.
+#[tokio::test]
+async fn concurrent_creates_stop_at_the_limit() {
+    let test_db = test_db!("inbound filter limit race");
+    let db = test_db.connection_arc();
+    let project = create_project(db.as_ref()).await;
+    let service = Arc::new(InboundFilterService::new(
+        db.clone(),
+        Arc::new(InboundFilterRegistry::new()),
+    ));
+    let attempts = MAX_FILTERS_PER_PROJECT + 20;
+    let mut tasks = tokio::task::JoinSet::new();
+    for n in 0..attempts {
+        let service = service.clone();
+        tasks.spawn(async move {
+            service
+                .create(
+                    project,
+                    InboundFilterKind::Release,
+                    Some(format!("rel-{n}")),
+                    true,
+                )
+                .await
+        });
+    }
+    let (mut created, mut refused) = (0u64, 0u64);
+    while let Some(result) = tasks.join_next().await {
+        match result.expect("task") {
+            Ok(_) => created += 1,
+            Err(ErrorTrackingError::InboundFilterLimit { .. }) => refused += 1,
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+    assert_eq!(created, MAX_FILTERS_PER_PROJECT);
+    assert_eq!(refused, attempts - MAX_FILTERS_PER_PROJECT);
+    assert_eq!(
+        service.list(project).await.expect("list").len() as u64,
+        MAX_FILTERS_PER_PROJECT
+    );
+}
+
+/// #2112: a pattern rule exists once per kind, ignoring case as matching
+/// does, on create and on update; a pattern of only `*` is refused.
+#[tokio::test]
+async fn pattern_rules_are_unique_ignoring_case_and_match_all_is_refused() {
+    let test_db = test_db!("inbound filter duplicate patterns");
+    let db = test_db.connection_arc();
+    let project = create_project(db.as_ref()).await;
+    let other = create_project(db.as_ref()).await;
+    let service = InboundFilterService::new(db.clone(), Arc::new(InboundFilterRegistry::new()));
+
+    let first = service
+        .create(
+            project,
+            InboundFilterKind::ErrorMessage,
+            Some("TypeError: *".into()),
+            true,
+        )
+        .await
+        .expect("first rule");
+    for duplicate in ["TypeError: *", "typeerror: *", "  TYPEERROR: *  "] {
+        let error = service
+            .create(
+                project,
+                InboundFilterKind::ErrorMessage,
+                Some(duplicate.into()),
+                true,
+            )
+            .await
+            .expect_err("same rule");
+        assert!(
+            matches!(
+                &error,
+                ErrorTrackingError::InboundPatternFilterExists { filter_id, .. }
+                    if *filter_id == first.id
+            ),
+            "{duplicate}: {error}"
+        );
+    }
+    // Another kind, or another project, is a different rule.
+    service
+        .create(
+            project,
+            InboundFilterKind::Release,
+            Some("typeerror: *".into()),
+            true,
+        )
+        .await
+        .expect("another kind");
+    service
+        .create(
+            other,
+            InboundFilterKind::ErrorMessage,
+            Some("TypeError: *".into()),
+            true,
+        )
+        .await
+        .expect("another project");
+
+    let second = service
+        .create(
+            project,
+            InboundFilterKind::ErrorMessage,
+            Some("ResizeObserver*".into()),
+            true,
+        )
+        .await
+        .expect("second rule");
+    let error = service
+        .update(project, second.id, Some("TYPEERROR: *".into()), None)
+        .await
+        .expect_err("an edit cannot duplicate another rule");
+    assert!(matches!(
+        error,
+        ErrorTrackingError::InboundPatternFilterExists { .. }
+    ));
+    // Re-saving a rule's own pattern in another case is not a duplicate.
+    service
+        .update(project, first.id, Some("TYPEERROR: *".into()), None)
+        .await
+        .expect("its own pattern");
+
+    for match_all in ["*", "***", " * "] {
+        let error = service
+            .create(
+                project,
+                InboundFilterKind::Release,
+                Some(match_all.into()),
+                true,
+            )
+            .await
+            .expect_err("matches everything");
+        assert!(
+            matches!(&error, ErrorTrackingError::Validation(m) if m.contains("matches every event")),
+            "{match_all}: {error}"
+        );
+    }
+    assert!(service
+        .update(project, second.id, Some("*".into()), None)
+        .await
+        .is_err());
+}
