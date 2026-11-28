@@ -5,6 +5,224 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.65] - 2026-11-28
+
+### Added
+
+- **release:** Release every SDK at the server version
+- **ingress:** Run the managed Cloudflare tunnel connector on macOS
+- **web:** Show each domain once on the Domains page, shorten Make it reachable
+- **git:** Rotate basic-auth and SSH-key provider credentials in place
+- **nodes:** Read a worker's build limits back and refuse node 0 explicitly
+- **deployments:** Reset a node's system reservation to its default
+- **nodes:** Turn the WireGuard mesh off while nothing depends on it
+- **web,cli:** Turn the WireGuard mesh off from the console and the CLI
+- **web:** Show a project only the pages its services have, and link databases there
+- **web:** Navigate by an entity tree and connect the assistant from its first screen
+- **ai:** Draw tables, figures and charts in assistant answers
+- **web:** List a service's views in the sidebar and keep one row of tabs per page
+- **web:** List projects and one Server row in the sidebar, and cut a service to its everyday views
+- **cli:** Add traces show and a browser sign-in that does not wait
+- **web:** Hand off the page on screen to a coding agent
+- **web:** Hand off a deployment, an error occurrence and a request log
+- **core:** Add a shared page query and paginated list envelope
+- **funnels:** Read a funnel with its steps, return funnels from writes and paginate the list [**BREAKING**]: the funnel list, create and update responses changed shape; the console and CLI are migrated in this PR.
+- **api:** ISO 8601 timestamps, read-one endpoints and paginated growing lists [**BREAKING**]: timestamp fields listed above are ISO 8601 strings, not numbers; the five lists above return a page envelope instead of an array.
+- **web,cli:** Read ISO 8601 timestamps and paginated lists from the API [**BREAKING**]: `--json` output of the five list commands above is `{ items, total, page, page_size }` instead of an array.
+- **cli:** Cover the whole HTTP API, with a coverage check in CI ([#2070](https://github.com/gotempsh/temps/issues/2070))
+- **cli:** Look up one branch exactly with `providers repos get-repository-branch` and `providers public-repos get-branch`
+- **web:** Create a database from a backup, and ask only for a name to create one
+- **restore:** Show what a PostgreSQL restore brought back and point a link at restored data
+- **cli:** Show what a PostgreSQL restore brought back and point a link at it
+- **release:** Publish the SDKs and the CLI without a server build
+- First-run welcome, local folder deploys over MCP, private ingress ([#2059](https://github.com/gotempsh/temps/issues/2059))
+- **egress:** Record outbound connections of sandboxes and environments, opt-in ([#2065](https://github.com/gotempsh/temps/issues/2065))
+- **cli:** Ask for the admin email when temps start sets up Temps
+- **skills:** Guide installing Temps and connecting AI clients from the temps skill
+- **skills:** Publish the Temps skills as a Claude Code plugin
+- **mcpb:** Add a Claude Desktop extension that installs and connects Temps
+
+### Documentation
+
+- **status-pages:** Correct the incident heading and list the timing data a page publishes
+- **web:** Record the console page inventory and navigation plans
+- **web:** Record what was built of the sidebar hierarchy plan
+- **skills:** Teach the Temps skill to act on a console handoff
+- **skills:** Route only record handoffs to the handoff how-to
+- **cli:** Regenerate the skill command references for apikeys create
+- **release:** Point scripts/README.md at release.sh --help for libraries-only releases
+
+### Fixed
+
+- **status-page:** Keep uptime coverage of past windows when a monitor's check interval changes
+- **cli:** Let ip-access create and update confirm broad block ranges and self-lockouts
+- **ai-chat:** Leave more credential files out of sandbox deploys and say the exclusion is a fixed list
+- **environments:** Declare bearer auth on the environment, variable and secret endpoints in the OpenAPI spec
+- **environments:** Treat an anonymous security alternative as unauthenticated in the spec checks
+- **status-page:** Stamp a monitor interval change under the row lock so concurrent edits keep their order
+- **ai-chat:** Count credential files against the workspace quota
+- **cli:** Fail the ip-access spinner when a save is refused
+- **ai-chat:** Keep public .gpg keyrings in sandbox deploys
+- **status-page:** Give each check one grace period when an interval change timestamp steps back
+- **release:** Order every registry version when SDKs follow the server
+- **release:** Order package tags and build metadata when SDKs follow the server
+- **ai-gateway:** Keep refreshed catalog prices accurate and check coding agents without waking workspaces
+- **web:** Open the AI models page without waking a workspace and report update results truthfully
+- **ai-gateway:** Keep catalog rows readable after a rollback and never overwrite a chosen default model
+- **web:** Let a coding agent's workspace be checked again and confirm updates against the latest release
+- **ai-gateway:** Refuse a replacement key that only serves an older model instead of pinning it silently
+- **web:** Keep an explicit workspace check from being overwritten and fit coding-agent actions on a phone
+- **web:** Warn when an agent update leaves a pre-release and keep reads started during a check from overwriting it
+- **ai-agent-cli:** Never report a workspace version read before an unconfirmed install, nor update an npm copy with the vendor installer
+- **ai-gateway:** Verify a replacement key on the model the key routes to and bound each discovery pass
+- **web:** Keep a failed release lookup from hiding a workspace update and re-read the cache after a failed check
+- **web:** Name the coding agent in each row's Check workspace and Update buttons
+- **web:** Keep a dated workspace check over a failed release lookup and confirm nothing after a failed read
+- **ai-agent-cli:** Keep the workspace check when an update is refused before installing, and leave a native Claude Code install to its own updater
+- **node-agent:** Relay every Set-Cookie through the tunnel origin ([#2043](https://github.com/gotempsh/temps/issues/2043))
+- **dns:** Report cluster DNS as unavailable, not down, where it cannot run
+- **node-agent:** Give every connector download and extraction its own temporary file
+- **dns:** Report a cluster DNS change at once and keep an unsupported host unsupported
+- **web:** Keep domain addresses visible on a failed load and refresh them after changes
+- **dns:** Say cluster DNS stopped as soon as it is turned off, and keep an unsupported host reporting
+- **web:** List every domain when environments fail to load, and only where it is now
+- **web:** Show a renamed domain by its new name, and a placeholder while domains load
+- **web:** Don't call an environment empty while its domains failed to load
+- **network-policy:** Answer a function rule with a typed 400 when functions are not installed
+- **proxy:** Create load-balancer routes disabled on request and return ISO 8601 timestamps
+- **auth:** Take the role target from the path and rename users with username
+- **ai:** Classify the new node build-limits read and mesh disable for the assistant
+- **git:** Parse a rotated SSH key pair and require its halves to match
+- **auth:** Declare the deprecated user name field in the update schema
+- **nodes:** Keep a turned-off WireGuard mesh off and audit what was turned off
+- **web:** Keep the mesh shown as off after turning it off, and link its card
+- **network:** Publish the control plane's mesh end only for the settings it was built for
+- **auth:** Commit a role grant together with the read-back it answers with
+- **web:** Show a failed credentials save beside the Save button
+- **web:** Keep the credentials dialog open while a save is in flight
+- **ai:** Name no single vendor when no AI provider is configured
+- **web:** List the databases a service can link, and offer none when there is nothing to link
+- **ai:** Teach the assistant to draw views through a playbook it reads when needed
+- **web:** Link only the databases a service can take, and keep the sidebar whole on large servers
+- **web:** Spell out every command in a handoff prompt
+- **cli:** Keep a pending browser sign-in alive and refuse a context owned by another instance
+- **web:** Hand off exactly the record on screen
+- **cli:** Let a short sign-in resume see an approval and keep log output intact
+- **release:** Move the console's CLI pin with every CLI release
+- **release:** Name the CLI by its channel tag so copied commands always install
+- **ai-agents:** Make MCP server and skill updates PATCH and let an empty description clear it
+- **project-groups:** Let concurrent placements into one group succeed for callers with access
+- **ai:** Classify the new read-one and PUT-alias operations for the assistant
+- **project-groups:** Re-check late group members after releasing the group lock
+- **funnels:** Report funnel definition errors as a typed FunnelError
+- **web:** Show the saved funnel after editing or creating one
+- **web:** Find the active analytics ingest key past the first page
+- **cli:** Show deployment job durations from ISO 8601 timestamps
+- **funnels:** Reject updates and deletes of an already deleted funnel
+- **web:** Read on-demand certificate deadlines as ISO 8601
+- **web:** Show a deleted secret as not found instead of stale data
+- **web:** Refresh the funnel list after deleting a funnel
+- **plugin-sdk:** Decode project timestamps as ISO 8601
+- **cli:** Decode domain, certificate and ACME order timestamps as ISO 8601
+- **web:** Type captured container logs with the generated SDK
+- **web:** Keep a deleted funnel's metrics until its list refetch settles
+- **git:** Stop reporting a branch as missing when the provider's listing was capped
+- **git:** Keep the branch field usable while re-verifying, refresh exact lookups, and budget lookups before token work
+- **web:** Report a branch deleted since its last lookup as missing after a refresh
+- **ai:** Let the console assistant look up one branch of a public repository
+- **git:** Read every Gitea branch page, look branch names up exactly, and retry failed manual lookups
+- **git:** Look up a branch named only with Unicode whitespace instead of rejecting it
+- **web:** Show the commit to redeploy for a branch typed by hand, and re-check a missing one
+- **git:** Stop reporting a branch missing when the connection can no longer read its repository
+- **restore:** Keep the restored users and set Temps' login after a cross-server PostgreSQL restore
+- **restore:** Find hyphenated superusers, keep logs clean, and restore the backup that was submitted
+- **web:** Label the restored-database action "Use" and show the database beside it
+- **restore:** List restored databases with any name, and finish cross-server restores whose backup lacks the service's database
+- **web:** Refresh what a restore brought back after it finishes, and show when it cannot be loaded
+- **ai:** Let the console assistant read what a restore brought back and point a link at it
+- **web:** Preview the commit a recreated branch points to now, not the one it had before
+- **providers:** Create an all-worker HA PostgreSQL cluster on a control-plane-only server
+- **backup:** Never report a worker PostgreSQL's PITR window ending before it starts
+- **postgres:** Keep the HA autoctl_node password out of monitor URIs and service logs
+- **postgres:** Stop the HA TLS reconcile from signalling a member whose PostgreSQL is down
+- **metrics:** Refuse the undocumented percentile parameter on metric range endpoints
+- **scheduler:** Spread consecutive deployments over idle workers and use newly joined ones
+- **providers:** Answer 409 Node Busy, after a short retry, when a cluster member's container is busy
+- **proxy:** Take a replica that refuses or times out connections out of rotation
+- **deployments:** Remove a failed-over app's old containers once their worker is back
+- **settings:** Refuse a stale save of node build limits, node public ingress and platform settings
+- **ai:** Keep checking the credentials of a flattened settings request body
+- **proxy:** Send one probe to a replica back from ejection, and keep an all-ejected route answering
+- **nodes:** Keep a worker's public-ingress revision when a check first stores its settings
+- **cli:** Drop the server metrics --percentile flag the server refuses
+- **logs:** Mask a service URI password holding commas or quotes, or written with JSON-escaped slashes
+- **nodes:** Run the superseded container cleanup apart from the node health check
+- **deployments:** Never tear down a deployment its environment serves again after a rollback
+- **deployments:** Keep superseded deployments stuck on a down worker from blocking the removal of older ones
+- **backup:** Report a worker PostgreSQL's PITR window as unknown until WAL passes its first backup
+- **scheduler:** Count a replica a deploy just placed before its container is registered
+- **settings:** Refuse a revision-checked save merged onto settings that changed since, and cover every writable setting in the revision
+- **web:** Send the revision a settings form's edits started from, not one a background refetch brought
+- **ci-tokens:** Refuse a deployment token scope outside its project
+- **environments:** Keep a project secret's scope when an update leaves it out
+- **edge-rules:** Require a condition in every rule and refuse positions outside the rule list
+- **authz:** Explain an invalid API key scope in plain words
+- **cli:** Create a custom API key when permissions are customized
+- **auth:** Refuse API key changes that would not be applied
+- **auth:** Accept an unchanged expiry when editing an expired API key or deployment token
+- **cli:** Use the custom role when --permissions is given to apikeys create
+- **edge-rules:** Let a disabled rule without conditions be renamed from the console
+- **auth:** Audit API key activation and write an expiry only when it changes
+- **ci-tokens:** Write a deployment token expiry only when it changes
+- **environments:** Keep refused secret names within their excerpt and document update conflicts
+- **cli:** Honor --permissions and refuse an invalid selection in interactive apikeys create
+- **logs:** Mask the password of every URI in a list written without spaces between them
+- **proxy:** Keep a replica that just accepted a connection from being taken out of rotation by a failure recorded at the same moment
+- **web:** Keep unsaved settings edits when loading the settings another admin saved
+- **logs:** Never fail a service log line whose URI host ends in a non-ASCII character
+- **web:** Keep a settings form's edits based on what they were when loading the latest settings fails
+- **changelog:** Stop package and libraries-only tags from becoming changelog sections
+- **release:** Pass the crates.io trusted-publishing token as CARGO_REGISTRY_TOKEN ([#2091](https://github.com/gotempsh/temps/issues/2091))
+- **cli:** Verify release provenance with gh older than 2.68
+- **web:** Accept local admin emails such as admin@localhost on sign-in
+- **skills:** Point to the installation guide instead of an installer command
+
+### Miscellaneous
+
+- **api:** Regenerate the API clients for the new and changed endpoints
+- **api:** Describe the node success responses and regenerate the clients
+- **api:** Regenerate the clients for the assistant's setup description
+- **cli:** Regenerate the OpenAPI spec after merging main
+- **api:** Regenerate the OpenAPI spec and clients after merging main
+- **api:** Regenerate OpenAPI clients for the token, secret, API key and edge rule changes
+- **api:** Regenerate OpenAPI clients for the expiry, permission and secret update docs
+- **release:** Prepare SDKs for libraries/v0.1.0-beta.64 ([#2089](https://github.com/gotempsh/temps/issues/2089))
+- **release:** Prepare SDKs for v0.1.0-beta.65 ([#2114](https://github.com/gotempsh/temps/issues/2114))
+
+### Performance
+
+- **status-page:** Reach back only for intervals that can still cover the uptime window
+
+### Refactor
+
+- **web:** Rotate git provider credentials through the generated client
+- **git:** Move the exact branch lookup into the git provider service
+- **ci-tokens:** Move deployment token service tests into a sibling file
+- **auth:** Move API key service tests into a sibling file
+- **proxy:** Move edge rule service tests into a sibling file
+- **environments:** Move project secret service tests into sibling files
+
+### Testing
+
+- **ai-agents:** Cover the cached harness status endpoint through its sign-in and permission guards
+- **web:** Cover the sidebar's service views and the one row of tabs end to end
+- **web:** Walk the server's pages through the Server row in the navigation spec
+- **api:** Build the test targets against the paged incident updates and pass clippy
+- **cli:** Fall back to the real prompts in the interactive apikeys tests
+- **evals:** Add plugin eval cases for the agent install journeys
+
+<!-- generated by git-cliff -->
+
 ## [0.1.0-beta.63] - 2026-11-18
 
 ### Added
