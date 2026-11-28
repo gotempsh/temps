@@ -25,6 +25,8 @@ pub enum CustomDomainError {
     Database(#[from] sea_orm::DbErr),
     #[error("Custom domain not found: {0}")]
     NotFound(String),
+    #[error("Project {project_id} not found")]
+    ProjectNotFound { project_id: i32 },
     #[error("Invalid custom domain: {0}")]
     InvalidDomain(String),
     #[error("Duplicate domain: {0}")]
@@ -52,6 +54,22 @@ pub enum CustomDomainError {
     },
     #[error("Invalid redirect status code {code}: expected 301, 302, 303, 307 or 308")]
     InvalidRedirectStatusCode { code: i32 },
+    /// A status code only applies to a redirect; stored alone it does nothing.
+    #[error(
+        "Custom domain '{domain}' would have status_code {code} but no redirect_to; a status \
+         code only applies to a redirect, so set redirect_to or clear status_code (null)"
+    )]
+    StatusCodeWithoutRedirect { domain: String, code: i32 },
+    /// `service_name` picks a Docker Compose service; other projects have none.
+    #[error(
+        "service_name '{service_name}' only applies to Docker Compose projects; project \
+         {project_id} uses the '{preset}' preset"
+    )]
+    ServiceNameRequiresCompose {
+        project_id: i32,
+        service_name: String,
+        preset: String,
+    },
     #[error("Invalid redirect URL: {0}")]
     InvalidRedirectUrl(String),
     #[error(
@@ -289,14 +307,28 @@ impl CustomDomainService {
         let trimmed = redirect_url.trim();
 
         // If the URL already has a scheme, return as-is.
-        // This preserves invalid schemes (ftp://, file://, etc.) so that
-        // validate_external_url can reject them.
-        if trimmed.contains("://") {
+        // This preserves invalid schemes (ftp://, file://, javascript:, etc.)
+        // so that validation rejects them for their scheme.
+        if trimmed.contains("://") || Self::redirect_scheme(trimmed).is_some() {
             return trimmed.to_string();
         }
 
         // Add https:// scheme by default for bare domains like "example.com"
         format!("https://{}", trimmed)
+    }
+
+    /// The scheme of a redirect target written without `//`, such as
+    /// `javascript:alert(1)` or `mailto:ops@example.com`. A `host:port` such as
+    /// `example.com:8080/path` is not a scheme: what follows its colon is a
+    /// port, so it starts with a digit.
+    fn redirect_scheme(target: &str) -> Option<&str> {
+        let (scheme, rest) = target.split_once(':')?;
+        let mut chars = scheme.chars();
+        let starts_with_letter = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
+        let scheme_chars = chars.all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+        let rest_is_port = rest.chars().next().is_some_and(|c| c.is_ascii_digit());
+        (starts_with_letter && scheme_chars && !rest_is_port && !scheme.contains('.'))
+            .then_some(scheme)
     }
 
     /// Validates a redirect URL to prevent SSRF and circular redirects
@@ -323,6 +355,16 @@ impl CustomDomainService {
     ) -> Result<String, CustomDomainError> {
         // Normalize the URL by adding https:// if no scheme is present
         let normalized_url = Self::normalize_redirect_url(redirect_url);
+        let scheme = normalized_url
+            .split_once(':')
+            .map(|(scheme, _)| scheme.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(scheme.as_str(), "http" | "https") {
+            return Err(CustomDomainError::InvalidRedirectUrl(format!(
+                "Invalid redirect URL '{redirect_url}': the '{scheme}' scheme is not supported; \
+                 use http:// or https:// (or a bare host such as example.com)"
+            )));
+        }
 
         // Validate URL format and prevent SSRF
         let parsed_url = url_validation::validate_external_url(&normalized_url).map_err(|e| {
@@ -511,6 +553,20 @@ impl CustomDomainService {
             .unwrap_or(&domain)
             .to_ascii_lowercase();
         Self::ensure_domain_is_wellformed(&domain)?;
+
+        if let Some(code) = status_code {
+            if redirect_to.as_deref().is_none_or(str::is_empty) {
+                return Err(CustomDomainError::StatusCodeWithoutRedirect { domain, code });
+            }
+        }
+
+        // A missing project is a 404 for the project, not a 400 saying the
+        // environment does not belong to it.
+        self.require_project(project_id).await?;
+        let service_name = service_name.filter(|name| !name.is_empty());
+        if let Some(name) = &service_name {
+            self.ensure_service_name_allowed(project_id, name).await?;
+        }
 
         // The caller is authorized against `project_id`; `environment_id` comes
         // from the request body and must be proven to belong to it.
@@ -919,11 +975,43 @@ impl CustomDomainService {
         &self,
         project_id: i32,
     ) -> Result<Vec<project_custom_domains::Model>, CustomDomainError> {
+        self.require_project(project_id).await?;
         let custom_domains = project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::ProjectId.eq(project_id))
             .all(self.db.as_ref())
             .await?;
         Ok(custom_domains)
+    }
+
+    /// Refuse a `service_name` on a project that is not Docker Compose: only
+    /// a Compose project has services for the domain to route to.
+    async fn ensure_service_name_allowed(
+        &self,
+        project_id: i32,
+        service_name: &str,
+    ) -> Result<(), CustomDomainError> {
+        let project = temps_entities::projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(CustomDomainError::ProjectNotFound { project_id })?;
+        if project.preset == temps_entities::preset::Preset::DockerCompose {
+            return Ok(());
+        }
+        Err(CustomDomainError::ServiceNameRequiresCompose {
+            project_id,
+            service_name: service_name.to_string(),
+            preset: project.preset.as_str().to_string(),
+        })
+    }
+
+    /// [`CustomDomainError::ProjectNotFound`] unless the project exists and
+    /// is not deleted.
+    async fn require_project(&self, project_id: i32) -> Result<(), CustomDomainError> {
+        if temps_entities::projects::live_project_exists(self.db.as_ref(), project_id).await? {
+            Ok(())
+        } else {
+            Err(CustomDomainError::ProjectNotFound { project_id })
+        }
     }
 
     /// List all custom domains for an environment
@@ -946,7 +1034,8 @@ impl CustomDomainService {
         domain: Option<String>,
         environment_id: Option<i32>,
         redirect_to: Option<String>,
-        status_code: Option<i32>,
+        // `None` keeps it, `Some(None)` (or `Some(Some(0))`) clears it.
+        status_code: Option<Option<i32>>,
         branch: Option<String>,
         status: Option<String>,
         message: Option<String>,
@@ -1004,6 +1093,10 @@ impl CustomDomainService {
                 .await?;
             active_model.environment_id = Set(env_id);
         }
+        let redirect_after = match &redirect_to {
+            Some(redirect) => !redirect.is_empty(),
+            None => custom_domain.redirect_to.is_some(),
+        };
         if let Some(redirect) = redirect_to {
             // Empty string means clear the field
             if redirect.is_empty() {
@@ -1016,15 +1109,25 @@ impl CustomDomainService {
                 active_model.redirect_to = Set(Some(normalized_redirect));
             }
         }
-        if let Some(code) = status_code {
-            // 0 means clear the field
-            if code == 0 {
-                active_model.status_code = Set(None);
-            } else {
+        let status_after = match status_code {
+            // null or 0 clears the field
+            Some(None) | Some(Some(0)) => None,
+            Some(Some(code)) => {
                 validate_redirect_status_code(code)?;
-                active_model.status_code = Set(Some(code));
+                Some(code)
             }
+            // Clearing the redirect clears its status code with it: alone it
+            // does nothing, and it must not come back with a later redirect.
+            None if !redirect_after => None,
+            None => custom_domain.status_code,
+        };
+        if let Some(code) = status_after.filter(|_| !redirect_after) {
+            return Err(CustomDomainError::StatusCodeWithoutRedirect {
+                domain: final_domain.to_string(),
+                code,
+            });
         }
+        active_model.status_code = Set(status_after);
         if let Some(b) = branch {
             // Empty string means clear the field
             if b.is_empty() {
@@ -1046,6 +1149,8 @@ impl CustomDomainService {
             if sn.is_empty() {
                 active_model.service_name = Set(None);
             } else {
+                self.ensure_service_name_allowed(custom_domain.project_id, &sn)
+                    .await?;
                 active_model.service_name = Set(Some(sn));
             }
         }
@@ -2387,6 +2492,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_missing_project_is_project_not_found_for_list_and_create() {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (_project_id, env_id) = setup_test_data(&test_db.db).await;
+
+        let listed = service.list_custom_domains_for_project(999_999).await;
+        assert!(
+            matches!(
+                listed,
+                Err(CustomDomainError::ProjectNotFound {
+                    project_id: 999_999
+                })
+            ),
+            "{listed:?}"
+        );
+
+        let created = service
+            .create_custom_domain(
+                999_999,
+                env_id,
+                "missing-project.example.com".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(
+                created,
+                Err(CustomDomainError::ProjectNotFound {
+                    project_id: 999_999
+                })
+            ),
+            "{created:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_list_custom_domains_for_project() {
         let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
@@ -2486,7 +2633,7 @@ mod tests {
                 Some("updated-domain.com".to_string()),
                 None,
                 Some("https://redirect.com".to_string()),
-                Some(301),
+                Some(Some(301)),
                 Some("main".to_string()),
                 None,
                 None,
@@ -3007,10 +3154,186 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             CustomDomainError::InvalidRedirectUrl(msg) => {
-                assert!(msg.contains("URL scheme must be HTTP or HTTPS"));
+                assert!(msg.contains("the 'ftp' scheme is not supported"), "{msg}");
             }
             e => panic!("Expected InvalidRedirectUrl error, got: {:?}", e),
         }
+    }
+
+    /// #2103: `javascript:alert(1)` used to be read as host `javascript` with
+    /// an invalid port, and the error blamed the port.
+    #[test]
+    fn a_schemed_redirect_without_slashes_keeps_its_scheme() {
+        assert_eq!(
+            CustomDomainService::redirect_scheme("javascript:alert(1)"),
+            Some("javascript")
+        );
+        assert_eq!(
+            CustomDomainService::redirect_scheme("mailto:ops@example.com"),
+            Some("mailto")
+        );
+        assert_eq!(
+            CustomDomainService::redirect_scheme("example.com:8080/x"),
+            None
+        );
+        assert_eq!(CustomDomainService::redirect_scheme("localhost:3000"), None);
+        assert_eq!(CustomDomainService::redirect_scheme("example.com"), None);
+        assert_eq!(
+            CustomDomainService::normalize_redirect_url("target.example.com"),
+            "https://target.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_javascript_redirect_is_refused_for_its_scheme() {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
+            eprintln!("Skipping: no database container runtime");
+            return;
+        };
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (project_id, env_id) = setup_test_data(&test_db.db).await;
+        let error = service
+            .create_custom_domain(
+                project_id,
+                env_id,
+                "js-test.example.com".to_string(),
+                Some("javascript:alert(1)".to_string()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("only http and https redirect");
+        let CustomDomainError::InvalidRedirectUrl(message) = error else {
+            panic!("expected InvalidRedirectUrl, got {error:?}");
+        };
+        assert!(
+            message.contains("the 'javascript' scheme is not supported"),
+            "{message}"
+        );
+        // Not mistaken for a host with a port ("javascript" : "alert(1)").
+        assert!(!message.contains(" port"), "{message}");
+    }
+
+    /// #2103: a status code needs a redirect, can be cleared with null, and
+    /// goes away with the redirect it belongs to.
+    #[tokio::test]
+    async fn a_status_code_needs_a_redirect_and_clears_with_null_or_with_it() {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
+            eprintln!("Skipping: no database container runtime");
+            return;
+        };
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (project_id, env_id) = setup_test_data(&test_db.db).await;
+
+        let alone = service
+            .create_custom_domain(
+                project_id,
+                env_id,
+                "r3.example.com".to_string(),
+                None,
+                Some(301),
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(alone, Err(CustomDomainError::StatusCodeWithoutRedirect { ref domain, code: 301 }) if domain == "r3.example.com"),
+            "{alone:?}"
+        );
+
+        let domain = service
+            .create_custom_domain(
+                project_id,
+                env_id,
+                "r1.example.com".to_string(),
+                Some("https://target.example.com".to_string()),
+                Some(301),
+                None,
+                None,
+            )
+            .await
+            .expect("a redirect with its status code");
+        let update = |redirect: Option<&str>, status: Option<Option<i32>>| {
+            service.update_custom_domain(
+                domain.id,
+                None,
+                None,
+                redirect.map(str::to_string),
+                status,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+
+        // `"status_code": null` clears it and keeps the redirect.
+        let cleared = update(None, Some(None)).await.expect("null clears");
+        assert_eq!(cleared.status_code, None);
+        assert_eq!(
+            cleared.redirect_to.as_deref(),
+            Some("https://target.example.com")
+        );
+
+        // Clearing the redirect takes its status code with it.
+        update(None, Some(Some(308))).await.expect("set again");
+        let unredirected = update(Some(""), None).await.expect("clear the redirect");
+        assert_eq!(unredirected.redirect_to, None);
+        assert_eq!(unredirected.status_code, None);
+
+        // And a status code alone is refused on update too.
+        let refused = update(None, Some(Some(301))).await;
+        assert!(
+            matches!(
+                refused,
+                Err(CustomDomainError::StatusCodeWithoutRedirect { .. })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// #2103: `service_name` routes to a Compose service; other projects have
+    /// none, so it is refused instead of stored and ignored.
+    #[tokio::test]
+    async fn a_service_name_is_only_accepted_on_a_compose_project() {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
+            eprintln!("Skipping: no database container runtime");
+            return;
+        };
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (project_id, env_id) = setup_test_data(&test_db.db).await;
+        let create = |host: &str| {
+            service.create_custom_domain(
+                project_id,
+                env_id,
+                host.to_string(),
+                None,
+                None,
+                None,
+                Some("web".to_string()),
+            )
+        };
+        let refused = create("svc.example.com").await;
+        assert!(
+            matches!(refused, Err(CustomDomainError::ServiceNameRequiresCompose { project_id: id, ref service_name, .. }) if id == project_id && service_name == "web"),
+            "{refused:?}"
+        );
+
+        let mut project: temps_entities::projects::ActiveModel =
+            temps_entities::projects::Entity::find_by_id(project_id)
+                .one(test_db.db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        project.preset = Set(PresetType::DockerCompose);
+        project.update(test_db.db.as_ref()).await.unwrap();
+        let created = create("svc.example.com")
+            .await
+            .expect("a Compose project has services");
+        assert_eq!(created.service_name.as_deref(), Some("web"));
     }
 
     #[tokio::test]
@@ -3055,7 +3378,7 @@ mod tests {
                 None,
                 None,
                 Some("https://update-a.example.com".to_string()),
-                Some(301),
+                Some(Some(301)),
                 None,
                 None,
                 None,
@@ -3102,7 +3425,7 @@ mod tests {
                 None,
                 None,
                 Some("https://new-target.example.com".to_string()),
-                Some(301),
+                Some(Some(301)),
                 None,
                 None,
                 None,
@@ -3135,9 +3458,19 @@ mod tests {
             } else {
                 None
             };
+            // A status code belongs to a redirect (#2103).
+            let status_code = redirect.is_some().then_some(301);
 
             service
-                .create_custom_domain(project_id, env_id, domain, redirect, Some(301), None, None)
+                .create_custom_domain(
+                    project_id,
+                    env_id,
+                    domain,
+                    redirect,
+                    status_code,
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -3155,7 +3488,7 @@ mod tests {
                 None,
                 None,
                 Some("https://depth-0.example.com".to_string()),
-                Some(301),
+                Some(Some(301)),
                 None,
                 None,
                 None,

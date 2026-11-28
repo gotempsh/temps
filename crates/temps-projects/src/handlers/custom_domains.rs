@@ -57,6 +57,10 @@ use utoipa::OpenApi;
 pub struct CustomDomainsApiDoc;
 
 /// Create a custom domain for a project
+///
+/// Requires `projects:write` on the project. A project's custom domains are
+/// governed by the `projects:*` permissions, not `domains:*` (which governs
+/// the instance's domains and certificates).
 #[utoipa::path(
     post,
     path = "/{project_id}/custom-domains",
@@ -127,7 +131,7 @@ pub async fn create_custom_domain(
     ))
 }
 
-/// Get a custom domain by ID
+/// Get a custom domain by ID. Requires `projects:read`.
 #[utoipa::path(
     get,
     path = "/{project_id}/custom-domains/{domain_id}",
@@ -173,7 +177,9 @@ pub async fn get_custom_domain(
     if custom_domain.project_id != project_id {
         return Err(problemdetails::new(StatusCode::NOT_FOUND)
             .with_title("Custom domain not found")
-            .with_detail("Domain does not belong to the specified project"));
+            .with_detail(format!(
+                "Custom domain {domain_id} not found in project {project_id}"
+            )));
     }
 
     let domain_with_info = state
@@ -189,7 +195,7 @@ pub async fn get_custom_domain(
     ))
 }
 
-/// List all custom domains for a project
+/// List all custom domains for a project. Requires `projects:read`.
 #[utoipa::path(
     get,
     path = "/{project_id}/custom-domains",
@@ -432,7 +438,8 @@ async fn execute_reassignment(
     Ok(updated_domain)
 }
 
-/// Update a custom domain
+/// Update a custom domain. Omitted fields are kept; unknown fields are refused.
+/// Requires `projects:write`.
 #[utoipa::path(
     put,
     path = "/{project_id}/custom-domains/{domain_id}",
@@ -485,7 +492,9 @@ pub async fn update_custom_domain(
     if existing_domain.project_id != project_id {
         return Err(problemdetails::new(StatusCode::NOT_FOUND)
             .with_title("Custom domain not found")
-            .with_detail("Domain does not belong to the specified project"));
+            .with_detail(format!(
+                "Custom domain {domain_id} not found in project {project_id}"
+            )));
     }
 
     // If only domain and/or environment_id are sent (no redirect fields), clear redirect settings
@@ -519,7 +528,7 @@ pub async fn update_custom_domain(
                 None,
                 None,
                 Some("".to_string()), // Empty string to clear
-                Some(0),              // 0 to clear status code
+                Some(None),           // clear status code
                 Some("".to_string()), // Empty string to clear branch
                 None,
                 None,
@@ -544,7 +553,7 @@ pub async fn update_custom_domain(
     ))
 }
 
-/// Delete a custom domain
+/// Delete a custom domain. Requires `projects:delete`.
 #[utoipa::path(
     delete,
     path = "/{project_id}/custom-domains/{domain_id}",
@@ -594,7 +603,9 @@ pub async fn delete_custom_domain(
     if existing_domain.project_id != project_id {
         return Err(problemdetails::new(StatusCode::NOT_FOUND)
             .with_title("Custom domain not found")
-            .with_detail("Domain does not belong to the specified project"));
+            .with_detail(format!(
+                "Custom domain {domain_id} not found in project {project_id}"
+            )));
     }
 
     state
@@ -605,7 +616,7 @@ pub async fn delete_custom_domain(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Link a custom domain to a certificate
+/// Link a custom domain to a certificate. Requires `projects:write`.
 #[utoipa::path(
     post,
     path = "/{project_id}/custom-domains/{domain_id}/link-certificate/{certificate_id}",
@@ -656,7 +667,9 @@ pub async fn link_custom_domain_to_certificate(
     if existing_domain.project_id != project_id {
         return Err(problemdetails::new(StatusCode::NOT_FOUND)
             .with_title("Custom domain not found")
-            .with_detail("Domain does not belong to the specified project"));
+            .with_detail(format!(
+                "Custom domain {domain_id} not found in project {project_id}"
+            )));
     }
 
     let updated_domain = state

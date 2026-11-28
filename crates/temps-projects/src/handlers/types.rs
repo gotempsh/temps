@@ -749,14 +749,25 @@ impl ProjectResponse {
     }
 }
 
+/// A custom domain to add. Unknown fields are refused, so a misspelt one is
+/// an error instead of being ignored.
 #[derive(Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CustomDomainRequest {
+    /// Hostname. Stored lower-cased and without a trailing dot
+    /// (`Shop.Example.COM.` is stored as `shop.example.com`).
+    #[schema(example = "shop.example.com")]
     pub domain: String,
+    /// Redirect every request to this URL instead of serving the environment.
+    /// `http://` or `https://`; a bare host gets `https://`.
     pub redirect_to: Option<String>,
+    /// Status of the redirect: 301, 302, 303, 307 or 308. Requires
+    /// `redirect_to`.
     pub status_code: Option<i32>,
     pub branch: Option<String>,
     pub environment_id: i32,
-    /// Docker Compose service name this domain routes to (only for docker-compose projects)
+    /// Docker Compose service this domain routes to. Only for Docker Compose
+    /// projects; refused on others.
     pub service_name: Option<String>,
 }
 
@@ -1254,14 +1265,26 @@ pub struct ContainerLogsQuery {
     pub tail: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, ToSchema)]
+/// Changes to a custom domain; omitted fields are kept. Unknown fields are
+/// refused, so a misspelt one is an error instead of a silent no-op.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateCustomDomainRequest {
+    /// New hostname, normalised like on create (lower-cased, no trailing dot).
     pub domain: Option<String>,
     pub environment_id: Option<i32>,
+    /// Redirect target; an empty string clears the redirect, and its
+    /// `status_code` with it.
     pub redirect_to: Option<String>,
-    pub status_code: Option<i32>,
+    /// Redirect status (301, 302, 303, 307 or 308); `null` (or `0`) clears
+    /// it. Only valid while the domain has a `redirect_to`.
+    #[serde(default, deserialize_with = "temps_core::nullable::deserialize")]
+    #[schema(value_type = Option<i32>, nullable)]
+    pub status_code: Option<Option<i32>>,
+    /// Branch; an empty string clears it.
     pub branch: Option<String>,
-    /// Docker Compose service name this domain routes to (empty string clears it)
+    /// Docker Compose service this domain routes to (Compose projects only);
+    /// an empty string clears it.
     pub service_name: Option<String>,
 }
 
@@ -1540,6 +1563,9 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
             CustomDomainError::NotFound(msg) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Custom Domain Not Found")
                 .with_detail(msg),
+            CustomDomainError::ProjectNotFound { project_id } => {
+                temps_core::api_problems::project_not_found(project_id)
+            }
             CustomDomainError::InvalidDomain(msg) => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Domain")
                 .with_detail(msg),
@@ -1559,6 +1585,12 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
             CustomDomainError::DeliveryBindingBlocksChange { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Domain delivery is configured")
+                    .with_detail(error.to_string())
+            }
+            CustomDomainError::StatusCodeWithoutRedirect { .. }
+            | CustomDomainError::ServiceNameRequiresCompose { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Custom Domain")
                     .with_detail(error.to_string())
             }
             CustomDomainError::InvalidRedirectStatusCode { .. } => {
