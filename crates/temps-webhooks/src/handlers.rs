@@ -4,7 +4,7 @@
 //! HTTP handlers for webhook management.
 
 use crate::events::WebhookEventType;
-use crate::service::{CreateWebhookRequest, UpdateWebhookRequest, WebhookService};
+use crate::service::{CreateWebhookRequest, UpdateWebhookRequest, WebhookError, WebhookService};
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
@@ -147,12 +147,15 @@ impl From<temps_entities::webhooks::Model> for WebhookResponse {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateWebhookRequestBody {
-    /// Target URL for webhook delivery
-    #[schema(example = "https://example.com/webhook")]
+    /// Target URL for webhook delivery: http(s), at most 2048 characters, and
+    /// not a loopback, private, link-local or cloud-metadata address.
+    #[schema(example = "https://example.com/webhook", max_length = 2048)]
     pub url: String,
-    /// Secret for HMAC signature verification (optional)
+    /// Secret for HMAC signature verification (optional). Must not be empty;
+    /// omit it for an unsigned webhook.
+    #[schema(value_type = Option<String>, min_length = 1)]
     pub secret: Option<SecretString>,
-    /// Event types to subscribe to
+    /// Event types to subscribe to. Duplicates are stored once.
     #[schema(example = json!(["deployment.created", "deployment.succeeded"]))]
     pub events: Vec<String>,
     /// Whether the webhook is enabled
@@ -162,11 +165,16 @@ pub struct CreateWebhookRequestBody {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateWebhookRequestBody {
-    /// Target URL for webhook delivery
+    /// Target URL for webhook delivery (same rules as on create)
+    #[schema(max_length = 2048)]
     pub url: Option<String>,
-    /// Secret for HMAC signature verification
-    pub secret: Option<SecretString>,
-    /// Event types to subscribe to
+    /// Secret for HMAC signature verification. Omit to keep the current one,
+    /// send `null` to remove it (deliveries are then unsigned), or a
+    /// non-empty string to replace it.
+    #[serde(default, deserialize_with = "temps_core::nullable::deserialize")]
+    #[schema(value_type = Option<String>, nullable, min_length = 1)]
+    pub secret: Option<Option<SecretString>>,
+    /// Event types to subscribe to. Duplicates are stored once.
     pub events: Option<Vec<String>>,
     /// Whether the webhook is enabled
     pub enabled: Option<bool>,
@@ -234,6 +242,61 @@ pub struct ListDeliveriesQuery {
 // Handlers
 // ============================================================================
 
+/// `type` of the 400 for a webhook URL that is malformed or not allowed.
+pub const INVALID_WEBHOOK_URL_PROBLEM_TYPE: &str = "https://temps.sh/probs/invalid-webhook-url";
+/// `type` of the 400 for any other invalid webhook field.
+pub const WEBHOOK_VALIDATION_PROBLEM_TYPE: &str = "https://temps.sh/probs/invalid-webhook";
+/// `type` of the 404 for a webhook that is not one of the project's.
+pub const WEBHOOK_NOT_FOUND_PROBLEM_TYPE: &str = "https://temps.sh/probs/webhook-not-found";
+
+/// The 404 for a webhook id that is not a webhook of `project_id`.
+fn webhook_not_found(project_id: i32, webhook_id: i32) -> Problem {
+    ErrorBuilder::new(StatusCode::NOT_FOUND)
+        .type_(WEBHOOK_NOT_FOUND_PROBLEM_TYPE)
+        .title("Webhook Not Found")
+        .detail(format!(
+            "Webhook {webhook_id} not found in project {project_id}"
+        ))
+        .value("project_id", project_id)
+        .value("webhook_id", webhook_id)
+        .build()
+}
+
+/// The Problem for a webhook service error. `title` names the operation, for
+/// the errors that are the server's fault.
+fn webhook_error_problem(error: WebhookError, title: &str) -> Problem {
+    match error {
+        WebhookError::ProjectNotFound { project_id } => {
+            temps_core::api_problems::project_not_found(project_id)
+        }
+        WebhookError::InvalidUrl { .. } => ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .type_(INVALID_WEBHOOK_URL_PROBLEM_TYPE)
+            .title("Invalid Webhook URL")
+            .detail(error.to_string())
+            .value("field", "url")
+            .build(),
+        WebhookError::Validation { field, .. } => ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .type_(WEBHOOK_VALIDATION_PROBLEM_TYPE)
+            .title("Invalid Webhook")
+            .detail(error.to_string())
+            .value("field", field)
+            .build(),
+        WebhookError::Database(_)
+        | WebhookError::NotFound(_)
+        | WebhookError::DeliveryNotInScope { .. }
+        | WebhookError::RetryInProgress { .. }
+        | WebhookError::HttpError(_)
+        | WebhookError::Serialization(_)
+        | WebhookError::InvalidConfiguration(_) => {
+            error!("{title}: {error}");
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title(title)
+                .detail(error.to_string())
+                .build()
+        }
+    }
+}
+
 /// List all webhooks for a project
 #[utoipa::path(
     get,
@@ -271,13 +334,7 @@ async fn list_webhooks(
             let responses: Vec<WebhookResponse> = webhooks.into_iter().map(Into::into).collect();
             Ok(Json(responses))
         }
-        Err(e) => {
-            error!("Failed to list webhooks: {}", e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to list webhooks")
-                .detail(e.to_string())
-                .build())
-        }
+        Err(e) => Err(webhook_error_problem(e, "Failed to list webhooks")),
     }
 }
 
@@ -310,16 +367,11 @@ async fn get_webhook(
     match state.webhook_service.get_webhook(webhook_id).await {
         Ok(Some(webhook)) => {
             if webhook.project_id != project_id {
-                return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-                    .title("Webhook not found")
-                    .detail("Webhook does not belong to this project")
-                    .build());
+                return Err(webhook_not_found(project_id, webhook_id));
             }
             Ok(Json(WebhookResponse::from(webhook)))
         }
-        Ok(None) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-            .title("Webhook not found")
-            .build()),
+        Ok(None) => Err(webhook_not_found(project_id, webhook_id)),
         Err(e) => {
             error!("Failed to get webhook: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -362,10 +414,18 @@ fn parse_event_types(names: &[String]) -> Result<Vec<WebhookEventType>, Problem>
             "At least one valid event type is required".to_string(),
         ));
     }
-    Ok(names
+    // Each event once, in the order first given: a subscription is a set,
+    // and storing the same name thousands of times only bloats the row.
+    let mut events: Vec<WebhookEventType> = Vec::new();
+    for event in names
         .iter()
         .filter_map(|name| WebhookEventType::from_str(name))
-        .collect())
+    {
+        if !events.contains(&event) {
+            events.push(event);
+        }
+    }
+    Ok(events)
 }
 
 fn subscribes_to_backup_events(events: &[WebhookEventType]) -> bool {
@@ -440,13 +500,7 @@ async fn create_webhook(
 
             Ok((StatusCode::CREATED, Json(WebhookResponse::from(webhook))))
         }
-        Err(e) => {
-            error!("Failed to create webhook: {}", e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to create webhook")
-                .detail(e.to_string())
-                .build())
-        }
+        Err(e) => Err(webhook_error_problem(e, "Failed to create webhook")),
     }
 }
 
@@ -484,10 +538,7 @@ async fn update_webhook(
     let mut existing_subscribes_to_backup_events = false;
     if let Ok(Some(existing)) = state.webhook_service.get_webhook(webhook_id).await {
         if existing.project_id != project_id {
-            return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-                .title("Webhook not found")
-                .detail("Webhook does not belong to this project")
-                .build());
+            return Err(webhook_not_found(project_id, webhook_id));
         }
         let existing_events: Vec<String> =
             serde_json::from_str(&existing.events).unwrap_or_default();
@@ -513,7 +564,9 @@ async fn update_webhook(
 
     let request = UpdateWebhookRequest {
         url: body.url,
-        secret: body.secret.map(SecretString::into_exposed),
+        secret: body
+            .secret
+            .map(|secret| secret.map(SecretString::into_exposed)),
         events,
         enabled: body.enabled,
     };
@@ -541,16 +594,8 @@ async fn update_webhook(
 
             Ok(Json(WebhookResponse::from(webhook)))
         }
-        Ok(None) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-            .title("Webhook not found")
-            .build()),
-        Err(e) => {
-            error!("Failed to update webhook: {}", e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to update webhook")
-                .detail(e.to_string())
-                .build())
-        }
+        Ok(None) => Err(webhook_not_found(project_id, webhook_id)),
+        Err(e) => Err(webhook_error_problem(e, "Failed to update webhook")),
     }
 }
 
@@ -584,10 +629,7 @@ async fn delete_webhook(
     // Verify webhook belongs to project
     if let Ok(Some(existing)) = state.webhook_service.get_webhook(webhook_id).await {
         if existing.project_id != project_id {
-            return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-                .title("Webhook not found")
-                .detail("Webhook does not belong to this project")
-                .build());
+            return Err(webhook_not_found(project_id, webhook_id));
         }
     }
 
@@ -610,9 +652,7 @@ async fn delete_webhook(
 
             Ok(StatusCode::NO_CONTENT)
         }
-        Ok(false) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-            .title("Webhook not found")
-            .build()),
+        Ok(false) => Err(webhook_not_found(project_id, webhook_id)),
         Err(e) => {
             error!("Failed to delete webhook: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -653,10 +693,7 @@ async fn list_deliveries(
     // Verify webhook belongs to project
     if let Ok(Some(existing)) = state.webhook_service.get_webhook(webhook_id).await {
         if existing.project_id != project_id {
-            return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-                .title("Webhook not found")
-                .detail("Webhook does not belong to this project")
-                .build());
+            return Err(webhook_not_found(project_id, webhook_id));
         }
     }
 
@@ -712,10 +749,7 @@ async fn get_delivery(
     // Verify webhook belongs to project
     if let Ok(Some(existing)) = state.webhook_service.get_webhook(webhook_id).await {
         if existing.project_id != project_id {
-            return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-                .title("Webhook not found")
-                .detail("Webhook does not belong to this project")
-                .build());
+            return Err(webhook_not_found(project_id, webhook_id));
         }
     }
 

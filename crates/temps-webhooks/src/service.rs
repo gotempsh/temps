@@ -27,6 +27,9 @@ pub enum WebhookError {
     #[error("Webhook not found: {0}")]
     NotFound(i32),
 
+    #[error("Project {project_id} not found")]
+    ProjectNotFound { project_id: i32 },
+
     #[error(
         "Webhook delivery {delivery_id} not found for webhook {webhook_id} in project {project_id}"
     )]
@@ -53,6 +56,37 @@ pub enum WebhookError {
 
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
+
+    /// The target URL is malformed, not http(s), too long, or points at an
+    /// address deliveries refuse (loopback, private, cloud metadata, a name
+    /// that does not resolve). A client error, never a 500.
+    #[error("Invalid webhook URL: {reason}")]
+    InvalidUrl { reason: String },
+
+    #[error("Invalid webhook {field}: {message}")]
+    Validation {
+        field: &'static str,
+        message: String,
+    },
+}
+
+/// Longest webhook URL accepted, in characters. Far above any real endpoint,
+/// and keeps one row from holding an unbounded string.
+pub const MAX_WEBHOOK_URL_CHARS: usize = 2048;
+
+/// An empty secret would sign every delivery with an empty HMAC key, which
+/// proves nothing to the receiver: omit it (create) or send `null` (update)
+/// for an unsigned webhook instead.
+fn validate_secret(secret: &str) -> Result<(), WebhookError> {
+    if secret.is_empty() {
+        return Err(WebhookError::Validation {
+            field: "secret",
+            message: "must not be empty; omit it for an unsigned webhook, or send null on update \
+                      to remove the current one"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Result of a webhook delivery attempt
@@ -143,7 +177,9 @@ pub struct CreateWebhookRequest {
 #[derive(Debug, Clone)]
 pub struct UpdateWebhookRequest {
     pub url: Option<String>,
-    pub secret: Option<String>,
+    /// `None` keeps the stored secret, `Some(None)` removes it (deliveries
+    /// are then unsigned), `Some(Some(secret))` replaces it.
+    pub secret: Option<Option<String>>,
     pub events: Option<Vec<WebhookEventType>>,
     pub enabled: Option<bool>,
 }
@@ -194,6 +230,10 @@ impl WebhookService {
         &self,
         request: CreateWebhookRequest,
     ) -> Result<temps_entities::webhooks::Model, WebhookError> {
+        self.require_project(request.project_id).await?;
+        if let Some(secret) = &request.secret {
+            validate_secret(secret)?;
+        }
         // SECURITY: Validate URL to prevent SSRF attacks
         self.validate_webhook_url(&request.url).await?;
 
@@ -228,6 +268,17 @@ impl WebhookService {
         Ok(result)
     }
 
+    /// A missing (or deleted) project is [`WebhookError::ProjectNotFound`],
+    /// so a listing is not an empty 200 and a create is not a foreign-key
+    /// violation surfaced as a 500.
+    async fn require_project(&self, project_id: i32) -> Result<(), WebhookError> {
+        if temps_entities::projects::live_project_exists(self.db.as_ref(), project_id).await? {
+            Ok(())
+        } else {
+            Err(WebhookError::ProjectNotFound { project_id })
+        }
+    }
+
     /// Get a webhook by ID
     pub async fn get_webhook(
         &self,
@@ -259,6 +310,7 @@ impl WebhookService {
         page: u64,
         page_size: u64,
     ) -> Result<Vec<temps_entities::webhooks::Model>, WebhookError> {
+        self.require_project(project_id).await?;
         let webhooks = temps_entities::webhooks::Entity::find()
             .filter(temps_entities::webhooks::Column::ProjectId.eq(project_id))
             .order_by_desc(temps_entities::webhooks::Column::CreatedAt)
@@ -290,12 +342,17 @@ impl WebhookService {
             active_model.url = Set(url);
         }
 
-        if let Some(secret) = request.secret {
-            let encrypted = self
-                .encryption_service
-                .encrypt(secret.as_bytes())
-                .map_err(|e| WebhookError::InvalidConfiguration(e.to_string()))?;
-            active_model.secret = Set(Some(encrypted));
+        match request.secret {
+            None => {}
+            Some(None) => active_model.secret = Set(None),
+            Some(Some(secret)) => {
+                validate_secret(&secret)?;
+                let encrypted = self
+                    .encryption_service
+                    .encrypt(secret.as_bytes())
+                    .map_err(|e| WebhookError::InvalidConfiguration(e.to_string()))?;
+                active_model.secret = Set(Some(encrypted));
+            }
         }
 
         if let Some(events) = request.events {
@@ -825,20 +882,25 @@ impl WebhookService {
     /// - Port scanning the internal network
     /// - Exfiltrating data via DNS rebinding attacks
     async fn validate_webhook_url(&self, url: &str) -> Result<(), WebhookError> {
+        let length = url.chars().count();
+        if length > MAX_WEBHOOK_URL_CHARS {
+            return Err(WebhookError::InvalidUrl {
+                reason: format!("it is {length} characters; at most {MAX_WEBHOOK_URL_CHARS}"),
+            });
+        }
         // Basic URL format and scheme validation
         let parsed = temps_core::url_validation::validate_external_url(url).map_err(|e| {
-            WebhookError::InvalidConfiguration(format!("Invalid webhook URL: {}", e))
+            WebhookError::InvalidUrl {
+                reason: e.to_string(),
+            }
         })?;
 
         // For domain names, perform DNS resolution and validate resolved IPs
         if let Some(url::Host::Domain(domain)) = parsed.host() {
             temps_core::url_validation::validate_domain_async(domain)
                 .await
-                .map_err(|e| {
-                    WebhookError::InvalidConfiguration(format!(
-                        "Webhook URL domain validation failed: {}",
-                        e
-                    ))
+                .map_err(|e| WebhookError::InvalidUrl {
+                    reason: format!("domain '{domain}' failed validation: {e}"),
                 })?;
         }
 
@@ -863,11 +925,71 @@ mod tests {
         WebhookService::new(db, encryption_service)
     }
 
+    /// The row `live_project_exists` selects (only the id column).
+    fn project_id_row(id: i32) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([("id".to_string(), sea_orm::Value::from(id))])
+    }
+
+    #[tokio::test]
+    async fn listing_a_missing_project_is_project_not_found() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<
+                    std::collections::BTreeMap<String, sea_orm::Value>,
+                >::new()])
+                .into_connection(),
+        );
+        let error = service_with_db(db)
+            .list_webhooks_paginated(999_999, 1, 20)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WebhookError::ProjectNotFound {
+                    project_id: 999_999
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_under_a_missing_project_is_project_not_found_before_any_insert() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<
+                    std::collections::BTreeMap<String, sea_orm::Value>,
+                >::new()])
+                .into_connection(),
+        );
+        let error = service_with_db(db)
+            .create_webhook(CreateWebhookRequest {
+                project_id: 999_999,
+                url: "https://93.184.215.14/hook".to_string(),
+                secret: None,
+                events: vec![WebhookEventType::DeploymentFailed],
+                enabled: true,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WebhookError::ProjectNotFound {
+                    project_id: 999_999
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn listing_with_an_out_of_range_page_does_not_panic() {
         for page in [0, u64::MAX / 2, u64::MAX] {
             let db = Arc::new(
                 MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![project_id_row(1)]])
                     .append_query_results(vec![Vec::<temps_entities::webhooks::Model>::new()])
                     .into_connection(),
             );
@@ -890,6 +1012,125 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn exists_db() -> MockDatabase {
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project_id_row(1)]])
+    }
+
+    fn create_request(url: &str, secret: Option<&str>) -> CreateWebhookRequest {
+        CreateWebhookRequest {
+            project_id: 1,
+            url: url.to_string(),
+            secret: secret.map(str::to_string),
+            events: vec![WebhookEventType::DeploymentFailed],
+            enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn url_problems_are_invalid_url_not_a_configuration_error() {
+        let too_long = format!(
+            "https://93.184.215.14/{}",
+            "a".repeat(MAX_WEBHOOK_URL_CHARS)
+        );
+        for url in [
+            "not-a-url",
+            "ftp://example.com/",
+            "http://127.0.0.1:22/",
+            "http://169.254.169.254/latest",
+            too_long.as_str(),
+        ] {
+            let error = service_with_db(Arc::new(exists_db().into_connection()))
+                .create_webhook(create_request(url, None))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, WebhookError::InvalidUrl { .. }),
+                "{url}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_secret_is_refused_on_create_and_update() {
+        let error = service_with_db(Arc::new(exists_db().into_connection()))
+            .create_webhook(create_request("https://93.184.215.14/hook", Some("")))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WebhookError::Validation {
+                    field: "secret",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![webhook(5, 1)]])
+            .into_connection();
+        let error = service_with_db(Arc::new(db))
+            .update_webhook(
+                5,
+                UpdateWebhookRequest {
+                    url: None,
+                    secret: Some(Some(String::new())),
+                    events: None,
+                    enabled: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WebhookError::Validation {
+                    field: "secret",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_null_secret_on_update_removes_the_stored_one() {
+        let mut stored = webhook(5, 1);
+        stored.secret = Some("encrypted-secret".to_string());
+        let cleared = webhook(5, 1);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![stored]])
+                .append_query_results(vec![vec![cleared]])
+                .into_connection(),
+        );
+        let updated = service_with_db(db.clone())
+            .update_webhook(
+                5,
+                UpdateWebhookRequest {
+                    url: None,
+                    secret: Some(None),
+                    events: None,
+                    enabled: None,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("webhook 5 exists");
+        assert_eq!(updated.secret, None);
+
+        let connection = Arc::try_unwrap(db).expect("service dropped");
+        let log = connection.into_transaction_log();
+        let update = format!("{:?}", log.last().expect("an UPDATE was issued")).replace('\\', "");
+        assert!(update.contains(r#""secret" = $"#), "{update}");
+        assert!(
+            update.contains("String(None)"),
+            "the secret column is set to NULL: {update}"
+        );
     }
 
     fn delivery(id: i32, webhook_id: i32) -> temps_entities::webhook_deliveries::Model {
