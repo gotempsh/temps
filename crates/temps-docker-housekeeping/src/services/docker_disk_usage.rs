@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 use utoipa::ToSchema;
 
 /// Synthetic node id for the control plane (mirrors the node scheduler).
@@ -44,6 +44,25 @@ pub const DOCKER_DF_TIMEOUT: Duration = Duration::from_secs(90);
 /// runtime configuration lives in the database; the host's Docker socket is
 /// a fixed property of the machine).
 const DEFAULT_UNIX_SOCKET: &str = "/var/run/docker.sock";
+
+/// How many times `/system/df` is asked before a transient daemon failure is
+/// reported. The daemon walks every container's filesystem to answer, and a
+/// container that deletes a file mid-walk (a busy database, routinely) makes
+/// the whole call fail with HTTP 500 `lstat ...: no such file or directory`.
+/// The next walk almost always succeeds, so a few quick retries turn a
+/// spurious error into an answer. Every attempt runs inside the one overall
+/// timeout, so retries never extend how long a caller waits.
+const DF_ATTEMPTS: u32 = 4;
+
+/// Pause before the first retry; doubles on each further retry.
+const DF_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+
+/// Whether a `/system/df` answer is the daemon losing a race with a running
+/// container's filesystem, which a retry resolves. Anything else (another
+/// 5xx, a 4xx, a different message) is reported straight away.
+fn is_transient_df_failure(status: u16, body: &[u8]) -> bool {
+    status == 500 && String::from_utf8_lossy(body).contains("no such file or directory")
+}
 
 #[derive(Debug, Error)]
 pub enum DockerDiskUsageError {
@@ -574,8 +593,34 @@ impl DockerDiskUsageService {
             .map_err(|reason| DockerDiskUsageError::Parse { host, reason })
     }
 
-    /// Returns `(status, Api-Version header, body)`.
+    /// Returns `(status, Api-Version header, body)`, retrying the transient
+    /// failure described at [`DF_ATTEMPTS`]. The last answer is returned as is
+    /// when every attempt hits it, so the caller reports the daemon's message.
     async fn raw_get_system_df(
+        &self,
+        path_and_query: &str,
+    ) -> Result<(u16, Option<String>, Vec<u8>), DockerDiskUsageError> {
+        let mut delay = DF_RETRY_BASE_DELAY;
+        let mut attempt = 1;
+        loop {
+            let answer = self.get_system_df_once(path_and_query).await?;
+            if attempt >= DF_ATTEMPTS || !is_transient_df_failure(answer.0, &answer.2) {
+                return Ok(answer);
+            }
+            warn!(
+                host = %self.host.display(),
+                path = path_and_query,
+                attempt,
+                max_attempts = DF_ATTEMPTS,
+                "Docker daemon lost a race with a container's filesystem while answering /system/df; retrying"
+            );
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+            attempt += 1;
+        }
+    }
+
+    async fn get_system_df_once(
         &self,
         path_and_query: &str,
     ) -> Result<(u16, Option<String>, Vec<u8>), DockerDiskUsageError> {
@@ -843,6 +888,115 @@ mod tests {
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }
+    }
+
+    /// A stub daemon on a loopback port that answers each request with the
+    /// next `(status, body)` in `answers` (repeating the last one) and counts
+    /// the requests it served.
+    async fn stub_daemon(
+        answers: Vec<(u16, &'static str)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let index = counter.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = answers[index.min(answers.len() - 1)];
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (base, served)
+    }
+
+    const VANISHED_FILE: &str = r#"{"message":"failed to retrieve container list: snapshotter.Usage failed for abc: lstat /var/lib/containerd/snapshots/88/fs/data/base/1/2: no such file or directory"}"#;
+    const EMPTY_DF: &str =
+        r#"{"LayersSize": 0, "Images": [], "Containers": [], "Volumes": [], "BuildCache": []}"#;
+
+    #[test]
+    fn only_the_vanished_file_race_is_transient() {
+        assert!(is_transient_df_failure(500, VANISHED_FILE.as_bytes()));
+        assert!(!is_transient_df_failure(
+            500,
+            br#"{"message":"permission denied"}"#
+        ));
+        assert!(!is_transient_df_failure(404, VANISHED_FILE.as_bytes()));
+        assert!(!is_transient_df_failure(200, EMPTY_DF.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn a_file_vanishing_mid_walk_is_retried_until_the_daemon_answers() {
+        use std::sync::atomic::Ordering;
+        let (base, served) = stub_daemon(vec![(500, VANISHED_FILE), (200, EMPTY_DF)]).await;
+        let usage = DockerDiskUsageService::new(DockerHost::Http(base))
+            .fetch(0)
+            .await
+            .expect("the retry should reach the daemon's successful answer");
+        assert_eq!(usage.total_bytes, 0);
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn build_cache_records_retry_the_same_race() {
+        use std::sync::atomic::Ordering;
+        let (base, served) = stub_daemon(vec![(500, VANISHED_FILE), (200, EMPTY_DF)]).await;
+        let records = DockerDiskUsageService::new(DockerHost::Http(base))
+            .build_cache_records()
+            .await
+            .expect("the retry should reach the daemon's successful answer");
+        assert!(records.is_empty());
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_persistent_race_reports_the_daemons_message_after_bounded_attempts() {
+        use std::sync::atomic::Ordering;
+        let (base, served) = stub_daemon(vec![(500, VANISHED_FILE)]).await;
+        let err = DockerDiskUsageService::new(DockerHost::Http(base))
+            .fetch(0)
+            .await
+            .unwrap_err();
+        match err {
+            DockerDiskUsageError::UnexpectedStatus { status, body, .. } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("no such file or directory"), "{body}");
+            }
+            other => panic!("expected UnexpectedStatus, got {other:?}"),
+        }
+        assert_eq!(served.load(Ordering::SeqCst), DF_ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn other_daemon_errors_are_not_retried() {
+        use std::sync::atomic::Ordering;
+        let (base, served) = stub_daemon(vec![
+            (500, r#"{"message":"permission denied"}"#),
+            (200, EMPTY_DF),
+        ])
+        .await;
+        let err = DockerDiskUsageService::new(DockerHost::Http(base))
+            .fetch(0)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DockerDiskUsageError::UnexpectedStatus { status: 500, .. }
+        ));
+        assert_eq!(served.load(Ordering::SeqCst), 1);
     }
 
     /// Runs only when a Docker daemon is reachable; skips gracefully otherwise
