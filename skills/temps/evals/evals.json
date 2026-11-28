@@ -114,6 +114,7 @@
       "expected_output": "Uses `setup --ssh tempsbox --email admin@example.com --dry-run`, shows the plan and waits for approval before running it without --dry-run; never pipes a download into a shell, never reads the server's setup-result.json or install log, and verifies with whoami on the explicit context.",
       "files": [],
       "expectations": [
+        "Drafts a short plan from the answers and waits for approval before changing any machine",
         "Runs bunx or npx @temps-sdk/cli@beta setup --ssh with --dry-run before the real install",
         "Waits for the user's approval of the plan before installing",
         "Does not pipe curl output into bash or sh",
@@ -124,15 +125,17 @@
     {
       "id": 10,
       "prompt": "I just want to try Temps on my laptop, then hook it up to Claude Code.",
-      "expected_output": "Asks for the email for the Temps admin account, checks Docker, explains what `temps start` changes on the machine, runs `start --email <that email>`, verifies the `local` context, then runs `mcp enable` and `mcp add claude-code` against that context and tells the user to restart Claude Code.",
+      "expected_output": "Asks for the email for the Temps admin account, checks Docker, explains what `temps start` changes on the machine, runs `start --email <that email>`, verifies the `local` context, then runs `mcp enable` and `mcp add claude-code` against that context and tells the user to restart Claude Code, then walks the first-run onboarding steps (host, reach, agents, app), recording each with settings onboarding update and finishing with --completed.",
       "files": [],
       "expectations": [
+        "Drafts a short plan from the answers and waits for approval before changing any machine",
         "Asks the user for their admin email instead of inventing one",
         "Checks that Docker is running before installing",
         "Uses bunx or npx @temps-sdk/cli@beta start --email <email> rather than deploy.sh",
         "Verifies with --target-context local whoami",
         "Uses mcp enable and mcp add claude-code with an explicit target context",
-        "Never asks the user to paste an API key or password into the chat"
+        "Never asks the user to paste an API key or password into the chat",
+        "Walks the first-run onboarding steps and records each with settings onboarding update"
       ]
     },
     {

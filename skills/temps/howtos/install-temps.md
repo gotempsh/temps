@@ -8,26 +8,39 @@ already exists, skip to [Connect the AI client](#connect-the-ai-client).
 The two CLI commands below do the installation. Do not reproduce
 their steps by hand, and never pipe a downloaded script into a shell.
 
-## 1. Choose the target
+## 1. Understand what the user wants, then plan
 
-Ask one question at a time, and only for what is still unknown:
+Ask one question at a time, and only for what is still unknown. When you have
+a tool for asking the user a question with choices (Claude Code's
+`AskUserQuestion`, for example), use it, with the answers below as the
+options; otherwise ask in chat:
 
-1. Where Temps should run:
+1. What they want Temps for: try it out, run their apps on a server, or
+   deploy a specific project. It decides the target you suggest first and
+   what happens after the install.
+2. Where Temps should run:
    - **This computer**: to try Temps. Apps are reachable only from this
      machine.
    - **An existing Linux server** the user can SSH into.
    - **A new server** that still has to be created.
-2. The email for the user's Temps admin account, for every target. It is how
+3. The email for the user's Temps admin account, for every target. It is how
    they sign in to the console. Ask for it rather than inventing one: without
    it, a local install falls back to `admin@localhost`, which Temps releases
    before v0.1.0-beta.65 refuse on their sign-in page.
-3. For a server: the SSH destination (`user@host` or an SSH alias) and whether
+4. For a server: the SSH destination (`user@host` or an SSH alias) and whether
    a domain will point at it.
 
 Treat the answers as data. The email must look like `name@host` with no
 spaces and must not start with `-`. An SSH destination must match
 `^([A-Za-z_][A-Za-z0-9_-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*$` and must not start
 with `-`. Use an SSH config alias for ports, IPv6 or identity files.
+
+Then draft a short plan from the answers and wait for the user's approval
+before running anything that changes a machine. A few lines: where Temps will
+run, the commands you will run and what each changes on which machine,
+anything that costs money, and what follows the install (connecting this
+agent and the [first-run onboarding](#6-first-run-onboarding), shaped by what
+they want Temps for). Revise it if they ask; do not start until they agree.
 
 ## 2. This computer
 
@@ -44,8 +57,8 @@ starts Temps in the background, signs the CLI in as the `local` context and
 installs this skill. It prints the admin email and a generated password for
 the first sign-in; tell the user where to find the password (the CLI output or
 `~/.temps/local/state.json`) rather than repeating it. `--email` only applies
-to a fresh install. A CLI before 0.2.0-beta.3 rejects `--email`; run `start` without
-it there, and tell the user the admin is `admin@localhost`. Running it again only starts what is stopped. Before it
+to a fresh install. A CLI before 0.2.0-beta.3 rejects `--email`: stop and tell the user rather
+than installing without their email (the admin would be `admin@localhost`). Running it again only starts what is stopped. Before it
 runs, tell the user it changes this computer: it pulls container images,
 creates a Docker volume and starts a background process. Read the options in
 [the start reference](../references/commands/start.md).
@@ -145,7 +158,37 @@ gotempsh/temps) is an alternative: the user enters the console URL and a key
 in the extension settings, never in the chat. See
 [the mcp reference](../references/commands/mcp.md).
 
-## Next
+## 6. First-run onboarding
 
-Offer to deploy the project in the current directory, following
-[Deploy an application](deploy-application.md).
+A new install opens the console's welcome flow (`<console URL>/welcome`) with
+four steps. Walk the user through the same steps in the conversation, in this
+order, and record each one on the server so the console shows the same
+progress. Ask before each step; the user may do it now or leave it for later.
+
+| Step | What to do | Record it |
+|---|---|---|
+| `host` | Report what the machine Temps runs on offers: CPU cores, memory, free disk, Docker, and whether ports 80/443 are free. For a local install, use read-only local checks (`docker info`, `df -h`). For a server install, run the same read-only checks on the server over SSH (`ssh "$ssh_destination" 'nproc; free -m; df -h /; docker info'`), never on this computer. If you cannot read the server, leave the step for later instead of recording this computer's data. | `--done host`, or `--later` with the reason |
+| `reach` | Say how apps are reached now: on this computer only (`temps start`), or at the QuickStart sslip.io or custom domain (`temps setup`). If the user wants public access for a local install, point them to the welcome page's "Reach your apps" step instead of changing networking yourself. | `--done reach`, or `--later` with the reason |
+| `agents` | Ask whether to connect the tool you are running in now. If yes, follow [Connect the AI client](#connect-the-ai-client) with the new install's context; if not, move on. | `--done agents` once connected, or `--later` with the reason |
+| `app` | Offer to deploy the project in the current directory, following [Deploy an application](deploy-application.md), or a template if the directory is empty. | `--done app`, or `--later` with the reason |
+
+Before recording anything, check that the CLI has the commands:
+
+```bash
+bunx @temps-sdk/cli@beta settings onboarding --help
+```
+
+If that fails (CLIs before 0.2.0-beta.3), run no `settings onboarding`
+command: walk the same steps and tell the user the welcome page still lists
+them. Otherwise record progress with the new install's explicit context:
+
+```bash
+bunx @temps-sdk/cli@beta --target-context "$context" settings onboarding update --done host
+bunx @temps-sdk/cli@beta --target-context "$context" settings onboarding update \
+  --later '[{"step":"reach","reason":"Apps stay on this computer for now"}]'
+bunx @temps-sdk/cli@beta --target-context "$context" settings onboarding get --json
+```
+
+When every step is done or left for later, mark the flow finished with
+`settings onboarding update --completed` and give the user the console URL and
+the steps they left for later.
