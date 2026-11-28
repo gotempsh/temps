@@ -104,6 +104,7 @@ import { useForm } from 'react-hook-form'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { PowerDnsIcon } from '@/components/icons/DnsProviderIcons'
 
 // Helper function to get provider icon
 function getProviderIcon(providerType: string, className = 'h-5 w-5') {
@@ -118,6 +119,8 @@ function getProviderIcon(providerType: string, className = 'h-5 w-5') {
       )
     case 'cloudflare':
       return <Cloud className={`${className} text-orange-500`} />
+    case 'powerdns':
+      return <PowerDnsIcon className={className} />
     default:
       return <Globe className={className} />
   }
@@ -132,6 +135,8 @@ function formatProviderType(type: string): string {
       return 'Cloudflare'
     case 'namecheap':
       return 'Namecheap'
+    case 'powerdns':
+      return 'PowerDNS'
     default:
       return type.charAt(0).toUpperCase() + type.slice(1)
   }

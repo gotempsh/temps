@@ -26,7 +26,7 @@ use crate::errors::DnsError;
 use crate::providers::{
     AzureProvider, BunnyProvider, CloudflareCredentials, CloudflareProvider, DigitalOceanProvider,
     DnsProvider, DnsProviderType, GcpProvider, ManualDnsProvider, NamecheapProvider,
-    PebbleDnsProvider, ProviderCredentials, Route53Provider,
+    PebbleDnsProvider, PowerDnsProvider, ProviderCredentials, Route53Provider,
 };
 use crate::services::hostname_sync::{self, ConflictDecisions, HostnameModeResult};
 use temps_config::AppSettings;
@@ -258,6 +258,20 @@ impl DnsProviderService {
                 _ => {
                     return Err(DnsError::InvalidCredentials(
                         "Expected Azure credentials".to_string(),
+                    ))
+                }
+            },
+            DnsProviderType::PowerDns => match credentials {
+                ProviderCredentials::PowerDns(pdns_creds) => {
+                    let pdns_provider = PowerDnsProvider::new(pdns_creds.clone()).map_err(|e| {
+                        error!("Failed to create PowerDNS provider for testing: {}", e);
+                        e
+                    })?;
+                    Box::new(pdns_provider)
+                }
+                _ => {
+                    return Err(DnsError::InvalidCredentials(
+                        "Expected PowerDNS credentials".to_string(),
                     ))
                 }
             },
@@ -667,6 +681,21 @@ impl DnsProviderService {
                     }
                     _ => Err(DnsError::InvalidCredentials(
                         "Expected Azure credentials".to_string(),
+                    )),
+                }
+            }
+            DnsProviderType::PowerDns => {
+                let credentials: ProviderCredentials = serde_json::from_str(&credentials_json)?;
+                match credentials {
+                    ProviderCredentials::PowerDns(pdns_creds) => {
+                        let pdns_provider = PowerDnsProvider::new(pdns_creds).map_err(|e| {
+                            error!("Failed to create PowerDNS provider: {}", e);
+                            e
+                        })?;
+                        Ok(Box::new(pdns_provider))
+                    }
+                    _ => Err(DnsError::InvalidCredentials(
+                        "Expected PowerDNS credentials".to_string(),
                     )),
                 }
             }

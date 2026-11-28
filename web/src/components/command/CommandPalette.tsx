@@ -682,6 +682,7 @@ const settingsNavItems: NavigationItem[] = [
       'gcp',
       'digitalocean',
       'namecheap',
+      'powerdns',
     ],
   },
   {
@@ -703,6 +704,7 @@ const settingsNavItems: NavigationItem[] = [
       'azure',
       'gcp',
       'digitalocean',
+      'powerdns',
     ],
   },
   {

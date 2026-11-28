@@ -122,7 +122,7 @@ If renewal fails (port 80 blocked, DNS credentials expired), the certificate eve
 
 ### Validation
 
-When verifying DNS challenges, Temps uses Cloudflare's public DNS (1.1.1.1) as the resolver. This ensures consistent DNS resolution regardless of your server's local DNS configuration.
+When Temps issues a DNS-01 certificate on its own (for example from **Make it reachable** or `temps setup`), it waits until public resolvers see the challenge record before asking the certificate authority to validate it. It queries six public resolvers (Google, Cloudflare, Quad9 and OpenDNS) and continues once at least half of them return every expected value, so the result does not depend on your server's local DNS configuration. If they don't within three minutes, issuance stops before the order is spent.
 
 ---
 
@@ -137,6 +137,11 @@ For DNS-01 challenges and wildcard certificates, Temps needs API access to your 
 | **DigitalOcean** | API token |
 | **Azure DNS** | Service principal credentials |
 | **Google Cloud DNS** | Service account key |
+| **PowerDNS** (self-hosted) | API URL and the server's `api-key` (`api=yes`, `webserver=yes`) |
+
+PowerDNS runs on your own network, so its API address is usually private. Add that address under **Settings > Security > Trusted private networks** before connecting it. Temps refuses writes to PowerDNS Secondary zones, because the next zone transfer would discard them; connect the server that holds the primary zone.
+
+The PowerDNS API has no TLS of its own, so its `api-key` crosses the network in plain text. Keep the API on a private network or VPN, or put a TLS reverse proxy in front of it and connect the `https://` address. For DNS-01 certificates, the domain must be delegated to this PowerDNS server in public DNS (its NS records point at it): Temps waits for public resolvers to see the challenge record before validation, so a zone that exists only on a private network fails that check.
 
 Configure DNS providers in **Settings > DNS Providers**. Once configured, Temps can automatically create and remove TXT records for certificate validation.
 

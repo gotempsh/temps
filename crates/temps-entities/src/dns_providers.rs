@@ -22,7 +22,7 @@ pub struct Model {
     /// User-friendly name for this provider configuration
     pub name: String,
 
-    /// Provider type: cloudflare, namecheap, route53, digitalocean, manual
+    /// Provider type: cloudflare, bunny, namecheap, route53, digitalocean, gcp, azure, powerdns, manual, pebble
     pub provider_type: String,
 
     /// Encrypted JSON with provider credentials

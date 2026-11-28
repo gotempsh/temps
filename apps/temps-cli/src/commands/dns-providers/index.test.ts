@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
-import { resolveDnsProviderCredentials, resolveStdinSecret } from './index.js'
+import { resolveDnsProviderCredentials, resolveStdinSecret, rotatedCredentials } from './index.js'
 import type { DnsProviderType } from '../../api/types.gen.js'
 
 describe('resolveDnsProviderCredentials', () => {
@@ -99,6 +99,42 @@ describe('resolveDnsProviderCredentials', () => {
       expect(() => resolveDnsProviderCredentials('digitalocean', { yes: true })).toThrow(
         '--api-token is required for DigitalOcean when using --yes flag',
       )
+    })
+  })
+
+  describe('powerdns', () => {
+    test('builds credentials from the api url and key', () => {
+      expect(
+        resolveDnsProviderCredentials('powerdns', {
+          apiUrl: 'http://10.0.0.5:8081',
+          apiKey: 'pdns-key',
+        }),
+      ).toEqual({ type: 'powerdns', api_url: 'http://10.0.0.5:8081', api_key: 'pdns-key' })
+    })
+
+    test('passes the server id through when given', () => {
+      expect(
+        resolveDnsProviderCredentials('powerdns', {
+          apiUrl: 'http://10.0.0.5:8081',
+          apiKey: 'pdns-key',
+          serverId: 'ns1',
+        }),
+      ).toEqual({
+        type: 'powerdns',
+        api_url: 'http://10.0.0.5:8081',
+        api_key: 'pdns-key',
+        server_id: 'ns1',
+      })
+    })
+
+    test('falls back to prompts without the url', () => {
+      expect(resolveDnsProviderCredentials('powerdns', { apiKey: 'pdns-key' })).toBeUndefined()
+    })
+
+    test('throws under --yes without the url or key', () => {
+      expect(() =>
+        resolveDnsProviderCredentials('powerdns', { apiUrl: 'http://10.0.0.5:8081', yes: true }),
+      ).toThrow('--api-url and --api-key-stdin (recommended) or --api-key are required for PowerDNS')
     })
   })
 
@@ -281,5 +317,68 @@ describe('resolveStdinSecret', () => {
     ).rejects.toThrow(
       'Only one secret can be read from stdin per command, got --api-key-stdin, --api-token-stdin',
     )
+  })
+})
+
+describe('rotatedCredentials', () => {
+  test('keeps the stored PowerDNS API URL and server ID around the new key', () => {
+    expect(
+      rotatedCredentials(
+        'powerdns',
+        { type: 'powerdns', api_url: 'http://10.0.0.5:8081', api_key: '***', server_id: 'ns1' },
+        'new-key',
+      ),
+    ).toEqual({ type: 'powerdns', api_url: 'http://10.0.0.5:8081', api_key: 'new-key', server_id: 'ns1' })
+  })
+
+  test('omits an unset PowerDNS server ID', () => {
+    expect(
+      rotatedCredentials(
+        'powerdns',
+        { type: 'powerdns', api_url: 'http://10.0.0.5:8081', api_key: '***', server_id: null },
+        'new-key',
+      ),
+    ).toEqual({ type: 'powerdns', api_url: 'http://10.0.0.5:8081', api_key: 'new-key' })
+  })
+
+  test('tags single-secret providers with their type', () => {
+    expect(rotatedCredentials('bunny', { type: 'bunny', api_key: '***' }, 'k')).toEqual({
+      type: 'bunny',
+      api_key: 'k',
+    })
+    expect(rotatedCredentials('digitalocean', { type: 'digitalocean', api_token: 'abc***' }, 't')).toEqual({
+      type: 'digitalocean',
+      api_token: 't',
+    })
+    expect(
+      rotatedCredentials('cloudflare', { type: 'cloudflare', api_token: 'abc***', account_id: null }, 't'),
+    ).toEqual({ type: 'cloudflare', api_token: 't' })
+  })
+
+  test('keeps the stored Namecheap API user, client IP and sandbox flag', () => {
+    expect(
+      rotatedCredentials(
+        'namecheap',
+        { type: 'namecheap', api_user: 'dns-admin', api_key: '***', client_ip: '203.0.113.7', sandbox: true },
+        'new-key',
+      ),
+    ).toEqual({ type: 'namecheap', api_user: 'dns-admin', api_key: 'new-key', client_ip: '203.0.113.7', sandbox: true })
+    expect(
+      rotatedCredentials('namecheap', { type: 'namecheap', api_user: 'dns-admin', api_key: '***', sandbox: false }, 'k'),
+    ).toEqual({ type: 'namecheap', api_user: 'dns-admin', api_key: 'k', sandbox: false })
+  })
+
+  test('refuses to erase a Cloudflare account ID it cannot read back', () => {
+    expect(() =>
+      rotatedCredentials('cloudflare', { type: 'cloudflare', api_token: 'abc***', account_id: 'acc***' }, 't'),
+    ).toThrow('account ID')
+  })
+
+  test('refuses providers whose credentials it cannot rebuild', () => {
+    expect(() => rotatedCredentials('namecheap', { type: 'namecheap', api_key: '***' }, 'k')).toThrow('API user')
+    for (const type of ['route53', 'gcp', 'azure']) {
+      expect(() => rotatedCredentials(type, { type }, 'k')).toThrow('more than one secret')
+    }
+    expect(() => rotatedCredentials('manual', {}, 'k')).toThrow('no API key')
   })
 })

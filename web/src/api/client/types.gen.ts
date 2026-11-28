@@ -13009,6 +13009,20 @@ export type DnsProviderCredentials = {
     tenant_id: string;
     type: 'azure';
 } | {
+    /**
+     * Value of the server's `api-key` setting
+     */
+    api_key: SecretString;
+    /**
+     * PowerDNS webserver URL, with or without the `/api/v1` path
+     */
+    api_url: string;
+    /**
+     * Server ID (defaults to `localhost`)
+     */
+    server_id?: string | null;
+    type: 'powerdns';
+} | {
     management_url: string;
     type: 'pebble';
 };
@@ -13053,7 +13067,7 @@ export type DnsProviderSettingsMasked = {
 /**
  * Supported DNS provider types
  */
-export type DnsProviderType = 'cloudflare' | 'bunny' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual' | 'pebble';
+export type DnsProviderType = 'cloudflare' | 'bunny' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'powerdns' | 'manual' | 'pebble';
 
 /**
  * One logged query.

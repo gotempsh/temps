@@ -147,6 +147,28 @@ export function DigitalOceanIcon({ className }: IconProps) {
   )
 }
 
+// PowerDNS — the six-dot mark from the official PowerDNS logo
+// (https://github.com/PowerDNS/pdns, website/docs.powerdns.com/website/img/favicon.png),
+// redrawn as vector circles with the logo's colour and proportions.
+export function PowerDnsIcon({ className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      fill="#E66E00"
+      viewBox="0 0 96 96"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-label="PowerDNS"
+    >
+      <circle cx="14.5" cy="31.5" r="14.25" />
+      <circle cx="48" cy="31.5" r="14.25" />
+      <circle cx="81.5" cy="31.5" r="14.25" />
+      <circle cx="14.5" cy="64.5" r="14.25" />
+      <circle cx="48" cy="64.5" r="14.25" />
+      <circle cx="81.5" cy="64.5" r="14.25" />
+    </svg>
+  )
+}
+
 // Namecheap — Simple Icons
 export function NamecheapIcon({ className }: IconProps) {
   return (
