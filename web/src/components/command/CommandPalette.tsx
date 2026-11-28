@@ -681,6 +681,7 @@ const settingsNavItems: NavigationItem[] = [
       'azure',
       'gcp',
       'digitalocean',
+      'desec',
       'namecheap',
     ],
   },
@@ -703,6 +704,7 @@ const settingsNavItems: NavigationItem[] = [
       'azure',
       'gcp',
       'digitalocean',
+      'desec',
     ],
   },
   {

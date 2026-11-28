@@ -59,6 +59,13 @@ export function digitalOceanCredentials(apiToken: string): Record<string, unknow
   }
 }
 
+export function deSecCredentials(apiToken: string): Record<string, unknown> {
+  return {
+    type: 'desec',
+    api_token: apiToken,
+  }
+}
+
 export function namecheapCredentials(
   apiUser: string,
   apiKey: string,
@@ -112,6 +119,7 @@ const PROVIDER_TYPES: { name: string; value: DnsProviderType }[] = [
   { name: 'Namecheap', value: 'namecheap' },
   { name: 'AWS Route53', value: 'route53' },
   { name: 'DigitalOcean', value: 'digitalocean' },
+  { name: 'deSEC', value: 'desec' },
   { name: 'Google Cloud DNS', value: 'gcp' },
   { name: 'Azure DNS', value: 'azure' },
   { name: 'Manual', value: 'manual' },
@@ -132,13 +140,13 @@ export function registerDnsCommands(program: Command): void {
   dns
     .command('add')
     .description('Add a new DNS provider')
-    .option('-t, --type <type>', 'Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual)')
+    .option('-t, --type <type>', 'Provider type (cloudflare, bunny, route53, digitalocean, desec, namecheap, gcp, azure, manual)')
     .option('-n, --name <name>', 'Provider name')
     .option('-d, --description <description>', 'Provider description')
     // Cloudflare options
     .option(
       '--api-token <token>',
-      'API token (Cloudflare, DigitalOcean; prefer --api-token-stdin to keep it out of shell history)',
+      'API token (Cloudflare, DigitalOcean, deSEC; prefer --api-token-stdin to keep it out of shell history)',
     )
     .option('--api-token-stdin', 'Read the API token from stdin')
     .option('--account-id <id>', 'Cloudflare account ID (optional)')
@@ -440,6 +448,20 @@ async function addProvider(rawOptions: AddProviderOptions): Promise<void> {
       }
 
       credentials = digitalOceanCredentials(doApiToken)
+      break
+    }
+
+    case 'desec': {
+      if (options.apiToken) {
+        credentials = deSecCredentials(options.apiToken)
+      } else if (options.yes) {
+        throw new Error('--api-token is required for deSEC when using --yes flag')
+      } else {
+        info('\ndeSEC requires an API token with access to the domains and DNS RRsets Temps should manage.')
+        info('Review token scopes at: https://desec.readthedocs.io/en/latest/auth/tokens.html')
+        newline()
+        credentials = deSecCredentials(await promptPassword({ message: 'API Token' }))
+      }
       break
     }
 

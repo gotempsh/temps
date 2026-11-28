@@ -97,6 +97,7 @@ import {
   RefreshCw,
   TestTube2,
   Trash2,
+  Umbrella,
   XCircle,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -118,6 +119,8 @@ function getProviderIcon(providerType: string, className = 'h-5 w-5') {
       )
     case 'cloudflare':
       return <Cloud className={`${className} text-orange-500`} />
+    case 'desec':
+      return <Umbrella className={className} />
     default:
       return <Globe className={className} />
   }
@@ -132,6 +135,8 @@ function formatProviderType(type: string): string {
       return 'Cloudflare'
     case 'namecheap':
       return 'Namecheap'
+    case 'desec':
+      return 'deSEC'
     default:
       return type.charAt(0).toUpperCase() + type.slice(1)
   }
