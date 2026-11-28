@@ -25,9 +25,10 @@ import { useForm } from 'react-hook-form'
 import { SiAuth0, SiGoogle, SiKeycloak, SiOkta } from 'react-icons/si'
 import { Link } from 'react-router'
 import { z } from 'zod'
+import { signInEmailSchema } from '@/lib/sign-in-email'
 
 const loginSchema = z.object({
-  email: z.string().email('Please enter a valid email address'),
+  email: signInEmailSchema,
   password: z.string().min(1, 'Password is required'),
 })
 

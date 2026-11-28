@@ -29,10 +29,11 @@ import { AlertCircle, ArrowLeft, Loader2, MailCheck } from 'lucide-react'
 import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
 import { z } from 'zod'
+import { signInEmailSchema } from '@/lib/sign-in-email'
 import { usePageTitle } from '@/hooks/usePageTitle'
 
 const forgotPasswordSchema = z.object({
-  email: z.email('Please enter a valid email address'),
+  email: signInEmailSchema,
 })
 
 type ForgotPasswordFormData = z.infer<typeof forgotPasswordSchema>
