@@ -82,35 +82,30 @@ enum Buffered {
 
 async fn buffer_bounded(body: Body, limit: usize) -> Buffered {
     let mut stream = body.into_data_stream();
-    let mut chunks: Vec<Bytes> = Vec::new();
-    let mut total = 0usize;
+    // One contiguous buffer, not a handle per chunk: a body framed as many
+    // tiny (or empty) chunks would otherwise retain far more than its size.
+    // Memory stays at most the limit plus the one chunk that crossed it.
+    let mut buffered: Vec<u8> = Vec::new();
     while let Some(next) = stream.next().await {
         match next {
             Ok(chunk) => {
-                total = total.saturating_add(chunk.len());
-                chunks.push(chunk);
-                if total > limit {
-                    let read = stream::iter(chunks.into_iter().map(Ok::<_, axum::Error>));
+                buffered.extend_from_slice(&chunk);
+                if buffered.len() > limit {
+                    let read =
+                        stream::once(async move { Ok::<_, axum::Error>(Bytes::from(buffered)) });
                     return Buffered::Passthrough(Body::from_stream(read.chain(stream)));
                 }
             }
             Err(error) => {
                 // Hand the read error to the extractor, which reports it the
                 // way it always has.
-                let read = stream::iter(chunks.into_iter().map(Ok::<_, axum::Error>));
+                let read = stream::once(async move { Ok::<_, axum::Error>(Bytes::from(buffered)) });
                 let failed = stream::once(async move { Err::<Bytes, axum::Error>(error) });
                 return Buffered::Passthrough(Body::from_stream(read.chain(failed)));
             }
         }
     }
-    if chunks.len() == 1 {
-        return Buffered::Complete(chunks.pop().unwrap_or_default());
-    }
-    let mut joined = Vec::with_capacity(total);
-    for chunk in &chunks {
-        joined.extend_from_slice(chunk);
-    }
-    Buffered::Complete(Bytes::from(joined))
+    Buffered::Complete(Bytes::from(buffered))
 }
 
 /// The path of the first string holding a NUL, or `None` when the body has
@@ -320,6 +315,30 @@ mod tests {
             .await
             .expect("replayed body");
         assert_eq!(bytes, format!(r#"{{"name":"{filler}"}}"#).as_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_body_of_many_tiny_chunks_is_buffered_and_replayed_in_order() {
+        let text = format!(r#"{{"name":"{}"}}"#, "y".repeat(40));
+        let tiny = |text: &str| {
+            let chunks: Vec<Result<Bytes, std::io::Error>> = text
+                .bytes()
+                .flat_map(|b| [Ok(Bytes::new()), Ok(Bytes::from(vec![b]))])
+                .collect();
+            Body::from_stream(futures_util::stream::iter(chunks))
+        };
+        match buffer_bounded(tiny(&text), 1024).await {
+            Buffered::Complete(bytes) => assert_eq!(bytes, text.as_bytes()),
+            Buffered::Passthrough(_) => panic!("a body under the limit is buffered"),
+        }
+        let replayed = match buffer_bounded(tiny(&text), 16).await {
+            Buffered::Passthrough(body) => body,
+            Buffered::Complete(_) => panic!("a body over the limit must not be buffered"),
+        };
+        let bytes = axum::body::to_bytes(replayed, 1024)
+            .await
+            .expect("replayed body");
+        assert_eq!(bytes, text.as_bytes());
     }
 
     #[tokio::test]
