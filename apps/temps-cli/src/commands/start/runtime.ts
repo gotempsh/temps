@@ -259,15 +259,42 @@ export function cosignVerifyArgs(archive: string, bundle: string, version: strin
  * certificate identity is matched exactly: `--signer-workflow` is a prefix
  * match in some gh releases, which a workflow such as `release.yml-x.yml`
  * would also satisfy.
+ *
+ * The source ref is checked by `attestationBuiltFromTag` on the JSON output
+ * rather than with `--source-ref`: gh only gained that flag in 2.68.0, and an
+ * older gh rejects it with its usage text, which made a genuine release look
+ * tampered with. gh also compared `--source-ref` case-insensitively until
+ * 2.102.0; the check below is exact.
  */
 export function ghAttestationArgs(archive: string, version: string): string[] {
   return [
     'attestation', 'verify', archive,
     '--repo', RELEASE_REPO,
     '--cert-identity', releaseIdentity(version),
-    '--source-ref', `refs/tags/${version}`,
     '--cert-oidc-issuer', GITHUB_ACTIONS_ISSUER,
+    '--format', 'json',
   ]
+}
+
+/**
+ * Whether `gh attestation verify --format json` output contains a verified
+ * attestation built from `refs/tags/<version>`, compared exactly. Anything
+ * that is not the expected JSON counts as no.
+ */
+export function attestationBuiltFromTag(ghJson: string, version: string): boolean {
+  const expected = `refs/tags/${version}`
+  let results: unknown
+  try {
+    results = JSON.parse(ghJson)
+  } catch {
+    return false
+  }
+  if (!Array.isArray(results)) return false
+  return results.some((result) => {
+    const ref = (result as { verificationResult?: { signature?: { certificate?: { sourceRepositoryRef?: unknown } } } })
+      ?.verificationResult?.signature?.certificate?.sourceRepositoryRef
+    return ref === expected
+  })
 }
 
 export interface ReleaseSummary {
