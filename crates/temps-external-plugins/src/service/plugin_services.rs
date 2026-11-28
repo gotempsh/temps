@@ -27,8 +27,12 @@ pub struct PendingUpdateView {
     /// What an approval must quote: this build answering this manifest.
     pub review: String,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
-    /// The image that waits, when the deployment was made from an image.
+    /// The image that waits, when the deployment was made from an image in
+    /// a registry.
     pub image: Option<String>,
+    /// The content the image is, when Temps recorded it: what a registry
+    /// image resolved to, or what an uploaded image was imported as.
+    pub image_id: Option<String>,
     /// What it asks for compared with the approved build.
     pub difference: AccessDifference,
 }
@@ -96,6 +100,11 @@ pub struct ServicePluginView {
     /// image instead of built from a repository: the reference that was
     /// approved.
     pub image: Option<String>,
+    /// The Docker image ID the plugin's image is: what a registry image
+    /// resolved to when it was deployed, or what an image uploaded from a
+    /// client was imported as (which has no `image`). The content that was
+    /// approved, which a moved tag does not change.
+    pub image_id: Option<String>,
 }
 
 impl ExternalPluginsService {
@@ -385,6 +394,7 @@ impl ExternalPluginsService {
             }))
             .collect();
         let mut images: HashMap<i32, String> = HashMap::new();
+        let mut image_ids: HashMap<i32, String> = HashMap::new();
         let limits: HashMap<i32, PluginResourceLimits> = if deployment_ids.is_empty() {
             HashMap::new()
         } else {
@@ -405,7 +415,15 @@ impl ExternalPluginsService {
                 .map_err(read)?
                 .into_iter()
                 .map(|(deployment_id, config, metadata)| {
-                    if let Some(image) = metadata.and_then(|metadata| metadata.external_image_ref) {
+                    if let Some(id) = crate::service_runtime::image_content_id(metadata.as_ref()) {
+                        image_ids.insert(deployment_id, id.to_string());
+                    }
+                    // An image uploaded from a client is kept under a name Temps
+                    // made up; only a reference somebody named is shown.
+                    if let Some(image) = metadata
+                        .filter(|metadata| !metadata.image_uploaded_locally)
+                        .and_then(|metadata| metadata.external_image_ref)
+                    {
                         images.insert(deployment_id, image);
                     }
                     (
@@ -456,11 +474,14 @@ impl ExternalPluginsService {
                             review: pending.review.clone(),
                             since: pending.since,
                             image: images.get(&pending.deployment_id).cloned(),
+                            image_id: image_ids.get(&pending.deployment_id).cloned(),
                             difference: pin.pending_difference()?,
                         })
                     }),
                     image: deployment_of(&status)
                         .and_then(|deployment_id| images.get(&deployment_id).cloned()),
+                    image_id: deployment_of(&status)
+                        .and_then(|deployment_id| image_ids.get(&deployment_id).cloned()),
                     own_storage: status
                         .binding
                         .and_then(|binding| own_storage.get(&binding.project_id))

@@ -12342,6 +12342,13 @@ export type DeploymentMetadata = {
      */
     labels?: Array<string>;
     /**
+     * Docker image ID (sha256:...) a registry image resolved to when this
+     * deployment pulled it. A tag can be moved to other content later; this
+     * is the content this deployment's containers were created from. Absent
+     * when a worker node pulled the image itself.
+     */
+    pulledImageId?: string | null;
+    /**
      * ID of the deployment this was rolled back from (if applicable)
      */
     rolledBackFromId?: number | null;
@@ -27513,6 +27520,12 @@ export type PendingPluginUpdateResponse = {
      */
     image?: string | null;
     /**
+     * The Docker image ID the image that waits is, when Temps recorded it:
+     * what a registry image resolved to, or what an uploaded image was
+     * imported as (which has no `image`).
+     */
+    image_id?: string | null;
+    /**
      * What an approval must quote: this build answering this manifest.
      */
     review: string;
@@ -32399,6 +32412,13 @@ export type RepositoryCatalogPlugin = {
     commit: string;
     description: string;
     docsUrl?: string | null;
+    /**
+     * The image the author publishes for this version, named by digest
+     * (`registry.example.com/acme/reports@sha256:...`), so what is deployed
+     * is the content the listing names. Absent when the plugin is published
+     * as source only.
+     */
+    image?: string;
     latestVersion: string;
     logoUrl?: string | null;
     name: string;
@@ -36069,6 +36089,14 @@ export type ServicePluginResponse = {
      * from a repository.
      */
     image?: string | null;
+    /**
+     * The Docker image ID the plugin's image is: what a registry image
+     * resolved to when it was deployed, or what an image uploaded from a
+     * client was imported as (such a plugin has no `image`). This is the
+     * content that was approved; a tag moved to other content later does
+     * not change it. Absent when Temps did not record it.
+     */
+    image_id?: string | null;
     /**
      * The plugin's name, as its manifest declares it.
      */

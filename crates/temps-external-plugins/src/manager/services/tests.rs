@@ -342,12 +342,47 @@ impl Platform {
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "UPDATE deployments SET commit_sha=NULL, commit_message=NULL, image_name=$2, \
-                     metadata=jsonb_build_object('externalImageRef', $2::text) WHERE id=$1",
-                [deployment_id.into(), image.into()],
+                     metadata=jsonb_build_object('externalImageRef', $2::text, \
+                         'pulledImageId', $3::text) WHERE id=$1",
+                [
+                    deployment_id.into(),
+                    image.into(),
+                    Self::image_id_of(deployment_id).into(),
+                ],
             ))
             .await
             .expect("image deployment");
         deployment_id
+    }
+
+    /// Deploy an image the way an upload from a client records it: under a
+    /// name Temps made up, with the ID it was imported as.
+    pub(crate) async fn deploy_upload(&self, binding: ServiceBinding, port: u16) -> i32 {
+        let deployment_id = self.deploy(binding, port).await;
+        self.db()
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE deployments SET commit_sha=NULL, commit_message=NULL, image_name=$2, \
+                     metadata=jsonb_build_object('externalImageRef', $2::text, \
+                         'imageUploadedLocally', true, 'uploadedImageId', $3::text) WHERE id=$1",
+                [
+                    deployment_id.into(),
+                    format!(
+                        "temps.internal/project-1/environment-1/upload-{deployment_id}:immutable"
+                    )
+                    .into(),
+                    Self::image_id_of(deployment_id).into(),
+                ],
+            ))
+            .await
+            .expect("uploaded image deployment");
+        deployment_id
+    }
+
+    /// The content a synthetic image deployment resolved to: every
+    /// deployment pulls its own, as a moved tag would.
+    pub(crate) fn image_id_of(deployment_id: i32) -> String {
+        format!("sha256:{deployment_id:064x}")
     }
 
     /// A user with this id, for what records who did something.

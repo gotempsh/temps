@@ -25230,6 +25230,13 @@
             },
             "type": "array"
           },
+          "pulledImageId": {
+            "description": "Docker image ID (sha256:...) a registry image resolved to when this\ndeployment pulled it. A tag can be moved to other content later; this\nis the content this deployment's containers were created from. Absent\nwhen a worker node pulled the image itself.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "rolledBackFromId": {
             "description": "ID of the deployment this was rolled back from (if applicable)",
             "format": "int32",

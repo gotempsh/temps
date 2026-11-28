@@ -68,6 +68,13 @@ pub struct ServicePluginResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "registry.example.com/acme/reports:1.2.0")]
     pub image: Option<String>,
+    /// The Docker image ID the plugin's image is: what a registry image
+    /// resolved to when it was deployed, or what an image uploaded from a
+    /// client was imported as (such a plugin has no `image`). This is the
+    /// content that was approved; a tag moved to other content later does
+    /// not change it. Absent when Temps did not record it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<String>,
 }
 
 /// The limits a plugin's container runs with. They are the limits of its
@@ -115,6 +122,7 @@ impl From<ServicePluginView> for ServicePluginResponse {
             disabled_by: view.disabled_by,
             resource_limits: view.resource_limits.map(Into::into),
             image: view.image,
+            image_id: view.image_id,
         }
     }
 }

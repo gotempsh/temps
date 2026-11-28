@@ -21,6 +21,11 @@ pub struct PendingPluginUpdateResponse {
     /// The image that waits, when the deployment was made from an image.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// The Docker image ID the image that waits is, when Temps recorded it:
+    /// what a registry image resolved to, or what an uploaded image was
+    /// imported as (which has no `image`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<String>,
     /// What it asks for compared with the approved build.
     pub difference: AccessDifference,
 }
@@ -32,6 +37,7 @@ impl From<PendingUpdateView> for PendingPluginUpdateResponse {
             review: view.review,
             since: view.since,
             image: view.image,
+            image_id: view.image_id,
             difference: view.difference,
         }
     }
@@ -202,7 +208,7 @@ mod tests {
     };
     use super::*;
     use crate::manager::services::tests::{
-        eventually, platform, serve_plugin, serve_plugin_asking, TOKEN,
+        eventually, platform, serve_plugin, serve_plugin_asking, Platform, TOKEN,
     };
     use crate::manager::ServicePluginState;
     use axum::response::IntoResponse;
@@ -498,7 +504,7 @@ mod tests {
         };
         let first = serve_plugin("reports", TOKEN);
         let binding = platform.service("reports-service").await;
-        platform
+        let first_deployment = platform
             .deploy_image(
                 binding,
                 first.port,
@@ -520,6 +526,11 @@ mod tests {
         assert_eq!(
             listed.plugins[0].image.as_deref(),
             Some("registry.example.com/acme/reports:1.0.0")
+        );
+        assert_eq!(
+            listed.plugins[0].image_id,
+            Some(Platform::image_id_of(first_deployment)),
+            "the content the image resolved to is what was approved"
         );
 
         let second = serve_plugin("reports", TOKEN);
@@ -552,6 +563,15 @@ mod tests {
             pending.image.as_deref(),
             Some("registry.example.com/acme/reports:1.1.0")
         );
+        assert_eq!(
+            pending.image_id,
+            Some(Platform::image_id_of(second_deployment))
+        );
+        assert_eq!(
+            plugin.image_id,
+            Some(Platform::image_id_of(first_deployment)),
+            "the approved content stays the plugin's while other content waits"
+        );
         let json = serde_json::to_value(plugin).expect("json");
         assert_eq!(json["image"], "registry.example.com/acme/reports:1.0.0");
         assert_eq!(
@@ -576,6 +596,30 @@ mod tests {
             .find(|plugin| plugin.name == "audit-export")
             .expect("listed");
         assert!(built.image.is_none());
+        assert!(built.image_id.is_none());
+
+        // An image uploaded from a client has no reference anybody named:
+        // it is listed by its content alone.
+        let uploaded = serve_plugin("inventory", TOKEN);
+        let third = platform.service("inventory-service").await;
+        let upload = platform.deploy_upload(third, uploaded.port).await;
+        let (status, _) = add_service_plugin(admin(), State(state.clone()), metadata(), add(third))
+            .await
+            .expect("a service deployed from an upload is added");
+        assert_eq!(status, StatusCode::CREATED);
+        let Json(listed) = get_plugin_services(admin(), State(state.clone()))
+            .await
+            .expect("list");
+        let uploaded = listed
+            .plugins
+            .iter()
+            .find(|plugin| plugin.name == "inventory")
+            .expect("listed");
+        assert!(
+            uploaded.image.is_none(),
+            "Temps's own name for it is not shown"
+        );
+        assert_eq!(uploaded.image_id, Some(Platform::image_id_of(upload)));
         assert!(serde_json::to_value(built)
             .expect("json")
             .get("image")

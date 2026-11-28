@@ -12253,6 +12253,13 @@ export type DeploymentMetadata = {
      */
     labels?: Array<string>;
     /**
+     * Docker image ID (sha256:...) a registry image resolved to when this
+     * deployment pulled it. A tag can be moved to other content later; this
+     * is the content this deployment's containers were created from. Absent
+     * when a worker node pulled the image itself.
+     */
+    pulledImageId?: string | null;
+    /**
      * ID of the deployment this was rolled back from (if applicable)
      */
     rolledBackFromId?: number | null;

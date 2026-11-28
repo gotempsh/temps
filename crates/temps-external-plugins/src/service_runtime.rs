@@ -298,27 +298,48 @@ fn container_authority(
 
 /// A stable name for one build of a plugin service.
 fn build_identity(binding: ServiceBinding, deployment: &deployments::Model) -> String {
+    build_identity_of(
+        binding,
+        deployment.id,
+        deployment.image_name.as_deref(),
+        deployment.commit_sha.as_deref(),
+        image_content_id(deployment.metadata.as_ref()),
+    )
+}
+
+/// The parts a build is named by. The content an image resolved to is one of
+/// them, so the pin names what runs and not only the name it was deployed
+/// under.
+fn build_identity_of(
+    binding: ServiceBinding,
+    deployment_id: i32,
+    image_name: Option<&str>,
+    commit_sha: Option<&str>,
+    image_id: Option<&str>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"temps-plugin-service-build-v1\0");
     hasher.update(binding.project_id.to_be_bytes());
     hasher.update(binding.environment_id.to_be_bytes());
-    hasher.update(deployment.id.to_be_bytes());
-    hasher.update(
-        deployment
-            .image_name
-            .as_deref()
-            .unwrap_or_default()
-            .as_bytes(),
-    );
-    hasher.update([0u8]);
-    hasher.update(
-        deployment
-            .commit_sha
-            .as_deref()
-            .unwrap_or_default()
-            .as_bytes(),
-    );
+    hasher.update(deployment_id.to_be_bytes());
+    for part in [image_name, commit_sha, image_id] {
+        hasher.update(part.unwrap_or_default().as_bytes());
+        hasher.update([0u8]);
+    }
     hex::encode(hasher.finalize())
+}
+
+/// The Docker image ID a deployment made from an image runs: the one an
+/// uploaded or claimed image was imported as, or the one a registry image
+/// resolved to when it was pulled. `None` for a build from a repository, and
+/// for an image a worker node pulled itself.
+pub(crate) fn image_content_id(metadata: Option<&deployments::DeploymentMetadata>) -> Option<&str> {
+    let metadata = metadata?;
+    metadata
+        .uploaded_image_id
+        .as_deref()
+        .or(metadata.pulled_image_id.as_deref())
+        .filter(|id| !id.is_empty())
 }
 
 /// Ask a plugin service for its manifest, proving who is asking.
@@ -773,6 +794,50 @@ mod tests {
             error,
             ServiceAttachError::UnexpectedStatus { status: 500, .. }
         ));
+    }
+
+    #[test]
+    fn a_build_is_named_by_the_content_its_image_resolved_to() {
+        let binding = ServiceBinding {
+            project_id: 4,
+            environment_id: 9,
+        };
+        let image = Some("registry.example.com/acme/reports:stable");
+        let first = format!("sha256:{}", "a".repeat(64));
+        let moved = format!("sha256:{}", "b".repeat(64));
+        let named = |image_id: Option<&str>| build_identity_of(binding, 31, image, None, image_id);
+
+        assert_eq!(named(Some(&first)), named(Some(&first)));
+        assert_ne!(
+            named(Some(&first)),
+            named(Some(&moved)),
+            "the same tag resolved to other content is another build"
+        );
+        assert_ne!(named(Some(&first)), named(None));
+        // A part never runs into the next one.
+        assert_ne!(
+            build_identity_of(binding, 31, Some("ab"), Some("c"), None),
+            build_identity_of(binding, 31, Some("a"), Some("bc"), None),
+        );
+
+        let metadata =
+            |uploaded: Option<&str>, pulled: Option<&str>| deployments::DeploymentMetadata {
+                uploaded_image_id: uploaded.map(str::to_string),
+                pulled_image_id: pulled.map(str::to_string),
+                ..Default::default()
+            };
+        assert_eq!(image_content_id(None), None);
+        assert_eq!(image_content_id(Some(&metadata(None, None))), None);
+        assert_eq!(
+            image_content_id(Some(&metadata(None, Some(&first)))),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            image_content_id(Some(&metadata(Some(&moved), Some(&first)))),
+            Some(moved.as_str()),
+            "an uploaded image is named by what it was imported as"
+        );
+        assert_eq!(image_content_id(Some(&metadata(Some(""), None))), None);
     }
 
     #[test]
