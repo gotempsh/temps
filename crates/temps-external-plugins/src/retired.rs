@@ -58,6 +58,11 @@ pub async fn installed_executables(plugins_dir: &Path) -> Vec<RetiredPlugin> {
         if !crate::naming::valid_plugin_name(&name) {
             continue;
         }
+        // A link in place of the directory is not an installation: removal
+        // refuses it, so it is not listed either.
+        if !matches!(entry.file_type().await, Ok(kind) if kind.is_dir()) {
+            continue;
+        }
         let active = entry.path().join(ACTIVE_FILE);
         // Never follow a link out of the installation directory.
         let is_record = matches!(
@@ -241,6 +246,8 @@ mod tests {
         std::fs::create_dir_all(&installations).unwrap();
         std::os::unix::fs::symlink(&outside, installations.join("reports")).unwrap();
 
+        // What cannot be removed is not listed either.
+        assert_eq!(installed_executables(&installations).await, Vec::new());
         assert!(!is_installed(&installations, "reports").await.unwrap());
         assert!(!remove(&installations, "reports").await.unwrap());
         assert!(outside.join(ACTIVE_FILE).is_file());

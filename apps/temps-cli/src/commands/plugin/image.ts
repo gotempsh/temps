@@ -221,10 +221,14 @@ async function environmentOf(
   found: Service,
   wanted: string,
 ): Promise<{ id: number; name: string }> {
-  const { data } = await getEnvironments({
+  const { data, error } = await getEnvironments({
     client,
     path: { project_id: found.id },
   });
+  if (error || !data)
+    throw new PluginCommandError(
+      `The environments of the service ${found.slug} could not be read: ${getErrorMessage(error)}`,
+    );
   const environments = normalizeEnvironmentsResponse(data);
   const environment = environments.find((entry) => entry.name === wanted);
   if (!environment)

@@ -428,23 +428,27 @@ impl ExternalPluginManager {
             &auth_secret,
         )
         .await;
-        let Some(channel) = channel else {
-            // Opening the channel recorded the plugin's actor. A plugin that
-            // was being added and never connected must not keep its name:
-            // nothing lists it, so nothing could remove it.
-            if being_added {
-                if let Err(error) = PluginGrantService::new(self.db.clone())
-                    .revoke_actor(&manifest.name)
-                    .await
-                {
-                    error!(plugin = %manifest.name, %error, "Could not release the name of a plugin that failed to connect");
-                }
+        // Opening the channel recorded the plugin's actor. A plugin that was
+        // being added and did not get as far as its saved service must not
+        // keep its name: nothing lists it, so nothing could remove it.
+        let release_unadded = || async {
+            if !being_added {
+                return;
             }
+            if let Err(error) = PluginGrantService::new(self.db.clone())
+                .revoke_actor(&manifest.name)
+                .await
+            {
+                error!(plugin = %manifest.name, %error, "Could not release the name of a plugin that was not added");
+            }
+        };
+        let Some(channel) = channel else {
+            release_unadded().await;
             return Err(ServiceAttachError::ChannelRefused {
                 plugin: manifest.name.clone(),
             });
         };
-        PluginGrantService::new(self.db.clone())
+        if let Err(error) = PluginGrantService::new(self.db.clone())
             .bind_service(
                 &manifest.name,
                 binding,
@@ -453,13 +457,15 @@ impl ExternalPluginManager {
                 target.deployment_id,
             )
             .await
-            .map_err(|error| {
-                error!(plugin = %manifest.name, %error, "Could not record a plugin's service");
-                ServiceAttachError::Record {
-                    plugin: manifest.name.clone(),
-                    reason: "its service could not be saved; see the server log".to_string(),
-                }
-            })?;
+        {
+            error!(plugin = %manifest.name, %error, "Could not record a plugin's service");
+            drop(channel);
+            release_unadded().await;
+            return Err(ServiceAttachError::Record {
+                plugin: manifest.name.clone(),
+                reason: "its service could not be saved; see the server log".to_string(),
+            });
+        }
 
         let generation = self.services.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let closed = channel.closed();

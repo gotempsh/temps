@@ -805,6 +805,86 @@ async fn a_plugin_that_never_opened_its_channel_does_not_keep_its_name() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plugin_whose_service_could_not_be_saved_does_not_keep_its_name() {
+    use sea_orm::ConnectionTrait;
+    let Some(platform) = platform("a first binding that cannot be saved").await else {
+        return;
+    };
+    let db = platform.db();
+    // The channel opens, then saving the service fails.
+    db.execute_unprepared(
+        "CREATE FUNCTION refuse_service_binding() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'the service cannot be saved'; END $$; \
+         CREATE TRIGGER refuse_service_binding BEFORE UPDATE ON external_plugin_actors \
+         FOR EACH ROW WHEN (NEW.isolation = 'service') \
+         EXECUTE FUNCTION refuse_service_binding()",
+    )
+    .await
+    .expect("a trigger that refuses the binding");
+    let unsaved = serve_plugin("reports", TOKEN);
+    let first = platform.service("unsaved-service").await;
+    platform.deploy(first, unsaved.port).await;
+    let manager = platform.manager().await;
+
+    let error = manager.attach_service(first, None).await.unwrap_err();
+    assert!(
+        matches!(&error, ServiceAttachError::Record { plugin, .. } if plugin == "reports"),
+        "{error}"
+    );
+    assert!(status_of(&manager, "reports").await.is_none());
+
+    db.execute_unprepared("DROP TRIGGER refuse_service_binding ON external_plugin_actors")
+        .await
+        .expect("the trigger is removed");
+    let working = serve_plugin("reports", TOKEN);
+    let binding = platform.service("reports-service").await;
+    platform.deploy(binding, working.port).await;
+    manager
+        .attach_service(binding, None)
+        .await
+        .expect("the name is free for another service");
+    let status = status_of(&manager, "reports").await.expect("listed");
+    assert_eq!(status.state, ServicePluginState::Running);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plugin_seen_running_and_stopped_at_once_has_one_manifest() {
+    let Some(platform) = platform("one manifest per plugin").await else {
+        return;
+    };
+    let plugin = serve_plugin("reports", TOKEN);
+    let binding = platform.service("reports-service").await;
+    platform.deploy(binding, plugin.port).await;
+    let manager = platform.manager().await;
+    let manifest = manager
+        .attach_service(binding, None)
+        .await
+        .expect("attached");
+    // What a channel that closes while the manifests are read leaves behind:
+    // the plugin still listed as running and already listed as stopped.
+    manager.services.dormant.write().await.insert(
+        "reports".to_string(),
+        DormantService {
+            binding: Some(binding),
+            manifest: Some(manifest),
+            asleep: false,
+            update_waiting: false,
+            disabled: false,
+            reason: "its channel closed".to_string(),
+            retry_after: None,
+        },
+    );
+
+    let names: Vec<String> = manager
+        .manifests()
+        .await
+        .into_iter()
+        .map(|manifest| manifest.name)
+        .collect();
+    assert_eq!(names, vec!["reports".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_process_without_deployments_or_tokens_says_why_it_cannot_attach() {
     let Some(platform) = platform("attach prerequisites").await else {
         return;

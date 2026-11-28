@@ -272,7 +272,13 @@ impl ExternalPluginManager {
             .values()
             .map(|p| p.manifest.clone())
             .collect();
-        manifests.extend(self.services.dormant_manifests().await);
+        // A plugin whose channel closed between the two reads is in both;
+        // mounting its routes twice would panic.
+        for dormant in self.services.dormant_manifests().await {
+            if !manifests.iter().any(|known| known.name == dormant.name) {
+                manifests.push(dormant);
+            }
+        }
         manifests
     }
 

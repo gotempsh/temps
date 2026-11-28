@@ -90,6 +90,8 @@ interface Fake {
   lists?: ServicePlugin[][];
   live?: boolean;
   refuseDeploy?: boolean;
+  /** The API cannot list the service's environments. */
+  environmentsDown?: boolean;
   /** Images the Docker on this machine has. */
   localImages?: string[];
   /** The upload says why it failed and starts nothing. */
@@ -157,6 +159,12 @@ function server(fake: Fake) {
       return fake.existing
         ? Response.json(project)
         : problem(404, "No such project");
+    if (
+      fake.environmentsDown &&
+      request.method === "GET" &&
+      path === "/projects/7/environments"
+    )
+      return problem(503, "The database is unavailable");
     if (request.method === "GET" && path === "/projects/7/environments")
       return Response.json([
         { id: 9, name: "production", is_preview: false },
@@ -310,6 +318,18 @@ test("a refused image, an unknown service or environment and bad options stop be
     expect(refused.watched).toEqual([]);
   } finally {
     refused.restore();
+  }
+  const down = server({ existing: true, environmentsDown: true });
+  try {
+    // The API's own error, never "it has no environments".
+    await expect(
+      run(["--image", IMAGE, "--project", "reports"]),
+    ).rejects.toThrow(
+      /environments of the service reports could not be read: .*unavailable/,
+    );
+    expect(down.posts()).toEqual([]);
+  } finally {
+    down.restore();
   }
   const api = server({});
   try {
