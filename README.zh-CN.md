@@ -263,6 +263,6 @@ Temps 会发送匿名使用事件（一个随机的实例 ID、`deploy_succeeded
 
 [temps.sh](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=footer_zh) | [文档](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=footer_zh) | [GitHub](https://github.com/gotempsh/temps)
 
-[English](README.md) | 简体中文 | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md)
+[English](README.md) | 简体中文 | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md) | [Türkçe](README.tr.md)
 
 </div>
