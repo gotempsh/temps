@@ -56,6 +56,20 @@ Adding a service as a plugin opens its permission screen at once; the plugin has
 
 Outbound access is reported from the network policy that is actually enforced on the plugin's service, not from something the plugin declares: the manifest has no outbound declaration, and a declaration nothing enforces would be a promise, not a control.
 
+### D5. A plugin is pinned to an exact build; an update is a new request
+
+A plugin's service can be redeployed by anyone who may deploy it, and a new build is new code holding the plugin's permissions. So the build is part of what an administrator approves.
+
+- `external_plugin_actors.pinned_build` identifies the approved build (the deployment, its image and its commit) and `pinned_deployment_id` names it for display. Adding a service as a plugin pins the build that runs then.
+- Temps attaches only to the pinned build answering a manifest that asks for no more than the approved one. Restarting the same deployment, or starting it again after it stopped for being idle, is the same build and needs nothing.
+- Anything else is an **update that waits**: before the plugin is given a channel, the build, its deployment and the manifest it answered are recorded in the `pending_*` columns, an audit entry (`EXTERNAL_PLUGIN_UPDATE_HELD`, naming the plugin and no user) is written once, and Temps stays disconnected. The plugin keeps its routes and navigation and is listed as `update_waiting`; requests to it are answered with the reason.
+- The list of plugins shows the waiting build with **the difference** from the approved manifest: permissions, classes of API calls, public routes and event subscriptions it newly asks for, and permissions it no longer asks for.
+- Only `POST /x/plugins/{name}/update/approve` moves the pin. It requires system administration and recent verification, is audited before and after, and quotes a `review`: a digest of the waiting build and its manifest. If the service runs another build, or answers another manifest, by the time the approval arrives, nothing is attached and the new one waits for a review of its own.
+- **Approving an update allows nothing.** It changes which build runs as the plugin. Permissions the update newly asks for appear on the permission screen, off.
+- The alternative to approving is rolling the service back: when the pinned build is current again, the next request attaches to it and nothing waits any more.
+
+Nothing applies an update automatically, including one that asks for nothing more: it is still unreviewed code that would run with the plugin's existing permissions.
+
 ## Decisions taken without a precedent in the code
 
 These were chosen conservatively and are for the owner to confirm:
@@ -68,3 +82,8 @@ These were chosen conservatively and are for the owner to confirm:
 6. **The service limit applies to changes only**, holds at most 100 services, and `NULL` means every service.
 7. **A plugin limited to some services cannot create services**, and a collection call must name `project_id` in its body to be attributed to a service.
 8. **Outbound access is reported, not declared or changed, on the permission screen.** A new plugin's service keeps the default outbound profile for deployments, which is open; an administrator narrows it in the network policy.
+9. **Every new build waits, not only one that asks for more.** The stricter reading of "never apply automatically". The cost is that deploying a plugin's service disconnects the plugin until an administrator approves the build. The alternative is to attach automatically when the manifest asks for nothing more, and hold only when it does.
+10. **A build is identified by its deployment**, so rolling back by creating a new deployment of an old commit is a new build that waits, while re-pointing the service at the approved deployment is not.
+11. **A plugin row with no pin** (one added before pins existed) is pinned to the build that runs when Temps next attaches to it.
+12. **Approving reuses the `install_external_plugin` sensitive action**, since it lets new code run as the plugin.
+13. **There is no "reject" action.** An update that is not approved keeps waiting; the administrator rolls the service back or removes the plugin.

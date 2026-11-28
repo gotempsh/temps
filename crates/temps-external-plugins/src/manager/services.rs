@@ -24,6 +24,7 @@ use crate::proxy::ServiceRoute;
 use crate::service_runtime::{
     self, service_auth_secret, ServiceAttachError, ServiceBinding, ServiceRuntime,
 };
+use crate::updates::{AccessDifference, PendingUpdate, PluginBuilds};
 
 /// How long after a failed attempt a request may make Temps try again, so a
 /// broken plugin costs one attempt per interval and not one per request.
@@ -43,6 +44,17 @@ const REATTACH_DELAYS: [Duration; 5] = [
 /// wake timeout of its own.
 const DEFAULT_WAKE_TIMEOUT_SECONDS: i32 = 30;
 
+/// Who decides that Temps may attach to the build a plugin's service runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BuildApproval<'a> {
+    /// Nobody is asking: only the approved build is attached to, and any
+    /// other is held for an administrator.
+    Pinned,
+    /// An administrator approved the update with this review. A build or
+    /// manifest that is not the one reviewed is held like any other.
+    Approved(&'a str),
+}
+
 /// What a running service plugin is attached to.
 pub(super) struct AttachedService {
     pub(super) binding: ServiceBinding,
@@ -61,6 +73,10 @@ pub enum ServicePluginState {
     /// The service is stopped because it was idle. The next request to the
     /// plugin starts it again.
     Asleep,
+    /// The service runs a build no administrator approved. Temps is not
+    /// attached to it and attaches only once the update is approved, or the
+    /// approved build runs again.
+    UpdateWaiting,
     /// Temps is not attached, for the reason given with it.
     Unavailable,
 }
@@ -86,6 +102,8 @@ struct DormantService {
     /// and event subscriptions in place while it is stopped.
     manifest: Option<PluginManifest>,
     asleep: bool,
+    /// The service runs a build that waits for an administrator.
+    update_waiting: bool,
     reason: String,
     /// Until when requests fail, with what they are told, instead of trying
     /// again.
@@ -176,13 +194,130 @@ impl ExternalPluginManager {
         expected_name: Option<&str>,
     ) -> Result<PluginManifest, ServiceAttachError> {
         let _attaching = self.services.attach.lock().await;
-        self.attach_service_locked(binding, expected_name).await
+        self.attach_service_locked(binding, expected_name, BuildApproval::Pinned)
+            .await
+    }
+
+    /// Attach to the update of `plugin_name` an administrator reviewed and
+    /// approved. `review` names the build and manifest they saw; anything
+    /// else the service runs by now is held for another review.
+    pub async fn approve_service_update(
+        &self,
+        plugin_name: &str,
+        review: &str,
+    ) -> Result<PluginManifest, ServiceAttachError> {
+        let _attaching = self.services.attach.lock().await;
+        let binding = match self.plugins.read().await.get(plugin_name) {
+            Some(process) => Some(process.service.binding),
+            None => self
+                .services
+                .dormant
+                .read()
+                .await
+                .get(plugin_name)
+                .and_then(|dormant| dormant.binding),
+        };
+        let Some(binding) = binding else {
+            return Err(ServiceAttachError::Record {
+                plugin: plugin_name.to_string(),
+                reason: "it names no service any more; remove the plugin and add it again"
+                    .to_string(),
+            });
+        };
+        match self
+            .attach_service_locked(binding, Some(plugin_name), BuildApproval::Approved(review))
+            .await
+        {
+            Ok(manifest) => {
+                self.services.changed.notify_one();
+                Ok(manifest)
+            }
+            Err(error) => {
+                // A plugin that still runs its approved build keeps running.
+                if !self.plugins.read().await.contains_key(plugin_name) {
+                    self.mark_dormant(plugin_name, binding, &error, None).await;
+                    self.services.changed.notify_one();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Hold `update` unless it is the build this plugin is pinned to, asking
+    /// for nothing more, or the one an administrator just approved.
+    async fn hold_unapproved(
+        &self,
+        service: &str,
+        update: PendingUpdate,
+        approval: BuildApproval<'_>,
+    ) -> Result<(), ServiceAttachError> {
+        let plugin = update.manifest.name.clone();
+        let record = |error: crate::updates::UpdateError| {
+            error!(plugin = %plugin, %error, "Could not check a plugin's approved build");
+            ServiceAttachError::Record {
+                plugin: plugin.clone(),
+                reason: "its approved build could not be read or recorded; see the server log"
+                    .to_string(),
+            }
+        };
+        let builds = PluginBuilds::new(self.db.clone());
+        // A plugin that is being added has no row yet, and so no pin.
+        let Some(pin) = builds.pin_of(&plugin).await.map_err(record)? else {
+            return Ok(());
+        };
+        if pin.allows(&update.build, &update.manifest)
+            || approval == BuildApproval::Approved(update.review.as_str())
+        {
+            return Ok(());
+        }
+        let deployment_id = update.deployment_id;
+        let difference = AccessDifference::between(pin.approved.as_ref(), &update.manifest);
+        if builds.hold(&plugin, &update).await.map_err(record)? {
+            warn!(
+                plugin = %plugin,
+                approved_deployment_id = ?pin.deployment_id,
+                deployment_id,
+                asks_for_more = difference.asks_for_more,
+                "A plugin's service runs a build that was not approved; holding the update"
+            );
+            self.record_held_update(&plugin, pin.deployment_id, deployment_id, difference)
+                .await;
+        }
+        Err(ServiceAttachError::UpdateWaiting {
+            plugin,
+            service: service.to_string(),
+            deployment_id,
+        })
+    }
+
+    /// Put on record that Temps held an update without anyone asking.
+    async fn record_held_update(
+        &self,
+        plugin: &str,
+        approved_deployment_id: Option<i32>,
+        deployment_id: i32,
+        difference: AccessDifference,
+    ) {
+        let Some(audit) = self.audit_service.read().await.clone() else {
+            return;
+        };
+        let entry = HeldUpdateAudit {
+            plugin: plugin.to_string(),
+            approved_deployment_id,
+            deployment_id,
+            difference,
+        };
+        // The update is held whether or not the entry is written.
+        if let Err(error) = audit.create_audit_log(&entry).await {
+            warn!(plugin = %plugin, %error, "Could not record that a plugin update is held");
+        }
     }
 
     async fn attach_service_locked(
         &self,
         binding: ServiceBinding,
         expected_name: Option<&str>,
+        approval: BuildApproval<'_>,
     ) -> Result<PluginManifest, ServiceAttachError> {
         let runtime = self
             .services
@@ -211,6 +346,26 @@ impl ExternalPluginManager {
             });
         }
         self.ensure_name_is_free(&manifest.name, binding).await?;
+        // Before the plugin is given a channel: a build nobody approved gets
+        // none.
+        let review = crate::updates::review_id(&target.build, &manifest).map_err(|error| {
+            ServiceAttachError::InvalidHello {
+                service: target.service.clone(),
+                reason: format!("its manifest cannot be stored for review: {error}"),
+            }
+        })?;
+        self.hold_unapproved(
+            &target.service,
+            PendingUpdate {
+                build: target.build.clone(),
+                deployment_id: target.deployment_id,
+                manifest: manifest.clone(),
+                review,
+                since: None,
+            },
+            approval,
+        )
+        .await?;
 
         let openapi_schema = hello.openapi.and_then(|json| {
             serde_json::from_value::<OpenApi>(json)
@@ -240,7 +395,13 @@ impl ExternalPluginManager {
             plugin: manifest.name.clone(),
         })?;
         PluginGrantService::new(self.db.clone())
-            .bind_service(&manifest.name, binding, &manifest)
+            .bind_service(
+                &manifest.name,
+                binding,
+                &manifest,
+                &target.build,
+                target.deployment_id,
+            )
             .await
             .map_err(|error| {
                 error!(plugin = %manifest.name, %error, "Could not record a plugin's service");
@@ -359,6 +520,7 @@ impl ExternalPluginManager {
                     binding: Some(binding),
                     manifest,
                     asleep: false,
+                    update_waiting: false,
                     reason: format!(
                         "Plugin '{name}' lost its connection to Temps and is being reconnected."
                     ),
@@ -382,16 +544,27 @@ impl ExternalPluginManager {
             {
                 return;
             }
-            match self.attach_service_locked(binding, Some(name)).await {
+            match self
+                .attach_service_locked(binding, Some(name), BuildApproval::Pinned)
+                .await
+            {
                 Ok(_) => {
                     self.services.changed.notify_one();
                     return;
                 }
                 Err(error) => {
                     let asleep = error.is_asleep();
+                    let update_waiting = error.is_update_waiting();
                     self.mark_dormant(name, binding, &error, None).await;
                     if asleep {
                         info!(plugin = %name, "The plugin's service is stopped for being idle");
+                        self.services.changed.notify_one();
+                        return;
+                    }
+                    if update_waiting {
+                        // Trying again changes nothing: an administrator
+                        // approves it, or the approved build runs again and
+                        // the next request attaches to it.
                         self.services.changed.notify_one();
                         return;
                     }
@@ -424,6 +597,7 @@ impl ExternalPluginManager {
                 binding: Some(binding),
                 manifest,
                 asleep,
+                update_waiting: error.is_update_waiting(),
                 reason: reason.clone(),
                 retry_after: retry_after.map(|until| (until, reason.clone())),
             },
@@ -475,6 +649,7 @@ impl ExternalPluginManager {
                         binding: None,
                         manifest: None,
                         asleep: false,
+                        update_waiting: false,
                         reason: reason.clone(),
                         retry_after: None,
                     },
@@ -491,7 +666,7 @@ impl ExternalPluginManager {
             };
             let _attaching = self.services.attach.lock().await;
             match self
-                .attach_service_locked(binding, Some(&plugin.name))
+                .attach_service_locked(binding, Some(&plugin.name), BuildApproval::Pinned)
                 .await
             {
                 Ok(manifest) => report.manifests.push(manifest),
@@ -504,12 +679,18 @@ impl ExternalPluginManager {
                             binding: Some(binding),
                             manifest: plugin.manifest.clone(),
                             asleep: false,
+                            update_waiting: false,
                             reason: String::new(),
                             retry_after: None,
                         },
                     );
                     self.mark_dormant(&plugin.name, binding, &error, None).await;
-                    match plugin.manifest.filter(|_| error.is_asleep()) {
+                    // A plugin that is stopped, or whose update waits, keeps
+                    // the routes and navigation of its approved manifest.
+                    match plugin
+                        .manifest
+                        .filter(|_| error.is_asleep() || error.is_update_waiting())
+                    {
                         Some(manifest) => report.manifests.push(manifest),
                         None => {
                             warn!(plugin = %plugin.name, %error, "A plugin's service is not available");
@@ -571,6 +752,8 @@ impl ExternalPluginManager {
                     deployment_id: None,
                     state: if dormant.asleep {
                         ServicePluginState::Asleep
+                    } else if dormant.update_waiting {
+                        ServicePluginState::UpdateWaiting
                     } else {
                         ServicePluginState::Unavailable
                     },
@@ -731,7 +914,9 @@ impl ExternalPluginManager {
             return Err(reason);
         }
 
-        let mut outcome = self.attach_service_locked(binding, Some(plugin_name)).await;
+        let mut outcome = self
+            .attach_service_locked(binding, Some(plugin_name), BuildApproval::Pinned)
+            .await;
         if outcome.as_ref().is_err_and(ServiceAttachError::is_asleep) {
             if let Err(reason) = self.wake(plugin_name, binding).await {
                 // A start that just failed is not tried again for every
@@ -741,7 +926,9 @@ impl ExternalPluginManager {
                 }
                 return Err(reason);
             }
-            outcome = self.attach_service_locked(binding, Some(plugin_name)).await;
+            outcome = self
+                .attach_service_locked(binding, Some(plugin_name), BuildApproval::Pinned)
+                .await;
         }
         match outcome {
             Ok(_) => {
@@ -792,6 +979,37 @@ impl ExternalPluginManager {
                     "Plugin '{plugin_name}' was stopped for being idle and its service did not start within {timeout} seconds. Check the service's deployment."
                 )
             })
+    }
+}
+
+/// Temps held an update of a plugin on its own: nobody asked, so the entry
+/// names the plugin and no user.
+#[derive(Serialize)]
+struct HeldUpdateAudit {
+    plugin: String,
+    /// The deployment the plugin is pinned to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approved_deployment_id: Option<i32>,
+    /// The deployment that is held.
+    deployment_id: i32,
+    difference: AccessDifference,
+}
+
+impl temps_core::audit::AuditOperation for HeldUpdateAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_PLUGIN_UPDATE_HELD".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        None
+    }
+    fn ip_address(&self) -> Option<String> {
+        None
+    }
+    fn user_agent(&self) -> &str {
+        "external-plugin-host"
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

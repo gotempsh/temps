@@ -10,6 +10,7 @@ import { TARGETS, validName, PluginPublishError } from "./model.js";
 import { buildPlugin, loadConfig, publishPlugin } from "./workflow.js";
 import { registerPluginGrantCommands } from "./grants.js";
 import { registerPluginServiceCommands } from "./services.js";
+import { registerPluginUpdateCommands } from "./updates.js";
 
 export function registerPluginCommands(program: Command) {
   const plugin = program
@@ -19,6 +20,7 @@ export function registerPluginCommands(program: Command) {
     );
   registerPluginGrantCommands(plugin);
   registerPluginServiceCommands(plugin);
+  registerPluginUpdateCommands(plugin);
   registerPluginDevCommands(plugin);
   plugin.hook("preAction", async (_command, action) => {
     let current: Command | null = action;

@@ -31,6 +31,22 @@ pub struct Model {
     /// Who stands behind the plugin: `community` (anyone; the least access)
     /// or `verified` (reviewed, from the signed registry).
     pub tier: String,
+    /// Identifies the exact build an administrator approved. Temps attaches
+    /// to no other build of the plugin's service. NULL until the plugin is
+    /// first attached to.
+    pub pinned_build: Option<String>,
+    /// The deployment that build came from, for display.
+    pub pinned_deployment_id: Option<i32>,
+    /// A build the service runs that is not the approved one and waits for
+    /// an administrator. NULL when no update is waiting.
+    pub pending_build: Option<String>,
+    pub pending_deployment_id: Option<i32>,
+    /// The manifest the waiting build answered with.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub pending_manifest: Option<Json>,
+    /// What an approval must quote: the waiting build and its manifest.
+    pub pending_review: Option<String>,
+    pub pending_since: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

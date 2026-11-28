@@ -50,7 +50,7 @@ A plugin name belongs to whatever was installed under it first. A service never 
 
 The address of a plugin is resolved from the deployment's containers by the rules the route table uses (another node's data address and published port; the published port when Temps runs on the host; the container name when Temps runs in a container), for every request.
 
-- **Redeploy or container restart**: the channel closes; Temps attaches to whatever runs now, retrying for under a minute, then leaves it to the next request.
+- **Redeploy or container restart**: the channel closes; Temps attaches to whatever runs now, retrying for under a minute, then leaves it to the next request. (ADR-120 D5 narrows this: Temps attaches again only to the build an administrator approved, and a new build waits for approval.)
 - **Temps restart**: the plugin keeps running and accepts a new channel. Temps attaches again at start from the stored rows.
 - **Idle stop**: the plugin keeps its routes, navigation and subscriptions from the manifest stored on its row and is reported as stopped, not failed. The next authenticated request, or an event the plugin is subscribed to and granted, starts the environment through the existing on-demand manager and is then served. An anonymous request never starts a plugin. A start that just failed is not repeated for ten seconds; an event that cannot be delivered is dropped with a warning naming the plugin.
 

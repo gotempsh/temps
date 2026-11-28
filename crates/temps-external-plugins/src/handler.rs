@@ -5,6 +5,7 @@
 
 mod ai_tools;
 mod services;
+mod updates;
 mod watches;
 use ai_tools::{get_plugin_ai_tools, put_plugin_ai_tools};
 
@@ -607,6 +608,16 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
             "Plugin Services Could Not Be Read",
         ),
         ExternalPluginsError::Service(attach) => service_attach_status(attach),
+        ExternalPluginsError::NoUpdateWaiting { .. } => {
+            (StatusCode::CONFLICT, "No Plugin Update Waits")
+        }
+        ExternalPluginsError::UpdateChanged { .. } => {
+            (StatusCode::CONFLICT, "Plugin Update Changed")
+        }
+        ExternalPluginsError::Update(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Approved Plugin Build Unavailable",
+        ),
     };
     temps_core::problemdetails::new(status)
         .with_title(title)
@@ -628,6 +639,7 @@ fn service_attach_status(
             (StatusCode::CONFLICT, "Service Has No Running Container")
         }
         Attach::NameChanged { .. } => (StatusCode::CONFLICT, "Plugin Name Changed"),
+        Attach::UpdateWaiting { .. } => (StatusCode::CONFLICT, "Plugin Update Waits For Approval"),
         Attach::NameTaken { .. } => (StatusCode::CONFLICT, "Plugin Name Already Installed"),
         Attach::NotAPlugin { .. } => (StatusCode::BAD_REQUEST, "Service Is Not A Plugin"),
         Attach::InvalidHello { .. } => (StatusCode::BAD_REQUEST, "Plugin Hello Is Invalid"),
@@ -673,10 +685,17 @@ fn service_attach_status(
 /// server logs at their origin.
 fn public_error_detail(error: &ExternalPluginsError) -> String {
     match error {
-        // These carry only the plugin name the caller sent.
+        // These carry only the plugin name the caller sent, and a deployment
+        // of its service.
         ExternalPluginsError::InvalidPluginName { .. }
         | ExternalPluginsError::ShuttingDown
-        | ExternalPluginsError::NotInstalled { .. } => error.to_string(),
+        | ExternalPluginsError::NotInstalled { .. }
+        | ExternalPluginsError::NoUpdateWaiting { .. }
+        | ExternalPluginsError::UpdateChanged { .. } => error.to_string(),
+        ExternalPluginsError::Update(_) => {
+            "The plugin's approved build could not be read from or recorded in the database. See the server log."
+                .to_string()
+        }
         ExternalPluginsError::RetiredRecord { name, .. } => format!(
             "The installation record of plugin '{name}' could not be removed from this server's plugin directory, so it is still listed. See the server log."
         ),
@@ -830,6 +849,10 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             "/x/plugins/services",
             get(services::get_plugin_services).post(services::add_service_plugin),
         )
+        .route(
+            "/x/plugins/{name}/update/approve",
+            post(updates::approve_plugin_update),
+        )
 }
 
 #[derive(OpenApiTrait)]
@@ -848,6 +871,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         put_plugin_grants,
         services::get_plugin_services,
         services::add_service_plugin,
+        updates::approve_plugin_update,
     ),
     components(
         schemas(
@@ -877,6 +901,10 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             services::RetiredPluginResponse,
             services::AddServicePlugin,
             services::AddedServicePluginResponse,
+            updates::PendingPluginUpdateResponse,
+            updates::ApprovePluginUpdate,
+            updates::ApprovedPluginUpdateResponse,
+            crate::updates::AccessDifference,
             crate::manager::ServicePluginState,
             crate::grants::PluginGrantConfig,
             PluginActorInfo,
@@ -1325,6 +1353,7 @@ mod tests {
             "/x/plugins/{name}/status",
             "/x/plugins/{name}/uninstall",
             "/x/plugins/{name}/grants",
+            "/x/plugins/{name}/update/approve",
         ] {
             assert!(spec.paths.paths.contains_key(path), "missing {path}");
         }
@@ -1340,7 +1369,9 @@ mod tests {
                 "{path} changes how an executable is isolated"
             );
         }
-        let routes = format!("{:?}", configure_routes());
+        // Approving the update of a plugin's service is not updating an
+        // executable: it is the one route under `/update`.
+        let routes = format!("{:?}", configure_routes()).replace("/update/approve", "");
         for removed in ["/install", "/update", "/isolation", "/sandbox"] {
             assert!(!routes.contains(removed), "{removed} is still routed");
         }
@@ -1455,6 +1486,13 @@ mod tests {
             environment_id: None,
             manifest: None,
             tier: "community".into(),
+            pinned_build: None,
+            pinned_deployment_id: None,
+            pending_build: None,
+            pending_deployment_id: None,
+            pending_manifest: None,
+            pending_review: None,
+            pending_since: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

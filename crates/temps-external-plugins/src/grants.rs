@@ -58,6 +58,8 @@ pub struct StoredServicePlugin {
     pub manifest: Option<temps_plugin_protocol::PluginManifest>,
     /// Who stands behind the plugin.
     pub tier: crate::tier::PluginTier,
+    /// The build it is pinned to, and the update that waits, if any.
+    pub pin: crate::updates::BuildPin,
 }
 
 #[derive(Debug, Error)]
@@ -239,12 +241,15 @@ impl PluginGrantService {
     }
 
     /// Record that the active actor of `plugin_name` runs as a Temps service,
-    /// and the manifest it answered with.
+    /// the manifest it answered with, and the build Temps attached to: that
+    /// build becomes the approved one, and no update waits any more.
     pub async fn bind_service(
         &self,
         plugin_name: &str,
         binding: ServiceBinding,
         manifest: &temps_plugin_protocol::PluginManifest,
+        build: &str,
+        deployment_id: i32,
     ) -> Result<(), GrantError> {
         let manifest = serde_json::to_value(manifest).map_err(|error| GrantError::Invalid {
             plugin_name: plugin_name.into(),
@@ -254,13 +259,15 @@ impl PluginGrantService {
             .db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE external_plugin_actors SET isolation='service',project_id=$2,environment_id=$3,manifest=$4,tier=$5,updated_at=NOW() WHERE plugin_name=$1 AND active=TRUE",
+                "UPDATE external_plugin_actors SET isolation='service',project_id=$2,environment_id=$3,manifest=$4,tier=$5,pinned_build=$6,pinned_deployment_id=$7,pending_build=NULL,pending_deployment_id=NULL,pending_manifest=NULL,pending_review=NULL,pending_since=NULL,updated_at=NOW() WHERE plugin_name=$1 AND active=TRUE",
                 [
                     plugin_name.into(),
                     binding.project_id.into(),
                     binding.environment_id.into(),
                     manifest.into(),
                     crate::tier::PluginTier::of_added_service().as_str().into(),
+                    build.into(),
+                    deployment_id.into(),
                 ],
             ))
             .await
@@ -288,7 +295,10 @@ impl PluginGrantService {
             .db
             .query_all(Statement::from_string(
                 DatabaseBackend::Postgres,
-                "SELECT plugin_name, project_id, environment_id, manifest, tier FROM external_plugin_actors WHERE active=TRUE AND isolation='service' ORDER BY plugin_name",
+                format!(
+                    "SELECT plugin_name, project_id, environment_id, tier, {} FROM external_plugin_actors WHERE active=TRUE AND isolation='service' ORDER BY plugin_name",
+                    crate::updates::BuildPin::COLUMNS
+                ),
             ))
             .await
             .map_err(database)?;
@@ -298,9 +308,8 @@ impl PluginGrantService {
             let project_id: Option<i32> = row.try_get("", "project_id").map_err(database)?;
             let environment_id: Option<i32> =
                 row.try_get("", "environment_id").map_err(database)?;
-            let manifest: Option<serde_json::Value> =
-                row.try_get("", "manifest").map_err(database)?;
             let tier: String = row.try_get("", "tier").map_err(database)?;
+            let pin = crate::updates::BuildPin::from_row(&row).map_err(database)?;
             plugins.push(StoredServicePlugin {
                 tier: crate::tier::PluginTier::from_stored(&tier),
                 binding: project_id
@@ -311,7 +320,8 @@ impl PluginGrantService {
                     }),
                 // A manifest this build cannot read is the same as none: the
                 // plugin answers a current one when it is next attached to.
-                manifest: manifest.and_then(|value| serde_json::from_value(value).ok()),
+                manifest: pin.approved.clone(),
+                pin,
                 name,
             });
         }

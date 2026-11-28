@@ -24282,6 +24282,8 @@ Create TypeScript plugins, add a deployed service as a plugin and manage its per
 - `services` - List the plugins, the service each runs as and whether it is running; also lists plugins that no longer run, with the reason
 - `add-service` - Make a deployed service a plugin; it starts with no permissions
 - `remove` - Remove a plugin and revoke its permissions; its service and the files it stored are kept
+- `update` - Show the build a plugin is pinned to and the update that waits for approval, with what it asks for
+- `approve-update` - Approve the update of a plugin that waits; an update is never applied without this, and it allows no new permissions
 - `dev` - Run a plugin with a local simulated host, UI preview, and events (no Temps server)
 - `init` - Create a TypeScript plugin project
 - `build` - Build every platform selected in package.json; --all selects all six supported targets
@@ -24340,6 +24342,30 @@ Make a deployed service a plugin; it starts with no permissions
 Remove a plugin and revoke its permissions; its service and the files it stored are kept
 
 **Usage:** `plugin remove <name>`
+
+### `plugin update`
+
+Show the build a plugin is pinned to and the update that waits for approval, with what it asks for
+
+**Usage:** `plugin update <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+### `plugin approve-update`
+
+Approve the update of a plugin that waits; an update is never applied without this, and it allows no new permissions
+
+**Usage:** `plugin approve-update <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--deployment <id>` | Id of the deployment you reviewed, as shown by temps plugin update | - | Yes |
 
 ### `plugin dev`
 

@@ -35,6 +35,7 @@ pub mod service_runtime;
 pub mod source_catalog;
 pub mod tier;
 pub mod trust;
+pub mod updates;
 
 pub use channel::PluginChannel;
 pub use event_listener::PluginEventListener;

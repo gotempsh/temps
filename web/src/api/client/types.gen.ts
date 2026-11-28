@@ -59,6 +59,42 @@ export type AccessCapability = {
 
 export type AccessCapabilityState = 'available' | 'integration_unavailable';
 
+/**
+ * What a build asks for compared with what an administrator approved.
+ */
+export type AccessDifference = {
+    /**
+     * Classes of delegated API calls the update newly intends to make.
+     */
+    added_capabilities: Array<PluginCapability>;
+    /**
+     * Platform events the update newly subscribes to.
+     */
+    added_events: Array<string>;
+    /**
+     * Permissions the update asks for that the approved build did not.
+     * Approving the update does not allow them.
+     */
+    added_permissions: Array<PluginHostPermission>;
+    /**
+     * Routes the update newly serves without a Temps session.
+     */
+    added_public_paths: Array<string>;
+    /**
+     * Whether the update asks for anything the approved build did not.
+     */
+    asks_for_more: boolean;
+    /**
+     * Permissions the update no longer asks for.
+     */
+    removed_permissions: Array<PluginHostPermission>;
+    /**
+     * The approved version, when it is known.
+     */
+    version_from?: string | null;
+    version_to: string;
+};
+
 export type AccessMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
 export type AccessPermission = 'apps_edit' | 'organizations_read';
@@ -3352,6 +3388,17 @@ export type ApplyServiceHealthcheckResponse = {
     service_id: number;
 };
 
+/**
+ * The update an administrator reviewed and approves.
+ */
+export type ApprovePluginUpdate = {
+    /**
+     * The `review` of the update that was shown. An update that changed
+     * since is not approved by it.
+     */
+    review: string;
+};
+
 export type ApproveSandboxService = {
     expected_version: number;
     /**
@@ -3370,6 +3417,23 @@ export type ApproveServiceGrant = {
     service_id: string;
     service_version: number;
     ttl_seconds: number;
+};
+
+/**
+ * The build a plugin now runs as.
+ */
+export type ApprovedPluginUpdateResponse = {
+    /**
+     * The deployment the plugin is pinned to now.
+     */
+    deployment_id: number;
+    /**
+     * What the update asked for beyond the build it replaced. Nothing in it
+     * was allowed by the approval: new permissions stay off until chosen.
+     */
+    difference: AccessDifference;
+    name: string;
+    version: string;
 };
 
 export type ArchiveFlagResponse = {
@@ -27432,6 +27496,29 @@ export type PendingChanges = {
 };
 
 /**
+ * A build of a plugin's service that waits for an administrator. Temps is
+ * not attached to it.
+ */
+export type PendingPluginUpdateResponse = {
+    /**
+     * The deployment that waits.
+     */
+    deployment_id: number;
+    /**
+     * What it asks for compared with the approved build.
+     */
+    difference: AccessDifference;
+    /**
+     * What an approval must quote: this build answering this manifest.
+     */
+    review: string;
+    /**
+     * Since when it waits.
+     */
+    since?: string | null;
+};
+
+/**
  * One detector and what it looks for.
  */
 export type PerformanceDetectorResponse = {
@@ -35939,6 +36026,12 @@ export type ServicePluginResponse = {
      * where it keeps its own data. Empty when it has none.
      */
     own_storage: Array<string>;
+    pending_update?: PendingPluginUpdateResponse | null;
+    /**
+     * The deployment whose build an administrator approved. The plugin is
+     * pinned to it: Temps attaches to no other build of the service.
+     */
+    pinned_deployment_id?: number | null;
     /**
      * The service the plugin runs as. Absent once the service was deleted.
      */
@@ -35964,7 +36057,7 @@ export type ServicePluginResponse = {
 /**
  * Whether a plugin that runs as a service can serve a request right now.
  */
-export type ServicePluginState = 'running' | 'asleep' | 'unavailable';
+export type ServicePluginState = 'running' | 'asleep' | 'update_waiting' | 'unavailable';
 
 /**
  * A public URL of a compose service and the container port it routes to.
@@ -112532,6 +112625,76 @@ export type UninstallPluginResponses = {
 };
 
 export type UninstallPluginResponse2 = UninstallPluginResponses[keyof UninstallPluginResponses];
+
+export type ApprovePluginUpdateData = {
+    body: ApprovePluginUpdate;
+    path: {
+        /**
+         * The plugin's name
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/update/approve';
+};
+
+export type ApprovePluginUpdateErrors = {
+    /**
+     * Invalid request body or plugin name, or the build is not a plugin Temps accepts
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No plugin with that name was added
+     */
+    404: ProblemDetails;
+    /**
+     * No update waits, or what waits is not what was reviewed
+     */
+    409: ProblemDetails;
+    /**
+     * Request body is not JSON
+     */
+    415: ProblemDetails;
+    /**
+     * Request body does not name the review
+     */
+    422: ProblemDetails;
+    /**
+     * Recent sensitive-action verification required
+     */
+    428: ProblemDetails;
+    /**
+     * The approved build could not be read or recorded
+     */
+    500: ProblemDetails;
+    /**
+     * The service did not answer as a plugin
+     */
+    502: ProblemDetails;
+    /**
+     * Audit unavailable, or the plugin host is shutting down
+     */
+    503: ProblemDetails;
+};
+
+export type ApprovePluginUpdateError = ApprovePluginUpdateErrors[keyof ApprovePluginUpdateErrors];
+
+export type ApprovePluginUpdateResponses = {
+    /**
+     * The plugin now runs as the approved build
+     */
+    200: ApprovedPluginUpdateResponse;
+};
+
+export type ApprovePluginUpdateResponse = ApprovePluginUpdateResponses[keyof ApprovePluginUpdateResponses];
 
 export type IngestSentryEnvelopeData = {
     /**

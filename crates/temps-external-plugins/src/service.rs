@@ -68,6 +68,16 @@ pub enum ExternalPluginsError {
     Service(#[from] crate::service_runtime::ServiceAttachError),
     #[error("Could not read the services plugins run as: {source}")]
     ServiceLookup { source: sea_orm::DbErr },
+    #[error(
+        "No update of plugin '{name}' waits for approval: it runs the build that was approved"
+    )]
+    NoUpdateWaiting { name: String },
+    /// What waits is not what the administrator reviewed.
+    #[error("The update of plugin '{name}' that waits is now deployment {deployment_id}, which is not the one that was reviewed. Review it again before approving")]
+    UpdateChanged { name: String, deployment_id: i32 },
+    /// The approved build of a plugin could not be read or recorded.
+    #[error(transparent)]
+    Update(#[from] crate::updates::UpdateError),
 }
 
 impl ExternalPluginsService {
@@ -518,7 +528,7 @@ impl ExternalPluginsService {
 }
 
 mod plugin_services;
-pub use plugin_services::ServicePluginView;
+pub use plugin_services::{ApprovedUpdate, PendingUpdateView, ServicePluginView};
 
 #[cfg(test)]
 mod tests {

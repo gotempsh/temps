@@ -44,6 +44,14 @@ pub struct ServicePluginResponse {
     /// The managed databases and stores linked to the plugin's service,
     /// where it keeps its own data. Empty when it has none.
     pub own_storage: Vec<String>,
+    /// The deployment whose build an administrator approved. The plugin is
+    /// pinned to it: Temps attaches to no other build of the service.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_deployment_id: Option<i32>,
+    /// A build the service runs that is not the approved one. It waits for
+    /// an administrator and is never applied on its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_update: Option<super::updates::PendingPluginUpdateResponse>,
 }
 
 impl From<ServicePluginView> for ServicePluginResponse {
@@ -61,6 +69,8 @@ impl From<ServicePluginView> for ServicePluginResponse {
             deployment_id: view.deployment_id,
             tier: view.tier,
             own_storage: view.own_storage,
+            pinned_deployment_id: view.pinned_deployment_id,
+            pending_update: view.pending_update.map(Into::into),
         }
     }
 }
@@ -307,7 +317,7 @@ pub(super) async fn add_service_plugin(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::tests::{
         metadata, test_state, test_state_with_audit, user_auth, AllowSensitiveActions,
         RecordingAuditLogger, RequireSensitiveVerification,
@@ -318,7 +328,9 @@ mod tests {
     use temps_auth::permissions::Role;
     use tower::ServiceExt;
 
-    fn add(binding: ServiceBinding) -> Result<Json<AddServicePlugin>, JsonRejection> {
+    pub(in crate::handler) fn add(
+        binding: ServiceBinding,
+    ) -> Result<Json<AddServicePlugin>, JsonRejection> {
         Ok(Json(AddServicePlugin {
             project_id: binding.project_id,
             environment_id: binding.environment_id,
@@ -326,7 +338,7 @@ mod tests {
     }
 
     /// A state on a real database whose plugin host can attach to services.
-    async fn state_on(
+    pub(in crate::handler) async fn state_on(
         platform: &Platform,
         audit: Arc<RecordingAuditLogger>,
     ) -> ExternalPluginsAppState {
@@ -346,7 +358,7 @@ mod tests {
         }
     }
 
-    fn operations(audit: &RecordingAuditLogger) -> Vec<String> {
+    pub(in crate::handler) fn operations(audit: &RecordingAuditLogger) -> Vec<String> {
         audit.operations.lock().expect("audit lock").clone()
     }
 
@@ -371,7 +383,7 @@ mod tests {
         let schemas = &spec["components"]["schemas"];
         assert_eq!(
             schemas["ServicePluginState"]["enum"],
-            serde_json::json!(["running", "asleep", "unavailable"])
+            serde_json::json!(["running", "asleep", "update_waiting", "unavailable"])
         );
         for schema in [
             "PluginServicesResponse",

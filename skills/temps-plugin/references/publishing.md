@@ -112,12 +112,16 @@ refused.
 
 A newly added plugin has no permissions. Grant only permissions declared and used by the
 plugin. A declaration does not self-approve a grant. An update is a new deployment of the
-service: Temps follows it, and consent to the plugin's AI tools is asked for again.
+service. Temps does not follow it: the plugin is pinned to the build an administrator
+approved, the new build waits with what it asks for beyond the approved one, and it runs
+as the plugin only once an administrator approves that deployment. Approving allows no
+new permission, and consent to the plugin's AI tools is asked for again.
 Removing a plugin revokes its permissions and leaves its service and files in place;
 adding the service again is a new identity with fresh grants.
 
 Verify sidebar entry, real host API behavior, denied/revoked permissions, persisted data,
-intended deployment events and a redeploy of the same service.
+intended deployment events, and a redeploy of the same service followed by approving the
+update that waits.
 
 ## 4. Submit to the discovery catalog
 

@@ -17,6 +17,30 @@ use super::{ExternalPluginsError, ExternalPluginsService};
 use crate::manager::ServicePluginState;
 use crate::service_runtime::ServiceBinding;
 use crate::tier::PluginTier;
+use crate::updates::{AccessDifference, PluginBuilds};
+
+/// A build of a plugin's service that waits for an administrator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUpdateView {
+    /// The deployment that waits.
+    pub deployment_id: i32,
+    /// What an approval must quote: this build answering this manifest.
+    pub review: String,
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// What it asks for compared with the approved build.
+    pub difference: AccessDifference,
+}
+
+/// An update an administrator approved.
+#[derive(Debug, Clone)]
+pub struct ApprovedUpdate {
+    pub manifest: PluginManifest,
+    /// The deployment the plugin was pinned to before.
+    pub previous_deployment_id: Option<i32>,
+    /// The deployment it is pinned to now.
+    pub deployment_id: i32,
+    pub difference: AccessDifference,
+}
 
 /// One plugin that runs as a service, with the names an administrator knows
 /// the service by.
@@ -42,6 +66,11 @@ pub struct ServicePluginView {
     /// The managed databases and stores linked to the plugin's service: the
     /// plugin's own data. Empty when it has none.
     pub own_storage: Vec<String>,
+    /// The deployment whose build an administrator approved. Temps attaches
+    /// to no other.
+    pub pinned_deployment_id: Option<i32>,
+    /// A newer build that waits for approval, if any.
+    pub pending_update: Option<PendingUpdateView>,
 }
 
 impl ExternalPluginsService {
@@ -113,6 +142,74 @@ impl ExternalPluginsService {
         Ok(())
     }
 
+    /// Approve the update of `name` that waits and attach to it.
+    ///
+    /// `review` is what the administrator was shown: one build answering one
+    /// manifest. If the service runs anything else by now, nothing is
+    /// attached and the new build waits for a review of its own. Approving
+    /// changes which build runs as the plugin, never what the plugin is
+    /// allowed: permissions it newly asks for stay off until they are chosen.
+    pub async fn approve_plugin_update(
+        &self,
+        name: &str,
+        review: &str,
+    ) -> Result<ApprovedUpdate, ExternalPluginsError> {
+        if !crate::naming::valid_plugin_name(name) {
+            return Err(ExternalPluginsError::InvalidPluginName { name: name.into() });
+        }
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+        let pin = PluginBuilds::new(self.db.clone())
+            .pin_of(name)
+            .await?
+            .ok_or_else(|| ExternalPluginsError::NotInstalled { name: name.into() })?;
+        let Some(pending) = pin.pending.as_ref() else {
+            return Err(ExternalPluginsError::NoUpdateWaiting { name: name.into() });
+        };
+        if pending.review != review {
+            return Err(ExternalPluginsError::UpdateChanged {
+                name: name.into(),
+                deployment_id: pending.deployment_id,
+            });
+        }
+        let difference = AccessDifference::between(pin.approved.as_ref(), &pending.manifest);
+        let manifest = match self.manager.approve_service_update(name, review).await {
+            Ok(manifest) => manifest,
+            // The service was redeployed, or answers another manifest, since
+            // the review was shown.
+            Err(crate::service_runtime::ServiceAttachError::UpdateWaiting {
+                deployment_id,
+                ..
+            }) => {
+                self.refresh_runtime_surfaces().await;
+                return Err(ExternalPluginsError::UpdateChanged {
+                    name: name.into(),
+                    deployment_id,
+                });
+            }
+            Err(error) => {
+                self.refresh_runtime_surfaces().await;
+                return Err(error.into());
+            }
+        };
+        info!(
+            plugin = %name,
+            previous_deployment_id = ?pin.deployment_id,
+            deployment_id = pending.deployment_id,
+            asks_for_more = difference.asks_for_more,
+            "A plugin update was approved"
+        );
+        self.refresh_runtime_surfaces().await;
+        Ok(ApprovedUpdate {
+            manifest,
+            previous_deployment_id: pin.deployment_id,
+            deployment_id: pending.deployment_id,
+            difference,
+        })
+    }
+
     /// Every plugin that runs as a service, and how it is doing.
     pub async fn service_plugins(&self) -> Result<Vec<ServicePluginView>, ExternalPluginsError> {
         let statuses = self.manager.service_plugin_statuses().await;
@@ -174,12 +271,12 @@ impl ExternalPluginsService {
                 names.sort();
             }
         }
-        let tiers: HashMap<String, PluginTier> =
+        let mut stored: HashMap<String, crate::grants::StoredServicePlugin> =
             crate::grants::PluginGrantService::new(self.db.clone())
                 .service_plugins()
                 .await?
                 .into_iter()
-                .map(|plugin| (plugin.name, plugin.tier))
+                .map(|plugin| (plugin.name.clone(), plugin))
                 .collect();
         Ok(statuses
             .into_iter()
@@ -190,8 +287,23 @@ impl ExternalPluginsService {
                 let environment = status
                     .binding
                     .and_then(|binding| environments.get(&binding.environment_id));
+                let stored = stored.remove(&status.name);
+                let pin = stored.as_ref().map(|plugin| &plugin.pin);
                 ServicePluginView {
-                    tier: tiers.get(&status.name).copied().unwrap_or_default(),
+                    tier: stored
+                        .as_ref()
+                        .map(|plugin| plugin.tier)
+                        .unwrap_or_default(),
+                    pinned_deployment_id: pin.and_then(|pin| pin.deployment_id),
+                    pending_update: pin.and_then(|pin| {
+                        let pending = pin.pending.as_ref()?;
+                        Some(PendingUpdateView {
+                            deployment_id: pending.deployment_id,
+                            review: pending.review.clone(),
+                            since: pending.since,
+                            difference: pin.pending_difference()?,
+                        })
+                    }),
                     own_storage: status
                         .binding
                         .and_then(|binding| own_storage.get(&binding.project_id))

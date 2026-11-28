@@ -93,7 +93,7 @@ idempotency, cancellation and explicit environment/project settings.
    event delivery, duplicates, denied/granted/revoked permissions, and role restrictions.
 3. **Temps instance:** deploy a reviewed repository revision as a service, add it as a
    plugin, open it through Temps, trigger the intended user workflow, change permissions,
-   and redeploy the same service. Verify persistence and relevant actor/audit attribution where supported.
+   redeploy the same service and approve the update that waits. Verify persistence and relevant actor/audit attribution where supported.
 
 Read [development.md](references/development.md) for simulator commands. A standalone
 unauthenticated UI preview proves layout only. Simulator/mock AI results are not real
@@ -118,4 +118,5 @@ only that scope. Never ask users to paste credentials into chat.
 Finish with source location, preview/deployment instructions, declared permissions,
 verification evidence, distribution/catalog state and remaining limitations. For updates,
 retain the stable identity, version deliberately, migrate storage safely, and test a
-redeploy of the same service. A plugin changes when its service is redeployed.
+redeploy of the same service. A plugin changes when an administrator approves the build
+its redeployed service runs; until then the plugin is disconnected.

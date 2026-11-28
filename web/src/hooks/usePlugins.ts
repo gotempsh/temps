@@ -3,6 +3,7 @@
 
 import {
   addServicePlugin,
+  approvePluginUpdate,
   getPluginServices,
   listExternalPlugins,
   reloadPlugins,
@@ -99,6 +100,30 @@ export function useUninstallPlugin() {
       return response.data
     },
     onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
+    },
+  })
+}
+
+/**
+ * Approve the update of a plugin that waits. `review` names the build and
+ * manifest that were shown; anything else is refused. Nothing the update
+ * newly asks for is allowed by approving it.
+ */
+export function useApprovePluginUpdate() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ name, review }: { name: string; review: string }) =>
+      (
+        await approvePluginUpdate({
+          path: { name },
+          body: { review },
+          throwOnError: true,
+        })
+      ).data,
+    retry: false,
+    // Approved or refused, what waits may have changed.
+    onSettled: async () => {
       await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
     },
   })

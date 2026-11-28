@@ -6,9 +6,30 @@ import { client, setupClient, getErrorMessage } from "../../lib/api-client.js";
 import { PluginCommandError, pluginName } from "./grants.js";
 
 // Plugin APIs intentionally use local interfaces, outside the canonical core SDK.
-interface ServicePlugin {
+/** What a build asks for compared with the build that was approved. */
+export interface AccessDifference {
+  version_from?: string | null;
+  version_to: string;
+  added_permissions: string[];
+  removed_permissions: string[];
+  added_capabilities: string[];
+  added_public_paths: string[];
+  added_events: string[];
+  asks_for_more: boolean;
+}
+
+/** A build of a plugin's service that waits for an administrator. */
+export interface PendingPluginUpdate {
+  deployment_id: number;
+  /** What an approval must quote: this build answering this manifest. */
+  review: string;
+  since?: string | null;
+  difference: AccessDifference;
+}
+
+export interface ServicePlugin {
   name: string;
-  state: "running" | "asleep" | "unavailable";
+  state: "running" | "asleep" | "update_waiting" | "unavailable";
   detail?: string | null;
   project_id?: number | null;
   environment_id?: number | null;
@@ -21,6 +42,10 @@ interface ServicePlugin {
   tier: "community" | "verified";
   /** The managed databases linked to the plugin's service: its own data. */
   own_storage: string[];
+  /** The deployment whose build was approved; no other is attached to. */
+  pinned_deployment_id?: number | null;
+  /** A newer build that waits for approval and is never applied on its own. */
+  pending_update?: PendingPluginUpdate | null;
 }
 
 /** A plugin an earlier version installed as an executable; it never runs. */
@@ -30,7 +55,7 @@ interface RetiredPlugin {
   reason: string;
 }
 
-interface PluginServicesResponse {
+export interface PluginServicesResponse {
   configured: boolean;
   reason?: string | null;
   setup_path?: string | null;

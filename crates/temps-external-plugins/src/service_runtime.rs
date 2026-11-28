@@ -103,6 +103,12 @@ pub enum ServiceAttachError {
         plugin: String,
         access: &'static str,
     },
+    #[error("Service '{service}' now runs deployment {deployment_id}, which is not the build of plugin '{plugin}' an administrator approved. The plugin stays disconnected until the update is approved in Settings > Plugins, or the service runs the approved build again")]
+    UpdateWaiting {
+        plugin: String,
+        service: String,
+        deployment_id: i32,
+    },
     #[error("Plugin '{plugin}' did not accept the platform channel from this Temps instance")]
     ChannelRefused { plugin: String },
     #[error("A plugin named '{name}' is already installed from another source. Remove it before adding a service that declares the same plugin name")]
@@ -122,6 +128,12 @@ impl ServiceAttachError {
     /// request fixes, as opposed to broken.
     pub fn is_asleep(&self) -> bool {
         matches!(self, Self::Asleep { .. })
+    }
+
+    /// Whether the service runs a build no administrator approved, which
+    /// only an approval or the approved build running again changes.
+    pub fn is_update_waiting(&self) -> bool {
+        matches!(self, Self::UpdateWaiting { .. })
     }
 
     /// What an administrator is shown. Every variant already names the

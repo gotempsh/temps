@@ -37,6 +37,7 @@ import {
   AlertCircle,
   ArrowUpRight,
   Compass,
+  GitCompareArrows,
   MoreHorizontal,
   Plus,
   Puzzle,
@@ -52,6 +53,11 @@ import { toast } from 'sonner'
 import { RepositoryCatalog } from '@/components/plugins/RepositoryCatalog'
 import { PluginNavigationHint } from '@/components/plugins/PluginNavigationHint'
 import { PluginPermissionsDialog } from '@/components/plugins/PluginPermissionsDialog'
+import {
+  PluginPinnedBuild,
+  PluginUpdateDialog,
+  PluginUpdateNotice,
+} from '@/components/plugins/PluginUpdates'
 import {
   AddServicePluginDialog,
   PluginOwnStorage,
@@ -76,6 +82,8 @@ export function PluginsPage() {
   const [addingService, setAddingService] = useState(false)
   const [uninstallName, setUninstallName] = useState<string | null>(null)
   const [permissionsName, setPermissionsName] = useState<string | null>(null)
+  // The plugin whose waiting update is being reviewed.
+  const [updateName, setUpdateName] = useState<string | null>(null)
   const [reloadFailures, setReloadFailures] = useState<ReloadFailureResponse[]>(
     []
   )
@@ -142,6 +150,18 @@ export function PluginsPage() {
         }}
         onSensitiveError={handleSensitiveActionError}
       />
+      <PluginUpdateDialog
+        plugin={updateName === null ? undefined : serviceOf(updateName)}
+        open={canManagePlugins && updateName !== null}
+        onOpenChange={(open) => {
+          if (!open) setUpdateName(null)
+        }}
+        onSensitiveError={handleSensitiveActionError}
+        // What an update newly asks for is off until it is chosen.
+        onApproved={(name, asksForMore) => {
+          if (asksForMore) setPermissionsName(name)
+        }}
+      />
       <AddServicePluginDialog
         open={canManagePlugins && addingService}
         onOpenChange={setAddingService}
@@ -188,6 +208,13 @@ export function PluginsPage() {
           retired={services.data?.retired}
           disabled={managementPending}
           onRemove={setUninstallName}
+        />
+      )}
+      {canManagePlugins && (
+        <PluginUpdateNotice
+          services={services.data}
+          disabled={managementPending}
+          onReview={setUpdateName}
         />
       )}
       <Tabs value={tab} onValueChange={setTab} className="space-y-6">
@@ -348,6 +375,14 @@ export function PluginsPage() {
                             >
                               <Shield className="mr-2 size-4" /> Permissions
                             </DropdownMenuItem>
+                            {serviceOf(plugin.name)?.pending_update && (
+                              <DropdownMenuItem
+                                onSelect={() => setUpdateName(plugin.name)}
+                              >
+                                <GitCompareArrows className="mr-2 size-4" />{' '}
+                                Review update
+                              </DropdownMenuItem>
+                            )}
                             <DropdownMenuSeparator />
                             <DropdownMenuItem
                               className="text-destructive focus:text-destructive"
@@ -390,6 +425,7 @@ function PluginServiceOrigin({
   return (
     <>
       <ServicePluginOrigin plugin={service} />
+      <PluginPinnedBuild plugin={service} />
       <PluginOwnStorage plugin={service} />
     </>
   )

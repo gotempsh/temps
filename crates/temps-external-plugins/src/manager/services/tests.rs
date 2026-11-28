@@ -34,6 +34,8 @@ pub(crate) const TOKEN: &str = "dt_fixture";
 struct Reports {
     name: &'static str,
     privileged: bool,
+    /// Permissions a later build asks for on top of the usual ones.
+    extra: Vec<PluginHostPermission>,
     events: Arc<AtomicUsize>,
 }
 
@@ -46,6 +48,7 @@ impl ExternalPlugin for Reports {
             .public_path("/hooks/*")
             .event("deployment.succeeded")
             .build();
+        manifest.host_permissions.extend(self.extra.iter().copied());
         manifest.requires_db = self.privileged;
         manifest
     }
@@ -86,6 +89,15 @@ impl Drop for Served {
 }
 
 pub(crate) fn serve_plugin(name: &'static str, token: &'static str) -> Served {
+    serve_plugin_asking(name, token, Vec::new())
+}
+
+/// A build of the plugin that asks for `extra` permissions as well.
+pub(crate) fn serve_plugin_asking(
+    name: &'static str,
+    token: &'static str,
+    extra: Vec<PluginHostPermission>,
+) -> Served {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a free local port");
     listener.set_nonblocking(true).expect("non-blocking");
     let port = listener.local_addr().expect("local address").port();
@@ -109,6 +121,7 @@ pub(crate) fn serve_plugin(name: &'static str, token: &'static str) -> Served {
         let plugin = Reports {
             name,
             privileged: false,
+            extra,
             events: counted,
         };
         let _ = serve_service(plugin, listener, environment).await;
@@ -651,9 +664,177 @@ async fn a_process_without_deployments_or_tokens_says_why_it_cannot_attach() {
     assert_eq!(platform.stored("reports").await, None);
 }
 
+/// Records the audit entries the plugin host writes on its own.
+#[derive(Default)]
+struct HostAudit {
+    entries: Mutex<Vec<(String, Option<i32>, String)>>,
+}
+
+#[async_trait]
+impl ::temps_core::AuditLogger for HostAudit {
+    async fn create_audit_log(
+        &self,
+        operation: &dyn ::temps_core::audit::AuditOperation,
+    ) -> ::temps_core::AuditResult<()> {
+        self.entries.lock().expect("audit lock").push((
+            operation.operation_type(),
+            operation.user_id(),
+            operation.serialize()?,
+        ));
+        Ok(())
+    }
+}
+
+/// The update of `name` that waits, as the database records it.
+async fn waiting_update(platform: &Platform, name: &str) -> Option<crate::updates::PendingUpdate> {
+    crate::updates::PluginBuilds::new(platform.db())
+        .pin_of(name)
+        .await
+        .expect("read the pin")
+        .and_then(|pin| pin.pending)
+}
+
+async fn pinned_deployment(platform: &Platform, name: &str) -> Option<i32> {
+    crate::updates::PluginBuilds::new(platform.db())
+        .pin_of(name)
+        .await
+        .expect("read the pin")
+        .and_then(|pin| pin.deployment_id)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_redeployed_plugin_is_followed_to_its_new_container() {
-    let Some(platform) = platform("following a redeployed plugin").await else {
+async fn a_redeployed_plugin_is_held_until_an_administrator_approves_that_build() {
+    let Some(platform) = platform("holding a redeployed plugin").await else {
+        return;
+    };
+    let first = serve_plugin("reports", TOKEN);
+    let binding = platform.service("reports-service").await;
+    let first_deployment = platform.deploy(binding, first.port).await;
+    let manager = platform.manager().await;
+    let audit = Arc::new(HostAudit::default());
+    manager.set_audit_service(audit.clone()).await;
+    manager.attach_service(binding, None).await.expect("attach");
+    assert_eq!(
+        pinned_deployment(&platform, "reports").await,
+        Some(first_deployment),
+        "adding a service pins the build that runs"
+    );
+    let changed = manager.service_plugins_changed();
+
+    // A deployment replaces the container with a build nobody approved. It
+    // asks for exactly what the approved one did.
+    let second = serve_plugin("reports", TOKEN);
+    let second_deployment = platform.deploy(binding, second.port).await;
+    first.stop();
+
+    tokio::time::timeout(Duration::from_secs(10), changed.notified())
+        .await
+        .expect("the manager reports that the plugin changed");
+    eventually("the update waits", || async {
+        status_of(&manager, "reports")
+            .await
+            .is_some_and(|status| status.state == ServicePluginState::UpdateWaiting)
+    })
+    .await;
+    let status = status_of(&manager, "reports").await.expect("listed");
+    assert_eq!(status.deployment_id, None, "Temps is attached to nothing");
+    let detail = status.detail.expect("why it is not running");
+    assert!(
+        detail.contains(&format!("deployment {second_deployment}")) && detail.contains("approve"),
+        "{detail}"
+    );
+    // The new build is given no request: the proxy explains instead.
+    manager.end_retry_pause("reports").await;
+    let (status, body) = through_proxy(&manager, "reports", "/items", true).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("three items"), "{body}");
+    assert!(body.contains("approved"), "{body}");
+
+    let waiting = waiting_update(&platform, "reports")
+        .await
+        .expect("the update is recorded");
+    assert_eq!(waiting.deployment_id, second_deployment);
+    assert!(waiting.since.is_some());
+    assert_eq!(
+        pinned_deployment(&platform, "reports").await,
+        Some(first_deployment),
+        "the pin does not move on its own"
+    );
+    // Held once, on record, naming the plugin and no user; asking again
+    // does not repeat it.
+    manager.end_retry_pause("reports").await;
+    let _ = manager.revive_service("reports").await;
+    let held: Vec<_> = audit
+        .entries
+        .lock()
+        .expect("audit lock")
+        .iter()
+        .filter(|entry| entry.0 == "EXTERNAL_PLUGIN_UPDATE_HELD")
+        .cloned()
+        .collect();
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0].1, None);
+    let entry: serde_json::Value = serde_json::from_str(&held[0].2).expect("audit json");
+    assert_eq!(entry["plugin"], "reports");
+    assert_eq!(entry["approved_deployment_id"], first_deployment);
+    assert_eq!(entry["deployment_id"], second_deployment);
+    assert_eq!(entry["difference"]["asks_for_more"], false);
+
+    // A restarted Temps holds it too, and keeps the plugin's routes.
+    let restarted = platform.manager().await;
+    let report = restarted.start_service_plugins().await;
+    assert_eq!(
+        report
+            .manifests
+            .iter()
+            .map(|manifest| manifest.name.as_str())
+            .collect::<Vec<_>>(),
+        ["reports"]
+    );
+    assert_eq!(
+        status_of(&restarted, "reports")
+            .await
+            .map(|status| status.state),
+        Some(ServicePluginState::UpdateWaiting)
+    );
+
+    // Approving something else than what waits attaches nothing.
+    let refused = manager
+        .approve_service_update("reports", "not-the-review-that-was-shown")
+        .await
+        .expect_err("another review approves nothing");
+    assert!(refused.is_update_waiting(), "{refused}");
+    assert_eq!(
+        pinned_deployment(&platform, "reports").await,
+        Some(first_deployment)
+    );
+
+    // Approving what waits attaches to it and moves the pin.
+    let manifest = manager
+        .approve_service_update("reports", &waiting.review)
+        .await
+        .expect("the reviewed build is attached");
+    assert_eq!(manifest.name, "reports");
+    let status = status_of(&manager, "reports").await.expect("listed");
+    assert_eq!(status.state, ServicePluginState::Running);
+    assert_eq!(status.deployment_id, Some(second_deployment));
+    assert_eq!(
+        pinned_deployment(&platform, "reports").await,
+        Some(second_deployment)
+    );
+    assert!(waiting_update(&platform, "reports").await.is_none());
+    let (status, body) = through_proxy(&manager, "reports", "/items", true).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "three items"));
+    assert_eq!(
+        platform.stored("reports").await.map(|row| row.4),
+        Some(true),
+        "the same plugin, with the grants it had"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_that_asks_for_more_says_what_and_approving_it_allows_nothing() {
+    let Some(platform) = platform("holding an update that asks for more").await else {
         return;
     };
     let first = serve_plugin("reports", TOKEN);
@@ -663,27 +844,88 @@ async fn a_redeployed_plugin_is_followed_to_its_new_container() {
     manager.attach_service(binding, None).await.expect("attach");
     let changed = manager.service_plugins_changed();
 
-    // A deployment replaces the container: the new one is up before the old
-    // one stops.
-    let second = serve_plugin("reports", TOKEN);
-    let second_deployment = platform.deploy(binding, second.port).await;
+    let second = serve_plugin_asking("reports", TOKEN, vec![PluginHostPermission::AiGenerate]);
+    platform.deploy(binding, second.port).await;
     first.stop();
-
     tokio::time::timeout(Duration::from_secs(10), changed.notified())
         .await
-        .expect("the manager reports that it attached again");
-    eventually("the plugin is attached to the new deployment", || async {
-        status_of(&manager, "reports")
-            .await
-            .is_some_and(|status| status.deployment_id == Some(second_deployment))
+        .expect("the manager reports that the plugin changed");
+    eventually("the update waits", || async {
+        waiting_update(&platform, "reports").await.is_some()
     })
     .await;
+
+    let pin = crate::updates::PluginBuilds::new(platform.db())
+        .pin_of("reports")
+        .await
+        .expect("read the pin")
+        .expect("the plugin is added");
+    let difference = pin.pending_difference().expect("a waiting update");
+    assert!(difference.asks_for_more);
+    assert_eq!(
+        difference.added_permissions,
+        [PluginHostPermission::AiGenerate]
+    );
+    assert!(difference.removed_permissions.is_empty());
+
+    let review = pin.pending.expect("a waiting update").review;
+    manager
+        .approve_service_update("reports", &review)
+        .await
+        .expect("the reviewed build is attached");
+    // The build runs; what it newly asks for is still off.
+    let grants = PluginGrantService::new(platform.db())
+        .get("reports")
+        .await
+        .expect("grants");
+    assert!(grants.config.permissions.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_approved_build_running_again_is_attached_without_asking() {
+    let Some(platform) = platform("rolling a plugin back to its approved build").await else {
+        return;
+    };
+    let first = serve_plugin("reports", TOKEN);
+    let binding = platform.service("reports-service").await;
+    let first_deployment = platform.deploy(binding, first.port).await;
+    let manager = platform.manager().await;
+    manager.attach_service(binding, None).await.expect("attach");
+    let changed = manager.service_plugins_changed();
+
+    let second = serve_plugin("reports", TOKEN);
+    platform.deploy(binding, second.port).await;
+    first.stop();
+    tokio::time::timeout(Duration::from_secs(10), changed.notified())
+        .await
+        .expect("the manager reports that the plugin changed");
+    eventually("the update waits", || async {
+        waiting_update(&platform, "reports").await.is_some()
+    })
+    .await;
+
+    // The service is rolled back: the approved deployment is current again,
+    // in a container started for it.
+    let again = serve_plugin("reports", TOKEN);
+    platform
+        .db()
+        .execute_unprepared(&format!(
+            "UPDATE deployment_containers SET host_port={} WHERE deployment_id={first_deployment}; \
+             UPDATE environments SET current_deployment_id={first_deployment} WHERE id={}",
+            again.port, binding.environment_id
+        ))
+        .await
+        .expect("roll back");
+    manager.end_retry_pause("reports").await;
+
     let (status, body) = through_proxy(&manager, "reports", "/items", true).await;
     assert_eq!((status, body.as_str()), (StatusCode::OK, "three items"));
-    assert_eq!(
-        platform.stored("reports").await.map(|row| row.4),
-        Some(true),
-        "the same plugin, with the grants it had"
+    let status = status_of(&manager, "reports").await.expect("listed");
+    assert_eq!(status.state, ServicePluginState::Running);
+    assert_eq!(status.deployment_id, Some(first_deployment));
+    assert!(
+        waiting_update(&platform, "reports").await.is_none(),
+        "nothing waits once the approved build runs"
     );
 }
 
