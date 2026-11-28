@@ -167,12 +167,20 @@ progress. Ask before each step; the user may do it now or leave it for later.
 
 | Step | What to do | Record it |
 |---|---|---|
-| `host` | Report what this machine offers: CPU cores, memory, free disk, Docker, and whether ports 80/443 are free (read-only checks such as `docker info`, `df -h`). | `--done host` |
+| `host` | Report what the machine Temps runs on offers: CPU cores, memory, free disk, Docker, and whether ports 80/443 are free. For a local install, use read-only local checks (`docker info`, `df -h`). For a server install, run the same read-only checks on the server over SSH (`ssh "$ssh_destination" 'nproc; free -m; df -h /; docker info'`), never on this computer. If you cannot read the server, leave the step for later instead of recording this computer's data. | `--done host`, or `--later` with the reason |
 | `reach` | Say how apps are reached now: on this computer only (`temps start`), or at the QuickStart sslip.io or custom domain (`temps setup`). If the user wants public access for a local install, point them to the welcome page's "Reach your apps" step instead of changing networking yourself. | `--done reach`, or `--later` with the reason |
-| `agents` | Done once [Connect the AI client](#connect-the-ai-client) succeeded for the tool you are running in. | `--done agents` |
+| `agents` | Ask whether to connect the tool you are running in now. If yes, follow [Connect the AI client](#connect-the-ai-client) with the new install's context; if not, move on. | `--done agents` once connected, or `--later` with the reason |
 | `app` | Offer to deploy the project in the current directory, following [Deploy an application](deploy-application.md), or a template if the directory is empty. | `--done app`, or `--later` with the reason |
 
-Record progress with the same explicit context:
+Before recording anything, check that the CLI has the commands:
+
+```bash
+bunx @temps-sdk/cli@beta settings onboarding --help
+```
+
+If that fails (CLIs before 0.2.0-beta.3), run no `settings onboarding`
+command: walk the same steps and tell the user the welcome page still lists
+them. Otherwise record progress with the new install's explicit context:
 
 ```bash
 bunx @temps-sdk/cli@beta --target-context "$context" settings onboarding update --done host
@@ -183,6 +191,4 @@ bunx @temps-sdk/cli@beta --target-context "$context" settings onboarding get --j
 
 When every step is done or left for later, mark the flow finished with
 `settings onboarding update --completed` and give the user the console URL and
-the steps they left for later. A CLI before 0.2.0-beta.3 has no
-`settings onboarding`; then walk the same steps and tell the user the welcome
-page will still list them.
+the steps they left for later.
