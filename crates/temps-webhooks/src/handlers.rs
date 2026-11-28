@@ -305,6 +305,7 @@ fn webhook_error_problem(error: WebhookError, title: &str) -> Problem {
         (status = 200, description = "List of webhooks", body = Vec<WebhookResponse>),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -449,6 +450,7 @@ fn subscribes_to_backup_events(events: &[WebhookEventType]) -> bool {
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found"),
         (status = 500, description = "Internal server error")
     ),
     params(
