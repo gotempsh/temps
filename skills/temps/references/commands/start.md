@@ -17,5 +17,6 @@ Run Temps on this computer, sign in the CLI and add the Temps skill for your cod
 | `--allow-unsigned` | Run a release that publishes no Sigstore signature (only releases from before signing), trusting its checksum alone | - | No |
 | `--skills <scope>` | Where to add the Temps agent skill: project, global or none (default: project inside a project, otherwise global) | - | No |
 | `--port <port>` | Port for your apps and the console on a fresh install (default: 8080 or the next free port) | - | No |
+| `--email <email>` | Email for the admin account of a fresh install (asked in a terminal; default: admin@localhost) | - | No |
 | `--make-default` | Make "local" the default CLI context even if another one is active | - | No |
 | `--json` | Print the result as JSON, for scripts and agents | - | No |
