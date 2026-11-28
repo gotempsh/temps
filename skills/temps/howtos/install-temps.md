@@ -83,14 +83,10 @@ one. Report its error verbatim and stop; do not work around it. In particular:
 
 For a domain, advanced mode, a specific runtime release or a host where `setup` cannot
 run, use the `temps-platform-setup` skill when it is installed. It covers the
-digest-checked installer, headless flags and DNS. Without it, give the user
-these commands to run on the server themselves:
-
-```bash
-curl -fsSL https://temps.sh/deploy.sh -o deploy.sh
-less deploy.sh
-bash deploy.sh
-```
+digest-checked installer, headless flags and DNS. Without it, do not run an
+installer yourself: point the user to the installation guide at
+https://temps.sh/docs/quickstart, which has them download the installer,
+read it, and run it on the server.
 
 The installer log and `~/.temps/setup-result.json` on the server contain the
 first administrator password and an API key. Never read, print or copy them.
