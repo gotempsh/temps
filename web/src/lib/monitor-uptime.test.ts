@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import {
   bucketParts,
   bucketRangeLabel,
+  bucketResponseTime,
   bucketSummary,
   formatDurationShort,
   formatUptime,
@@ -151,5 +152,43 @@ describe('unknownTimeNote', () => {
     expect(
       unknownTimeNote({ monitored_seconds: 0, unknown_seconds: 86_400 })
     ).toBe('No checks for 24h (the whole range)')
+  })
+})
+
+describe('bucketRangeLabel across a daylight-saving change', () => {
+  const zone = process.env.TZ
+  afterEach(() => {
+    if (zone === undefined) delete process.env.TZ
+    else process.env.TZ = zone
+  })
+
+  test('the repeated hour names the offset of each end', () => {
+    process.env.TZ = 'America/Los_Angeles'
+    // 01:00 PDT to 01:00 PST: the clock falls back an hour.
+    const label = bucketRangeLabel('2026-11-01T08:00:00Z', 'hourly', 'en-GB')
+    expect(label).toBe('1 Nov, 01:00 GMT-7–01:00 GMT-8')
+  })
+
+  test('an hour with no change keeps the short form', () => {
+    process.env.TZ = 'America/Los_Angeles'
+    expect(bucketRangeLabel('2026-11-02T08:00:00Z', 'hourly', 'en-GB')).toBe(
+      '2 Nov, 00:00–01:00'
+    )
+  })
+})
+
+describe('bucketResponseTime', () => {
+  test('median and p95, else the average, else a dash', () => {
+    expect(
+      bucketResponseTime({
+        p50_response_time_ms: 6.2,
+        p95_response_time_ms: 11.6,
+        avg_response_time_ms: 8,
+      })
+    ).toBe('6 ms median · 12 ms p95')
+    expect(bucketResponseTime({ avg_response_time_ms: 8.4 })).toBe(
+      '8 ms average'
+    )
+    expect(bucketResponseTime({})).toBe('—')
   })
 })

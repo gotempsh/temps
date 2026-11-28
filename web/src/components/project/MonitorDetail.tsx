@@ -52,6 +52,7 @@ import {
   CHECK_LABEL,
   bucketParts,
   bucketRangeLabel,
+  bucketResponseTime,
   bucketSummary,
   formatUptime,
   unknownTimeNote,
@@ -156,7 +157,7 @@ function BucketItem({
               <div className="flex items-center justify-between border-t pt-1.5 text-xs">
                 <dt className="text-muted-foreground">Response time</dt>
                 <dd className="font-medium tabular-nums">
-                  {responseTimeLabel(bucket)}
+                  {bucketResponseTime(bucket)}
                 </dd>
               </div>
             </dl>
@@ -165,19 +166,6 @@ function BucketItem({
       </PopoverContent>
     </Popover>
   )
-}
-
-/** "6 ms median · 12 ms p95", or the average when percentiles are missing. */
-function responseTimeLabel(bucket: StatusBucket): string {
-  const ms = (value: number) => `${Math.round(value)} ms`
-  if (
-    bucket.p50_response_time_ms != null &&
-    bucket.p95_response_time_ms != null
-  )
-    return `${ms(bucket.p50_response_time_ms)} median · ${ms(bucket.p95_response_time_ms)} p95`
-  if (bucket.avg_response_time_ms != null)
-    return `${ms(bucket.avg_response_time_ms)} average`
-  return '—'
 }
 
 type QuickFilter = '24hours' | '7days' | '30days' | '90days' | 'custom'

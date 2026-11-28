@@ -89,6 +89,7 @@ import { TargetMonitorDialog } from './TargetMonitorDialog'
 import {
   bucketParts,
   bucketRangeLabel,
+  bucketResponseTime,
   bucketSummary,
   unknownTimeNote,
 } from '@/lib/monitor-uptime'
@@ -306,7 +307,7 @@ function MonitorCard({
                         <div
                           key={idx}
                           className="min-w-0 flex-1"
-                          title={`${bucketRangeLabel(bucket.bucket_start, 'hourly')}\n${bucketSummary(bucketParts(bucket))}`}
+                          title={`${bucketRangeLabel(bucket.bucket_start, 'hourly')}\n${bucketSummary(bucketParts(bucket))}\n${bucketResponseTime(bucket)}`}
                         >
                           <StatusBucketBar bucket={bucket} compact />
                         </div>

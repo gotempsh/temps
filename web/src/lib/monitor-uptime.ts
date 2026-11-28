@@ -147,11 +147,33 @@ export function bucketRangeLabel(
   })
   const step = BUCKET_STEP_MS[interval]
   if (interval === 'daily' || step === undefined) return day
+  const end = new Date(start.getTime() + step)
+  // Across a daylight-saving change two hours read alike ("01:00–01:00"):
+  // then each end names its offset.
+  const zoned = start.getTimezoneOffset() !== end.getTimezoneOffset()
   const time = (date: Date) =>
     date.toLocaleTimeString(locale, {
       hour: '2-digit',
       minute: '2-digit',
       hourCycle: 'h23',
+      ...(zoned ? { timeZoneName: 'shortOffset' } : {}),
     })
-  return `${day}, ${time(start)}–${time(new Date(start.getTime() + step))}`
+  return `${day}, ${time(start)}–${time(end)}`
+}
+
+/** "6 ms median · 12 ms p95", or the average when percentiles are missing. */
+export function bucketResponseTime(bucket: {
+  p50_response_time_ms?: number | null
+  p95_response_time_ms?: number | null
+  avg_response_time_ms?: number | null
+}): string {
+  const ms = (value: number) => `${Math.round(value)} ms`
+  if (
+    bucket.p50_response_time_ms != null &&
+    bucket.p95_response_time_ms != null
+  )
+    return `${ms(bucket.p50_response_time_ms)} median · ${ms(bucket.p95_response_time_ms)} p95`
+  if (bucket.avg_response_time_ms != null)
+    return `${ms(bucket.avg_response_time_ms)} average`
+  return '—'
 }
