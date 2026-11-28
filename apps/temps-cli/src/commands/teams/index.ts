@@ -9,6 +9,7 @@ import {
   getProjects,
   getTeam,
   getTeamMember,
+  getProjectAccess,
   grantProjectAccess,
   listProjectAccess,
   listTeamMembers,
@@ -17,6 +18,7 @@ import {
   listUsers,
   removeTeamMember,
   revokeProjectAccess,
+  updateProjectAccess,
   updateTeam,
   updateTeamMemberRole,
 } from '../../api/sdk.gen.js'
@@ -173,6 +175,22 @@ export function registerTeamsCommands(program: Command): void {
     .option('-r, --role <role>', `Role the team holds on the project (${TEAM_ROLES.join('|')})`)
     .option('--json', 'Output in JSON format')
     .action(grantAccessAction)
+
+  access
+    .command('show <team>')
+    .alias('get')
+    .description("Show a team's grant on a project")
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('--json', 'Output in JSON format')
+    .action(showAccessAction)
+
+  access
+    .command('set-role <team>')
+    .description("Change the role of a team's existing grant on a project")
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-r, --role <role>', `New role (${TEAM_ROLES.join('|')})`)
+    .option('--json', 'Output in JSON format')
+    .action(setAccessRoleAction)
 
   access
     .command('revoke <team>')
@@ -710,6 +728,70 @@ async function grantAccessAction(
   info(
     'This project is now restricted to the teams listed in: bunx @temps-sdk/cli access list'
   )
+  newline()
+}
+
+async function showAccessAction(
+  teamRef: string,
+  options: { json?: boolean } & ProjectOption
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const [projectId, teamId] = await Promise.all([
+    resolveProjectId(options.project),
+    resolveTeamId(teamRef)
+  ])
+  const { data, error } = await getProjectAccess({
+    client,
+    path: { project_id: projectId, team_id: teamId }
+  })
+  if (error || !data) {
+    throw new Error(getErrorMessage(error))
+  }
+
+  if (options.json) {
+    json(data)
+    return
+  }
+
+  newline()
+  info(`'${teamRef}' holds ${data.role} on project ${data.project_id}`)
+  newline()
+}
+
+async function setAccessRoleAction(
+  teamRef: string,
+  options: { role?: string; json?: boolean } & ProjectOption
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const role = options.role ? parseRole(options.role) : await promptRole('New role for this team on the project')
+
+  const grant = await withSpinner('Changing role...', async () => {
+    const [projectId, teamId] = await Promise.all([
+      resolveProjectId(options.project),
+      resolveTeamId(teamRef)
+    ])
+    const { data, error } = await updateProjectAccess({
+      client,
+      path: { project_id: projectId, team_id: teamId },
+      body: { role }
+    })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(grant)
+    return
+  }
+
+  newline()
+  success(`'${teamRef}' now holds ${grant.role} on project ${grant.project_id}`)
   newline()
 }
 

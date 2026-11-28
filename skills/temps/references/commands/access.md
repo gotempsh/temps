@@ -12,6 +12,8 @@ Manage which teams can reach a project
 
 - `list` (`ls`) - List the teams granted access to a project
 - `grant` - Grant a team access to a project
+- `show` (`get`) - Show a team's grant on a project
+- `set-role` - Change the role of a team's existing grant on a project
 - `revoke` - Revoke a team's access to a project
 
 ### `access list` (alias: `ls`)
@@ -37,6 +39,33 @@ Grant a team access to a project
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-r, --role <role>` | Role the team holds on the project (owner\|admin\|deployer\|viewer) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `access show` (alias: `get`)
+
+Show a team's grant on a project
+
+**Usage:** `access show <team> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `access set-role`
+
+Change the role of a team's existing grant on a project
+
+**Usage:** `access set-role <team> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-r, --role <role>` | New role (owner\|admin\|deployer\|viewer) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `access revoke`

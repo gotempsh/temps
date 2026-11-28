@@ -31,7 +31,7 @@ Manage Projects (what the console calls a Project): groups of services that ship
 - `create` (`new`) - Create a project (group), optionally with services
 - `update` (`edit`) - Rename a project (group) or change its description
 - `delete` (`rm`) - Delete a project (group); its services keep running as standalone services
-- `add` - Add services to a project (group), by slug or id as listed by `projects list`; moves them out of any other project
+- `add` - Add services to a project (group), by slug or id as listed by `projects list`
 - `remove` - Remove a service (slug or id) from a project (group); it becomes a standalone service
 - `repo` - The repository a project deploys its services from (monorepos)
 - `import` - Scan the project's repository and add its apps as services that follow it
@@ -76,6 +76,7 @@ Create a project (group), optionally with services
 | `-s, --slug <slug>` | URL slug (derived from the name when omitted) | - | No |
 | `-d, --description <text>` | What the services do together | - | No |
 | `--service <service...>` | Services to put in the project, by slug or id as listed by `projects list` (apps, not the databases of the `services` command) | - | No |
+| `--move` | Move a listed service that is already in another project (group) out of it | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `project-groups update` (alias: `edit`)
@@ -107,9 +108,15 @@ Delete a project (group); its services keep running as standalone services
 
 ### `project-groups add`
 
-Add services to a project (group), by slug or id as listed by `projects list`; moves them out of any other project
+Add services to a project (group), by slug or id as listed by `projects list`
 
-**Usage:** `project-groups add <group> <services...>`
+**Usage:** `project-groups add <group> <services...> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--move` | Move a service that is already in another project (group) out of it | - | No |
 
 ### `project-groups remove`
 
@@ -250,6 +257,7 @@ Variables shared by every service in a project (group)
 **Subcommands:**
 
 - `get` - Show one shared variable (a secret value is never shown)
+- `reveal` - Show the value of a non-secret shared variable (audited; secret values stay write-only)
 - `list` (`ls`) - List shared variables (secret values are never shown)
 - `set` - Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or read it with --value-file or --value-stdin (keeps secrets out of shell history)
 - `inherited` - Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
@@ -260,6 +268,18 @@ Variables shared by every service in a project (group)
 Show one shared variable (a secret value is never shown)
 
 **Usage:** `project-groups vars get <group-id> <var-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups vars reveal`
+
+Show the value of a non-secret shared variable (audited; secret values stay write-only)
+
+**Usage:** `project-groups vars reveal <group-id> <var-id> [options]`
 
 **Options:**
 

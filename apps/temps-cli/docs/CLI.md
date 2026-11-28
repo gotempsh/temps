@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-11-27
+> Generated on: 2026-11-28
 
 ## Installation
 
@@ -4423,6 +4423,8 @@ Archive a flag (callers fall back to their own default)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
+| `--purge` | Delete an already archived flag for good, freeing its key | - | No |
+| `-y, --yes` | Skip the confirmation for --purge | - | No |
 
 ## `data`
 

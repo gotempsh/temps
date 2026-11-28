@@ -21,6 +21,7 @@ import {
   deleteProjectGroup,
   detectPublicPresets,
   getGroupEnvVar,
+  revealGroupEnvVar,
   getGroupRepository,
   getInheritedEnvVars,
   getProjectBySlug,
@@ -383,6 +384,7 @@ export function registerProjectGroupsCommands(program: Command): void {
       '--service <service...>',
       'Services to put in the project, by slug or id as listed by `projects list` (apps, not the databases of the `services` command)'
     )
+    .option('--move', 'Move a listed service that is already in another project (group) out of it')
     .option('--json', 'Output in JSON format')
     .action(createAction)
 
@@ -406,8 +408,9 @@ export function registerProjectGroupsCommands(program: Command): void {
   groups
     .command('add <group> <services...>')
     .description(
-      'Add services to a project (group), by slug or id as listed by `projects list`; moves them out of any other project'
+      'Add services to a project (group), by slug or id as listed by `projects list`'
     )
+    .option('--move', 'Move a service that is already in another project (group) out of it')
     .action(addAction)
 
   groups
@@ -501,6 +504,12 @@ export function registerProjectGroupsCommands(program: Command): void {
   endpoint(vars, getGroupEnvVar, {
     name: 'get',
     description: 'Show one shared variable (a secret value is never shown)',
+    path: { group_id: 'int', var_id: 'int' },
+  })
+
+  endpoint(vars, revealGroupEnvVar, {
+    name: 'reveal',
+    description: 'Show the value of a non-secret shared variable (audited; secret values stay write-only)',
     path: { group_id: 'int', var_id: 'int' },
   })
 
@@ -645,6 +654,7 @@ async function createAction(
     slug?: string
     description?: string
     service?: string[]
+    move?: boolean
   } & JsonOption
 ): Promise<void> {
   await requireAuth()
@@ -664,7 +674,8 @@ async function createAction(
           slug: options.slug ?? null,
           description: options.description ?? null,
           project_ids: projectIds
-        }
+        },
+        query: { move: options.move ?? false }
       })
     )
   })
@@ -729,7 +740,7 @@ async function deleteAction(ref: string, options: { yes?: boolean }): Promise<vo
   success(`Deleted project ${colors.bold(group.name)}; its services are standalone now`)
 }
 
-async function addAction(ref: string, services: string[]): Promise<void> {
+async function addAction(ref: string, services: string[], options: { move?: boolean }): Promise<void> {
   await requireAuth()
   await setupClient()
   const group = await resolveGroup(ref)
@@ -739,7 +750,8 @@ async function addAction(ref: string, services: string[]): Promise<void> {
       unwrap(
         await addProjectToGroup({
           client,
-          path: { group_id: group.id, project_id: projectId }
+          path: { group_id: group.id, project_id: projectId },
+          query: { move: options.move ?? false }
         })
       )
     })
