@@ -22,6 +22,8 @@ import { useAuth } from '@/contexts/AuthContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
+  useDisablePlugin,
+  useEnablePlugin,
   usePluginServices,
   usePlugins,
   useReloadPlugins,
@@ -40,6 +42,8 @@ import {
   GitCompareArrows,
   MoreHorizontal,
   Plus,
+  Power,
+  PowerOff,
   Puzzle,
   RefreshCw,
   Shield,
@@ -53,6 +57,11 @@ import { toast } from 'sonner'
 import { RepositoryCatalog } from '@/components/plugins/RepositoryCatalog'
 import { PluginNavigationHint } from '@/components/plugins/PluginNavigationHint'
 import { PluginPermissionsDialog } from '@/components/plugins/PluginPermissionsDialog'
+import {
+  PluginDisabledNote,
+  PluginEnableButton,
+  PluginResourceLimits,
+} from '@/components/plugins/PluginControls'
 import {
   PluginPinnedBuild,
   PluginUpdateDialog,
@@ -75,6 +84,8 @@ export function PluginsPage() {
   const { data: plugins = [], isLoading: pluginsLoading } = usePlugins()
   const reloadPlugins = useReloadPlugins()
   const uninstallPlugin = useUninstallPlugin()
+  const disablePlugin = useDisablePlugin()
+  const enablePlugin = useEnablePlugin()
   // Plugins that run as Temps services, and how each is doing.
   const services = usePluginServices(canManagePlugins)
   const serviceOf = (name: string) =>
@@ -94,7 +105,11 @@ export function PluginsPage() {
   const tab = getUrlState('tab') === 'running' ? 'running' : 'browse'
   const setTab = (value: string) =>
     patchUrlState({ tab: value === 'browse' ? undefined : value })
-  const managementPending = reloadPlugins.isPending || uninstallPlugin.isPending
+  const managementPending =
+    reloadPlugins.isPending ||
+    uninstallPlugin.isPending ||
+    disablePlugin.isPending ||
+    enablePlugin.isPending
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
   // An entry left by a plugin an earlier version installed as an executable.
@@ -137,6 +152,26 @@ export function PluginsPage() {
         setUninstallName(null)
         return
       }
+    }
+  }
+
+  // One click: switching off takes access away, so it asks nothing first.
+  const handleDisable = async (name: string) => {
+    try {
+      const result = await disablePlugin.mutateAsync(name)
+      toast.success(result.message)
+    } catch {
+      // The toast comes from the app-wide mutation error handler.
+    }
+  }
+
+  const handleEnable = async (name: string) => {
+    try {
+      const result = await enablePlugin.mutateAsync(name)
+      toast.success(result.message)
+    } catch (error) {
+      // Any other failure is shown by the app-wide mutation error handler.
+      handleSensitiveActionError(error, () => void handleEnable(name))
     }
   }
 
@@ -343,11 +378,25 @@ export function PluginsPage() {
                             {plugin.description}
                           </p>
                         )}
-                        <PluginServiceOrigin service={serviceOf(plugin.name)} />
+                        <PluginServiceOrigin
+                          service={serviceOf(plugin.name)}
+                          currentUserId={user?.id}
+                        />
                         <PluginNavigationHint nav={plugin.nav} />
                       </div>
                     </div>
                     <div className="flex min-w-0 flex-wrap items-center gap-2">
+                      {canManagePlugins && (
+                        <PluginEnableButton
+                          plugin={serviceOf(plugin.name)}
+                          pending={
+                            enablePlugin.isPending &&
+                            enablePlugin.variables === plugin.name
+                          }
+                          disabled={managementPending}
+                          onEnable={(name) => void handleEnable(name)}
+                        />
+                      )}
                       {plugin.nav.some(
                         (entry) => entry.section !== 'project'
                       ) && (
@@ -382,6 +431,23 @@ export function PluginsPage() {
                                 <GitCompareArrows className="mr-2 size-4" />{' '}
                                 Review update
                               </DropdownMenuItem>
+                            )}
+                            {serviceOf(plugin.name)?.state === 'disabled' ? (
+                              <DropdownMenuItem
+                                onSelect={() => void handleEnable(plugin.name)}
+                              >
+                                <Power className="mr-2 size-4" /> Enable
+                              </DropdownMenuItem>
+                            ) : (
+                              serviceOf(plugin.name) && (
+                                <DropdownMenuItem
+                                  onSelect={() =>
+                                    void handleDisable(plugin.name)
+                                  }
+                                >
+                                  <PowerOff className="mr-2 size-4" /> Disable
+                                </DropdownMenuItem>
+                              )
                             )}
                             <DropdownMenuSeparator />
                             <DropdownMenuItem
@@ -418,14 +484,18 @@ function PluginRunState({
 /** The service a plugin runs as. */
 function PluginServiceOrigin({
   service,
+  currentUserId,
 }: {
   service: ServicePluginResponse | undefined
+  currentUserId?: number
 }) {
   if (!service) return null
   return (
     <>
+      <PluginDisabledNote plugin={service} currentUserId={currentUserId} />
       <ServicePluginOrigin plugin={service} />
       <PluginPinnedBuild plugin={service} />
+      <PluginResourceLimits plugin={service} />
       <PluginOwnStorage plugin={service} />
     </>
   )

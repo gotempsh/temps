@@ -28464,6 +28464,25 @@ export type PluginOutboundNetwork = {
 };
 
 /**
+ * The limits a plugin's container runs with. They are the limits of its
+ * service, changed in the service's settings and applied by a deployment.
+ */
+export type PluginResourceLimitsResponse = {
+    /**
+     * Microcores of CPU: 1,000,000 is one core. Absent when not capped.
+     */
+    cpu_limit_microcores?: number | null;
+    /**
+     * The deployment these limits were applied to.
+     */
+    deployment_id: number;
+    /**
+     * Megabytes of memory. Absent when memory is not capped.
+     */
+    memory_limit_mb?: number | null;
+};
+
+/**
  * Whether this server can run plugins as services, and the ones it runs.
  */
 export type PluginServicesResponse = {
@@ -28491,6 +28510,21 @@ export type PluginStatusResponse = {
     configured: boolean;
     reason?: string | null;
     setup_path: string;
+};
+
+/**
+ * Whether a plugin is switched off, after the call.
+ */
+export type PluginSwitchResponse = {
+    /**
+     * Whether Temps is cut off from the plugin.
+     */
+    disabled: boolean;
+    /**
+     * What happened, and what was left as it is.
+     */
+    message: string;
+    name: string;
 };
 
 /**
@@ -36015,6 +36049,14 @@ export type ServicePluginResponse = {
      * Why the plugin is not running, when it is not.
      */
     detail?: string | null;
+    /**
+     * Since when an administrator has the plugin switched off.
+     */
+    disabled_at?: string | null;
+    /**
+     * The user who switched it off, while that user exists.
+     */
+    disabled_by?: number | null;
     environment_id?: number | null;
     environment_name?: string | null;
     /**
@@ -36036,6 +36078,7 @@ export type ServicePluginResponse = {
      * The service the plugin runs as. Absent once the service was deleted.
      */
     project_id?: number | null;
+    resource_limits?: PluginResourceLimitsResponse | null;
     service_name?: string | null;
     service_slug?: string | null;
     /**
@@ -36057,7 +36100,7 @@ export type ServicePluginResponse = {
 /**
  * Whether a plugin that runs as a service can serve a request right now.
  */
-export type ServicePluginState = 'running' | 'asleep' | 'update_waiting' | 'unavailable';
+export type ServicePluginState = 'running' | 'asleep' | 'update_waiting' | 'disabled' | 'unavailable';
 
 /**
  * A public URL of a compose service and the container port it routes to.
@@ -112443,6 +112486,110 @@ export type PutPluginAiToolsResponses = {
 };
 
 export type PutPluginAiToolsResponse = PutPluginAiToolsResponses[keyof PutPluginAiToolsResponses];
+
+export type DisablePluginData = {
+    body?: never;
+    path: {
+        /**
+         * The plugin's name
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/disable';
+};
+
+export type DisablePluginErrors = {
+    /**
+     * Invalid plugin name
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No plugin with that name was added
+     */
+    404: ProblemDetails;
+    /**
+     * The plugin is cut off, but that could not be saved
+     */
+    500: ProblemDetails;
+    /**
+     * The plugin host is shutting down
+     */
+    503: ProblemDetails;
+};
+
+export type DisablePluginError = DisablePluginErrors[keyof DisablePluginErrors];
+
+export type DisablePluginResponses = {
+    /**
+     * Temps is cut off from the plugin
+     */
+    200: PluginSwitchResponse;
+};
+
+export type DisablePluginResponse = DisablePluginResponses[keyof DisablePluginResponses];
+
+export type EnablePluginData = {
+    body?: never;
+    path: {
+        /**
+         * The plugin's name
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/enable';
+};
+
+export type EnablePluginErrors = {
+    /**
+     * Invalid plugin name
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No plugin with that name was added
+     */
+    404: ProblemDetails;
+    /**
+     * Recent sensitive-action verification required
+     */
+    428: ProblemDetails;
+    /**
+     * The plugin could not be enabled
+     */
+    500: ProblemDetails;
+    /**
+     * Audit unavailable, or the plugin host is shutting down
+     */
+    503: ProblemDetails;
+};
+
+export type EnablePluginError = EnablePluginErrors[keyof EnablePluginErrors];
+
+export type EnablePluginResponses = {
+    /**
+     * The plugin may connect again
+     */
+    200: PluginSwitchResponse;
+};
+
+export type EnablePluginResponse = EnablePluginResponses[keyof EnablePluginResponses];
 
 export type GetPluginGrantsData = {
     body?: never;

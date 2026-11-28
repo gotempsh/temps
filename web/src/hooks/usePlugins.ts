@@ -4,6 +4,8 @@
 import {
   addServicePlugin,
   approvePluginUpdate,
+  disablePlugin,
+  enablePlugin,
   getPluginServices,
   listExternalPlugins,
   reloadPlugins,
@@ -123,6 +125,36 @@ export function useApprovePluginUpdate() {
       ).data,
     retry: false,
     // Approved or refused, what waits may have changed.
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
+    },
+  })
+}
+
+/**
+ * Cut a plugin off from Temps at once. Its service, its permissions and its
+ * approved build are kept for when it is enabled.
+ */
+export function useDisablePlugin() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (name: string) =>
+      (await disablePlugin({ path: { name }, throwOnError: true })).data,
+    retry: false,
+    // Also when it failed: the plugin may be cut off without that being saved.
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
+    },
+  })
+}
+
+/** Let a disabled plugin connect again, with the permissions it had. */
+export function useEnablePlugin() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (name: string) =>
+      (await enablePlugin({ path: { name }, throwOnError: true })).data,
+    retry: false,
     onSettled: async () => {
       await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
     },

@@ -116,6 +116,11 @@ service. Temps does not follow it: the plugin is pinned to the build an administ
 approved, the new build waits with what it asks for beyond the approved one, and it runs
 as the plugin only once an administrator approves that deployment. Approving allows no
 new permission, and consent to the plugin's AI tools is asked for again.
+An administrator can disable a plugin in one step (`temps plugin disable <name>`): Temps
+closes its channel and sends it nothing until `temps plugin enable <name>`, while the
+service keeps running with its grants and approved build kept. The container runs with
+the memory and CPU limits of its service (`temps plugin limits <name>`), and each change
+the plugin makes through the API is audited with the plugin and the acting user.
 Removing a plugin revokes its permissions and leaves its service and files in place;
 adding the service again is a new identity with fresh grants.
 

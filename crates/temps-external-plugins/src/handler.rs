@@ -4,6 +4,7 @@
 //! HTTP handlers for external plugin management endpoints.
 
 mod ai_tools;
+mod controls;
 mod services;
 mod updates;
 mod watches;
@@ -618,6 +619,14 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
             StatusCode::INTERNAL_SERVER_ERROR,
             "Approved Plugin Build Unavailable",
         ),
+        ExternalPluginsError::DisableNotRecorded { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Plugin Disabled But Not Saved",
+        ),
+        ExternalPluginsError::EnableNotRecorded { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Plugin Could Not Be Enabled",
+        ),
     };
     temps_core::problemdetails::new(status)
         .with_title(title)
@@ -639,6 +648,7 @@ fn service_attach_status(
             (StatusCode::CONFLICT, "Service Has No Running Container")
         }
         Attach::NameChanged { .. } => (StatusCode::CONFLICT, "Plugin Name Changed"),
+        Attach::Disabled { .. } => (StatusCode::CONFLICT, "Plugin Is Disabled"),
         Attach::UpdateWaiting { .. } => (StatusCode::CONFLICT, "Plugin Update Waits For Approval"),
         Attach::NameTaken { .. } => (StatusCode::CONFLICT, "Plugin Name Already Installed"),
         Attach::NotAPlugin { .. } => (StatusCode::BAD_REQUEST, "Service Is Not A Plugin"),
@@ -696,6 +706,12 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
             "The plugin's approved build could not be read from or recorded in the database. See the server log."
                 .to_string()
         }
+        ExternalPluginsError::DisableNotRecorded { name, .. } => format!(
+            "Plugin '{name}' is disconnected now, but that could not be saved, so it connects again when Temps restarts. Disable it again."
+        ),
+        ExternalPluginsError::EnableNotRecorded { name, .. } => format!(
+            "Plugin '{name}' could not be enabled in the database, so it stays disabled. Try again."
+        ),
         ExternalPluginsError::RetiredRecord { name, .. } => format!(
             "The installation record of plugin '{name}' could not be removed from this server's plugin directory, so it is still listed. See the server log."
         ),
@@ -853,6 +869,8 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             "/x/plugins/{name}/update/approve",
             post(updates::approve_plugin_update),
         )
+        .route("/x/plugins/{name}/disable", post(controls::disable_plugin))
+        .route("/x/plugins/{name}/enable", post(controls::enable_plugin))
 }
 
 #[derive(OpenApiTrait)]
@@ -872,6 +890,8 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         services::get_plugin_services,
         services::add_service_plugin,
         updates::approve_plugin_update,
+        controls::disable_plugin,
+        controls::enable_plugin,
     ),
     components(
         schemas(
@@ -905,6 +925,8 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             updates::ApprovePluginUpdate,
             updates::ApprovedPluginUpdateResponse,
             crate::updates::AccessDifference,
+            controls::PluginSwitchResponse,
+            services::PluginResourceLimitsResponse,
             crate::manager::ServicePluginState,
             crate::grants::PluginGrantConfig,
             PluginActorInfo,
@@ -1493,6 +1515,9 @@ mod tests {
             pending_manifest: None,
             pending_review: None,
             pending_since: None,
+            disabled: false,
+            disabled_at: None,
+            disabled_by: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

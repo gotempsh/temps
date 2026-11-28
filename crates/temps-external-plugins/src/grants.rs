@@ -60,6 +60,11 @@ pub struct StoredServicePlugin {
     pub tier: crate::tier::PluginTier,
     /// The build it is pinned to, and the update that waits, if any.
     pub pin: crate::updates::BuildPin,
+    /// An administrator switched it off: Temps attaches to nothing.
+    pub disabled: bool,
+    pub disabled_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The user who switched it off, while that user exists.
+    pub disabled_by: Option<i32>,
 }
 
 #[derive(Debug, Error)]
@@ -284,6 +289,41 @@ impl PluginGrantService {
         Ok(())
     }
 
+    /// Record that an administrator switched the active plugin `plugin_name`
+    /// off (`by` is who) or on again.
+    pub async fn set_disabled(
+        &self,
+        plugin_name: &str,
+        disabled: Option<i32>,
+    ) -> Result<(), GrantError> {
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE external_plugin_actors SET disabled=$2, \
+                 disabled_at=CASE WHEN $2 THEN NOW() ELSE NULL END, disabled_by=$3, \
+                 updated_at=NOW() \
+                 WHERE plugin_name=$1 AND active=TRUE",
+                [
+                    plugin_name.into(),
+                    disabled.is_some().into(),
+                    disabled.into(),
+                ],
+            ))
+            .await
+            .map_err(|source| GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation: "record whether the plugin is disabled",
+                source,
+            })?;
+        if result.rows_affected() != 1 {
+            return Err(GrantError::NotFound {
+                plugin_name: plugin_name.into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Every active plugin that runs as a Temps service, in one query.
     pub async fn service_plugins(&self) -> Result<Vec<StoredServicePlugin>, GrantError> {
         let database = |source| GrantError::Database {
@@ -296,7 +336,7 @@ impl PluginGrantService {
             .query_all(Statement::from_string(
                 DatabaseBackend::Postgres,
                 format!(
-                    "SELECT plugin_name, project_id, environment_id, tier, {} FROM external_plugin_actors WHERE active=TRUE AND isolation='service' ORDER BY plugin_name",
+                    "SELECT plugin_name, project_id, environment_id, tier, disabled, disabled_at, disabled_by, {} FROM external_plugin_actors WHERE active=TRUE AND isolation='service' ORDER BY plugin_name",
                     crate::updates::BuildPin::COLUMNS
                 ),
             ))
@@ -311,6 +351,9 @@ impl PluginGrantService {
             let tier: String = row.try_get("", "tier").map_err(database)?;
             let pin = crate::updates::BuildPin::from_row(&row).map_err(database)?;
             plugins.push(StoredServicePlugin {
+                disabled: row.try_get("", "disabled").map_err(database)?,
+                disabled_at: row.try_get("", "disabled_at").map_err(database)?,
+                disabled_by: row.try_get("", "disabled_by").map_err(database)?,
                 tier: crate::tier::PluginTier::from_stored(&tier),
                 binding: project_id
                     .zip(environment_id)

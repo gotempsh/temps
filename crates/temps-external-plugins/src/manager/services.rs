@@ -77,6 +77,9 @@ pub enum ServicePluginState {
     /// attached to it and attaches only once the update is approved, or the
     /// approved build runs again.
     UpdateWaiting,
+    /// An administrator switched the plugin off. Temps is cut off from it
+    /// until it is enabled again.
+    Disabled,
     /// Temps is not attached, for the reason given with it.
     Unavailable,
 }
@@ -104,6 +107,8 @@ struct DormantService {
     asleep: bool,
     /// The service runs a build that waits for an administrator.
     update_waiting: bool,
+    /// An administrator switched the plugin off: nothing attaches to it.
+    disabled: bool,
     reason: String,
     /// Until when requests fail, with what they are told, instead of trying
     /// again.
@@ -346,6 +351,11 @@ impl ExternalPluginManager {
             });
         }
         self.ensure_name_is_free(&manifest.name, binding).await?;
+        if self.is_disabled(&manifest.name).await {
+            return Err(ServiceAttachError::Disabled {
+                plugin: manifest.name,
+            });
+        }
         // Before the plugin is given a channel: a build nobody approved gets
         // none.
         let review = crate::updates::review_id(&target.build, &manifest).map_err(|error| {
@@ -521,6 +531,7 @@ impl ExternalPluginManager {
                     manifest,
                     asleep: false,
                     update_waiting: false,
+                    disabled: false,
                     reason: format!(
                         "Plugin '{name}' lost its connection to Temps and is being reconnected."
                     ),
@@ -590,6 +601,10 @@ impl ExternalPluginManager {
         let asleep = error.is_asleep();
         let reason = error.public_reason();
         let mut dormant = self.services.dormant.write().await;
+        // A plugin that was switched off stays off, with that reason.
+        if dormant.get(name).is_some_and(|previous| previous.disabled) {
+            return;
+        }
         let manifest = dormant.remove(name).and_then(|previous| previous.manifest);
         dormant.insert(
             name.to_string(),
@@ -598,6 +613,7 @@ impl ExternalPluginManager {
                 manifest,
                 asleep,
                 update_waiting: error.is_update_waiting(),
+                disabled: false,
                 reason: reason.clone(),
                 retry_after: retry_after.map(|until| (until, reason.clone())),
             },
@@ -650,6 +666,7 @@ impl ExternalPluginManager {
                         manifest: None,
                         asleep: false,
                         update_waiting: false,
+                        disabled: false,
                         reason: reason.clone(),
                         retry_after: None,
                     },
@@ -664,6 +681,23 @@ impl ExternalPluginManager {
                 });
                 continue;
             };
+            if plugin.disabled {
+                // Listed, with its routes, and never attached to.
+                self.services.dormant.write().await.insert(
+                    plugin.name.clone(),
+                    DormantService {
+                        binding: Some(binding),
+                        manifest: plugin.manifest.clone(),
+                        asleep: false,
+                        update_waiting: false,
+                        disabled: true,
+                        reason: disabled_reason(&plugin.name),
+                        retry_after: None,
+                    },
+                );
+                report.manifests.extend(plugin.manifest);
+                continue;
+            }
             let _attaching = self.services.attach.lock().await;
             match self
                 .attach_service_locked(binding, Some(&plugin.name), BuildApproval::Pinned)
@@ -680,6 +714,7 @@ impl ExternalPluginManager {
                             manifest: plugin.manifest.clone(),
                             asleep: false,
                             update_waiting: false,
+                            disabled: false,
                             reason: String::new(),
                             retry_after: None,
                         },
@@ -750,7 +785,9 @@ impl ExternalPluginManager {
                     name: name.clone(),
                     binding: dormant.binding,
                     deployment_id: None,
-                    state: if dormant.asleep {
+                    state: if dormant.disabled {
+                        ServicePluginState::Disabled
+                    } else if dormant.asleep {
                         ServicePluginState::Asleep
                     } else if dormant.update_waiting {
                         ServicePluginState::UpdateWaiting
@@ -778,6 +815,82 @@ impl ExternalPluginManager {
         let attached = self.plugins.write().await.remove(plugin_name).is_some();
         self.start_failures.write().await.remove(plugin_name);
         attached || was_dormant
+    }
+
+    /// Whether an administrator switched `plugin_name` off.
+    pub async fn is_disabled(&self, plugin_name: &str) -> bool {
+        self.services
+            .dormant
+            .read()
+            .await
+            .get(plugin_name)
+            .is_some_and(|dormant| dormant.disabled)
+    }
+
+    /// Cut `plugin_name` off from Temps at once: close its channel and
+    /// refuse every later attempt to attach, until it is enabled. It stays
+    /// listed, with its routes, so that what was switched off says so. The
+    /// service keeps running: the deployment owns it. Returns whether such a
+    /// plugin exists.
+    pub(crate) async fn disable_service(&self, plugin_name: &str) -> bool {
+        let _attaching = self.services.attach.lock().await;
+        // Dropping the process closes its channel; its watcher finds the
+        // plugin gone and does nothing.
+        let attached = self.plugins.write().await.remove(plugin_name);
+        let mut dormant = self.services.dormant.write().await;
+        let (binding, manifest) = match attached {
+            Some(process) => (
+                Some(process.service.binding),
+                Some(process.manifest.clone()),
+            ),
+            None => match dormant.remove(plugin_name) {
+                Some(previous) => (previous.binding, previous.manifest),
+                None => return false,
+            },
+        };
+        dormant.insert(
+            plugin_name.to_string(),
+            DormantService {
+                binding,
+                manifest,
+                asleep: false,
+                update_waiting: false,
+                disabled: true,
+                reason: disabled_reason(plugin_name),
+                retry_after: None,
+            },
+        );
+        drop(dormant);
+        self.start_failures.write().await.remove(plugin_name);
+        true
+    }
+
+    /// Let `plugin_name` connect again, and connect to it if its approved
+    /// build runs. A service that is stopped for being idle is not started:
+    /// the next request to the plugin does that. Returns whether such a
+    /// plugin exists.
+    pub(crate) async fn enable_service(&self, plugin_name: &str) -> bool {
+        let _attaching = self.services.attach.lock().await;
+        let binding = {
+            let mut dormant = self.services.dormant.write().await;
+            let Some(entry) = dormant.get_mut(plugin_name) else {
+                return self.plugins.read().await.contains_key(plugin_name);
+            };
+            entry.disabled = false;
+            entry.retry_after = None;
+            entry.reason = format!("Plugin '{plugin_name}' was enabled and is being connected.");
+            entry.binding
+        };
+        let Some(binding) = binding else {
+            return true;
+        };
+        if let Err(error) = self
+            .attach_service_locked(binding, Some(plugin_name), BuildApproval::Pinned)
+            .await
+        {
+            self.mark_dormant(plugin_name, binding, &error, None).await;
+        }
+        true
     }
 
     /// The proxy of a plugin that runs as a service: it looks the address up
@@ -862,6 +975,7 @@ impl ExternalPluginManager {
             .read()
             .await
             .get(plugin_name)
+            .filter(|dormant| !dormant.disabled)
             .and_then(|dormant| dormant.manifest.as_ref())
             .is_some_and(|manifest| {
                 manifest
@@ -903,6 +1017,9 @@ impl ExternalPluginManager {
             let Some(binding) = entry.binding else {
                 return Err(entry.reason.clone());
             };
+            if entry.disabled {
+                return Err(entry.reason.clone());
+            }
             let waiting = entry
                 .retry_after
                 .as_ref()
@@ -980,6 +1097,14 @@ impl ExternalPluginManager {
                 )
             })
     }
+}
+
+/// What a request to a disabled plugin, and its row in the list, are told.
+fn disabled_reason(plugin_name: &str) -> String {
+    ServiceAttachError::Disabled {
+        plugin: plugin_name.to_string(),
+    }
+    .public_reason()
 }
 
 /// Temps held an update of a plugin on its own: nobody asked, so the entry

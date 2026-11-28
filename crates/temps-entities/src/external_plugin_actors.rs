@@ -47,6 +47,12 @@ pub struct Model {
     /// What an approval must quote: the waiting build and its manifest.
     pub pending_review: Option<String>,
     pub pending_since: Option<DBDateTime>,
+    /// An administrator switched the plugin off. Temps is cut off from it;
+    /// its grants, pinned build and service are kept.
+    pub disabled: bool,
+    pub disabled_at: Option<DBDateTime>,
+    /// The user who switched it off; NULL once that user is deleted.
+    pub disabled_by: Option<i32>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

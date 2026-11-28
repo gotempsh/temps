@@ -70,6 +70,16 @@ A plugin's service can be redeployed by anyone who may deploy it, and a new buil
 
 Nothing applies an update automatically, including one that asks for nothing more: it is still unreviewed code that would run with the plugin's existing permissions.
 
+### D6. A switch, limits and a trail
+
+Once a plugin runs, an administrator needs to stop it faster than they can investigate it, to bound what it can consume, and to find out afterwards what it changed and for whom.
+
+- **Switch.** `external_plugin_actors.disabled` (with `disabled_at` and `disabled_by`) switches a plugin off. `POST /x/plugins/{name}/disable` closes the plugin's channel at once and refuses every later attempt to attach: no request is forwarded, no event is delivered or starts it, none of its AI tools are offered, and it can make no call to Temps, since calls travel over the channel Temps opened. The plugin stays listed as `disabled`, with its routes, so a request to it is answered with the reason instead of a missing page. Its grants, its pinned build and its service are untouched. `POST /x/plugins/{name}/enable` clears the flag and attaches again to the approved build.
+- **Asymmetric cost.** Disabling takes access away, so it is one call with no confirmation and no step-up verification. Enabling gives code its permissions back, so it requires recent verification like adding a plugin does. Both require system administration and are audited (`EXTERNAL_PLUGIN_DISABLED`, `EXTERNAL_PLUGIN_ENABLE_REQUESTED`, `EXTERNAL_PLUGIN_ENABLED` and their `_FAILED` counterparts).
+- **Order of effects.** Disabling cuts the plugin off in memory first and saves the flag second: if the save fails the call reports it, and the plugin is off until the next restart rather than still on. Enabling saves first, so a plugin is never connected while its row says off. A restarted Temps reads the flag and never attaches to a disabled plugin.
+- **Limits.** A plugin's container is its service's container, so its memory and CPU limits are the service's (`deployment_config` on the environment, snapshotted on each deployment and applied by the deployer). They are per plugin because each plugin is its own service, they are rows, and changing them is audited by the existing write path. The list of plugins reports, for each one, the limits of the deployment it is attached or pinned to, and says so when memory is not capped.
+- **Trail.** Each delegated call that changes something and reaches the platform's handler writes `EXTERNAL_PLUGIN_CHANGE_MADE` (the handler answered 2xx) or `EXTERNAL_PLUGIN_CHANGE_REFUSED` (anything else). The entry belongs to the acting user (`user_id`) and names the plugin actor, the method, the path and the status. Before this, the handler's own entry named the user and not the plugin, and the channel's entries named the plugin and no user. A change refused before it reaches a handler (missing permission, outside the write scope) has no acting user and stays recorded as denied to the plugin.
+
 ## Decisions taken without a precedent in the code
 
 These were chosen conservatively and are for the owner to confirm:
@@ -87,3 +97,9 @@ These were chosen conservatively and are for the owner to confirm:
 11. **A plugin row with no pin** (one added before pins existed) is pinned to the build that runs when Temps next attaches to it.
 12. **Approving reuses the `install_external_plugin` sensitive action**, since it lets new code run as the plugin.
 13. **There is no "reject" action.** An update that is not approved keeps waiting; the administrator rolls the service back or removes the plugin.
+14. **Disabling cuts the plugin off from Temps and leaves its service running.** The container keeps its own outbound network access and its own database; stopping it is done from the service's page. The alternative, stopping the environment as part of disabling, would make the switch depend on the deployer and on the service's on-demand settings.
+15. **Disabling needs no step-up verification and enabling does.** The switch has to work for an administrator whose verification has lapsed; turning a plugin back on is treated like adding it.
+16. **Enabling does not start a service that is stopped for being idle.** The next request to the plugin does, as for any idle plugin.
+17. **Resource limits are the service's, with its existing defaults**: 512 MB of memory for a new service and no CPU limit. No stricter default is applied because a service is a plugin, and no plugin-specific limit columns were added, since two sources for one container's limits would disagree.
+18. **There is no rate limit on a plugin's calls to Temps.** The channel protocol has no error a plugin could tell apart from a failure, so adding one changes the wire contract. Calls are bounded today by the plugin's permissions, the write scope and the AI call quota.
+19. **The change entry is written after the call, best effort.** A change that went through and whose entry could not be written is logged as an error and not undone; the entry written before the call (`EXTERNAL_PLUGIN_HOST_OPERATION_ALLOWED`) is still required, and the call is not made without it.

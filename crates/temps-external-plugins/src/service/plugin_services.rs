@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-use temps_entities::{environments, external_services, project_services, projects};
+use temps_entities::{deployments, environments, external_services, project_services, projects};
 use temps_plugin_protocol::PluginManifest;
 use tracing::{debug, info};
 
@@ -29,6 +29,18 @@ pub struct PendingUpdateView {
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     /// What it asks for compared with the approved build.
     pub difference: AccessDifference,
+}
+
+/// The limits the plugin's container runs with: those of the deployment its
+/// service runs, as recorded when it was deployed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginResourceLimits {
+    /// The deployment the limits belong to.
+    pub deployment_id: i32,
+    /// Megabytes of memory; `None` when the service is not capped.
+    pub memory_limit_mb: Option<i32>,
+    /// Microcores of CPU (1,000,000 is one core); `None` when not capped.
+    pub cpu_limit_microcores: Option<i32>,
 }
 
 /// An update an administrator approved.
@@ -71,6 +83,13 @@ pub struct ServicePluginView {
     pub pinned_deployment_id: Option<i32>,
     /// A newer build that waits for approval, if any.
     pub pending_update: Option<PendingUpdateView>,
+    /// Since when the plugin is switched off, while it is.
+    pub disabled_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The user who switched it off, while that user exists.
+    pub disabled_by: Option<i32>,
+    /// The memory and CPU the plugin's container is limited to. `None`
+    /// before the plugin has a deployment Temps knows.
+    pub resource_limits: Option<PluginResourceLimits>,
 }
 
 impl ExternalPluginsService {
@@ -138,6 +157,64 @@ impl ExternalPluginsService {
             .await?;
         self.manager.detach_service(name).await;
         info!(plugin = %name, "A service plugin was removed; its service keeps running");
+        self.refresh_runtime_surfaces().await;
+        Ok(())
+    }
+
+    /// Cut `name` off from Temps at once, and keep it that way across
+    /// restarts. Its grants, approved build and service are left alone.
+    ///
+    /// The plugin is disconnected before anything is saved: a switch that
+    /// could not be recorded still holds until Temps restarts, and says so.
+    pub async fn disable_plugin(&self, name: &str, by: i32) -> Result<(), ExternalPluginsError> {
+        if !crate::naming::valid_plugin_name(name) {
+            return Err(ExternalPluginsError::InvalidPluginName { name: name.into() });
+        }
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+        if !self.manager.disable_service(name).await {
+            return Err(ExternalPluginsError::NotInstalled { name: name.into() });
+        }
+        // Its AI tools go with it, before the cancellable write.
+        self.ai_tools
+            .publish(self.ai_tools.snapshot().without_plugin(name));
+        let recorded = crate::grants::PluginGrantService::new(self.db.clone())
+            .set_disabled(name, Some(by))
+            .await;
+        self.refresh_runtime_surfaces().await;
+        recorded.map_err(|source| ExternalPluginsError::DisableNotRecorded {
+            name: name.into(),
+            source,
+        })?;
+        info!(plugin = %name, user_id = by, "A plugin was disabled; its service keeps running");
+        Ok(())
+    }
+
+    /// Let `name` connect again, with the grants it had, and connect to it
+    /// when its approved build runs.
+    pub async fn enable_plugin(&self, name: &str) -> Result<(), ExternalPluginsError> {
+        if !crate::naming::valid_plugin_name(name) {
+            return Err(ExternalPluginsError::InvalidPluginName { name: name.into() });
+        }
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+        if !self.manager.is_service_plugin(name).await {
+            return Err(ExternalPluginsError::NotInstalled { name: name.into() });
+        }
+        // Saved first: a plugin is never connected while its row says off.
+        crate::grants::PluginGrantService::new(self.db.clone())
+            .set_disabled(name, None)
+            .await
+            .map_err(|source| ExternalPluginsError::EnableNotRecorded {
+                name: name.into(),
+                source,
+            })?;
+        self.manager.enable_service(name).await;
+        info!(plugin = %name, "A plugin was enabled");
         self.refresh_runtime_surfaces().await;
         Ok(())
     }
@@ -271,13 +348,60 @@ impl ExternalPluginsService {
                 names.sort();
             }
         }
-        let mut stored: HashMap<String, crate::grants::StoredServicePlugin> =
+        let stored: HashMap<String, crate::grants::StoredServicePlugin> =
             crate::grants::PluginGrantService::new(self.db.clone())
                 .service_plugins()
                 .await?
                 .into_iter()
                 .map(|plugin| (plugin.name.clone(), plugin))
                 .collect();
+        // The limits each plugin's container runs with, from the deployment
+        // it is attached or pinned to, in one query. Only the limits are
+        // read: the same record holds the deployment's environment.
+        let deployment_of = |status: &crate::manager::services::ServicePluginStatus| {
+            status.deployment_id.or_else(|| {
+                stored
+                    .get(&status.name)
+                    .and_then(|plugin| plugin.pin.deployment_id)
+            })
+        };
+        let deployment_ids: Vec<i32> = statuses.iter().filter_map(deployment_of).collect();
+        let limits: HashMap<i32, PluginResourceLimits> = if deployment_ids.is_empty() {
+            HashMap::new()
+        } else {
+            use sea_orm::QuerySelect;
+            deployments::Entity::find()
+                .select_only()
+                .column(deployments::Column::Id)
+                .column(deployments::Column::DeploymentConfig)
+                .filter(deployments::Column::Id.is_in(deployment_ids))
+                .into_tuple::<(
+                    i32,
+                    Option<temps_entities::deployment_config::DeploymentConfigSnapshot>,
+                )>()
+                .all(self.db.as_ref())
+                .await
+                .map_err(read)?
+                .into_iter()
+                .map(|(deployment_id, config)| {
+                    (
+                        deployment_id,
+                        PluginResourceLimits {
+                            deployment_id,
+                            // Zero is the explicit "no limit".
+                            memory_limit_mb: config
+                                .as_ref()
+                                .and_then(|config| config.memory_limit)
+                                .filter(|megabytes| *megabytes > 0),
+                            cpu_limit_microcores: config
+                                .as_ref()
+                                .and_then(|config| config.cpu_limit)
+                                .filter(|microcores| *microcores > 0),
+                        },
+                    )
+                })
+                .collect()
+        };
         Ok(statuses
             .into_iter()
             .map(|status| {
@@ -287,13 +411,19 @@ impl ExternalPluginsService {
                 let environment = status
                     .binding
                     .and_then(|binding| environments.get(&binding.environment_id));
-                let stored = stored.remove(&status.name);
-                let pin = stored.as_ref().map(|plugin| &plugin.pin);
+                let resource_limits = deployment_of(&status)
+                    .and_then(|deployment_id| limits.get(&deployment_id).copied());
+                let stored = stored.get(&status.name);
+                let pin = stored.map(|plugin| &plugin.pin);
                 ServicePluginView {
-                    tier: stored
-                        .as_ref()
-                        .map(|plugin| plugin.tier)
-                        .unwrap_or_default(),
+                    tier: stored.map(|plugin| plugin.tier).unwrap_or_default(),
+                    disabled_at: stored
+                        .filter(|plugin| plugin.disabled)
+                        .and_then(|plugin| plugin.disabled_at),
+                    disabled_by: stored
+                        .filter(|plugin| plugin.disabled)
+                        .and_then(|plugin| plugin.disabled_by),
+                    resource_limits,
                     pinned_deployment_id: pin.and_then(|pin| pin.deployment_id),
                     pending_update: pin.and_then(|pin| {
                         let pending = pin.pending.as_ref()?;

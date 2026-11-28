@@ -329,6 +329,34 @@ impl Platform {
         deployment_id
     }
 
+    /// A user with this id, for what records who did something.
+    pub(crate) async fn user(&self, id: i32) -> i32 {
+        use sea_orm::IntoActiveModel;
+        let user = crate::proxy::tests::test_user(id, &format!("operator-{id}@example.test"));
+        temps_entities::users::Entity::insert(user.into_active_model())
+            .exec(self.db().as_ref())
+            .await
+            .expect("user");
+        id
+    }
+
+    /// Record the limits a deployment's container was started with.
+    pub(crate) async fn limit(&self, deployment_id: i32, memory_mb: i32, cpu_microcores: i32) {
+        self.db()
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE deployments SET deployment_config=\
+                     jsonb_build_object('memoryLimit', $2::int, 'cpuLimit', $3::int) WHERE id=$1",
+                [
+                    deployment_id.into(),
+                    memory_mb.into(),
+                    cpu_microcores.into(),
+                ],
+            ))
+            .await
+            .expect("deployment limits");
+    }
+
     pub(crate) async fn set_sleeping(&self, binding: ServiceBinding, sleeping: bool) {
         self.db()
             .execute(Statement::from_sql_and_values(
@@ -1274,4 +1302,141 @@ async fn an_event_starts_an_idle_plugin_only_when_it_may_receive_events() {
         2,
         "the second event did not try to start the service again"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_plugin_is_cut_off_at_once_and_stays_off_until_it_is_enabled() {
+    use crate::event_listener::PluginEventListener;
+    use crate::grants::{PluginGrantConfig, PluginGrantService};
+
+    let Some(platform) = platform("disabling a plugin").await else {
+        return;
+    };
+    let plugin = serve_plugin("reports", TOKEN);
+    let binding = platform.service("reports-service").await;
+    let deployment_id = platform.deploy(binding, plugin.port).await;
+    let administrator = platform.user(7).await;
+    let manager = platform.manager().await;
+    manager.attach_service(binding, None).await.expect("attach");
+    let grants = PluginGrantService::new(platform.db());
+    grants
+        .update(
+            "reports",
+            PluginGrantConfig {
+                permissions: vec![PluginHostPermission::EventsRead],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("grant events");
+    let event = temps_plugin_protocol::PluginEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        event_type: "deployment.succeeded".to_string(),
+        timestamp: chrono::Utc::now(),
+        project_id: Some(binding.project_id),
+        data: serde_json::json!({}),
+    };
+    PluginEventListener::deliver_to_plugins(&manager, &event).await;
+    eventually("the running plugin is given the event", || async {
+        plugin.events.load(AtomicOrdering::SeqCst) == 1
+    })
+    .await;
+
+    assert!(!manager.disable_service("absent").await, "no such plugin");
+    assert!(manager.disable_service("reports").await);
+
+    // It stays listed, with its routes, and says why nothing reaches it.
+    assert!(manager.is_disabled("reports").await);
+    assert!(manager.is_service_plugin("reports").await);
+    let status = status_of(&manager, "reports").await.expect("still listed");
+    assert_eq!(status.state, ServicePluginState::Disabled);
+    assert_eq!(status.binding, Some(binding));
+    let detail = status.detail.expect("a disabled plugin says so");
+    assert!(
+        detail.contains("was disabled by an administrator"),
+        "{detail}"
+    );
+    let (status, body) = through_proxy(&manager, "reports", "/items", true).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("was disabled by an administrator"), "{body}");
+    assert!(body.contains("Settings > Plugins"), "{body}");
+
+    // No event reaches it or starts it, and it cannot be added again.
+    assert!(!manager.stopped_service_takes_events("reports").await);
+    PluginEventListener::deliver_to_plugins(&manager, &event).await;
+    let error = manager
+        .attach_service(binding, None)
+        .await
+        .expect_err("a disabled plugin is not attached");
+    assert!(
+        matches!(&error, ServiceAttachError::Disabled { plugin } if plugin == "reports"),
+        "{error}"
+    );
+    // Its service still runs and its channel was closed: nothing connects to
+    // it again on its own.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        status_of(&manager, "reports")
+            .await
+            .map(|status| status.state),
+        Some(ServicePluginState::Disabled)
+    );
+    assert_eq!(plugin.events.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(platform.waker.wakes.load(AtomicOrdering::SeqCst), 0);
+
+    // A restarted Temps keeps it off, and keeps its routes.
+    grants
+        .set_disabled("reports", Some(administrator))
+        .await
+        .expect("record the switch");
+    manager.stop_supervising_services();
+    manager.shutdown_all().await;
+    drop(manager);
+    let restarted = platform.manager().await;
+    let report = restarted.discover_and_start_report().await;
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(
+        report
+            .manifests
+            .iter()
+            .map(|manifest| manifest.name.as_str())
+            .collect::<Vec<_>>(),
+        ["reports"]
+    );
+    assert_eq!(
+        status_of(&restarted, "reports")
+            .await
+            .map(|status| status.state),
+        Some(ServicePluginState::Disabled)
+    );
+    let (status, _) = through_proxy(&restarted, "reports", "/items", true).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    // Enabled, it is connected to at once: the approved build still runs.
+    grants
+        .set_disabled("reports", None)
+        .await
+        .expect("record the switch");
+    assert!(!restarted.enable_service("absent").await, "no such plugin");
+    assert!(restarted.enable_service("reports").await);
+    assert!(!restarted.is_disabled("reports").await);
+    let status = status_of(&restarted, "reports").await.expect("listed");
+    assert_eq!(status.state, ServicePluginState::Running);
+    assert_eq!(status.deployment_id, Some(deployment_id));
+    let (status, body) = through_proxy(&restarted, "reports", "/items", true).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "three items"));
+
+    // Enabling a plugin whose service is stopped for being idle does not
+    // start it: the next request does.
+    assert!(restarted.disable_service("reports").await);
+    platform.set_sleeping(binding, true).await;
+    plugin.stop();
+    assert!(restarted.enable_service("reports").await);
+    assert_eq!(
+        status_of(&restarted, "reports")
+            .await
+            .map(|status| status.state),
+        Some(ServicePluginState::Asleep)
+    );
+    assert_eq!(platform.waker.wakes.load(AtomicOrdering::SeqCst), 0);
 }

@@ -30,6 +30,8 @@ Use the numeric ids shown by `temps projects list` and `temps environments list`
 
 A plugin is pinned to the build you approved when you added it. When its service is redeployed, the new build does not run as the plugin: `temps plugin update my-plugin` shows what waits and what it asks for beyond the approved build, and `temps plugin approve-update my-plugin --deployment <id>` approves exactly that deployment. Nothing is applied on its own, and approving allows no new permissions. To keep the approved build, roll the service back to it.
 
+`temps plugin disable my-plugin` cuts a plugin off at once: Temps sends it no request and no event and takes no call from it, while its service, its permissions and its approved build are kept. `temps plugin enable my-plugin` connects it again. A plugin's container runs with the memory and CPU limits of its service; `temps plugin limits my-plugin` shows them. Every change a plugin makes through the API is recorded in the audit log with both the plugin and the user it acted for.
+
 Review declared host permissions in the plugin's **Permissions** dialog or with `temps plugin grants get my-plugin`. Use `temps plugin grants set` to approve specific permissions. A permission to change things reaches nothing until you name what may change, and it can be limited to some services: `temps plugin grants set my-plugin --grant api_write --write deployments --write-project 42`. For plugins serving MCP at `/mcp`, connect the client to `/api/x/my-plugin/mcp` with its own Temps credentials. The plugin receives the authenticated caller through the usual proxy.
 
 ## Develop and test a plugin locally

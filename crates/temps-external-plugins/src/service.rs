@@ -78,6 +78,17 @@ pub enum ExternalPluginsError {
     /// The approved build of a plugin could not be read or recorded.
     #[error(transparent)]
     Update(#[from] crate::updates::UpdateError),
+    /// The plugin is cut off for now, but the switch was not saved.
+    #[error("Plugin '{name}' is disconnected, but that could not be saved, so it connects again when Temps restarts: {source}")]
+    DisableNotRecorded {
+        name: String,
+        source: crate::grants::GrantError,
+    },
+    #[error("Plugin '{name}' could not be enabled, so it stays disabled: {source}")]
+    EnableNotRecorded {
+        name: String,
+        source: crate::grants::GrantError,
+    },
 }
 
 impl ExternalPluginsService {
@@ -528,7 +539,9 @@ impl ExternalPluginsService {
 }
 
 mod plugin_services;
-pub use plugin_services::{ApprovedUpdate, PendingUpdateView, ServicePluginView};
+pub use plugin_services::{
+    ApprovedUpdate, PendingUpdateView, PluginResourceLimits, ServicePluginView,
+};
 
 #[cfg(test)]
 mod tests {

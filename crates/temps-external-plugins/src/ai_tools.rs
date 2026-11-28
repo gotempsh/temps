@@ -442,6 +442,9 @@ mod tests {
             pending_manifest: None,
             pending_review: None,
             pending_since: None,
+            disabled: false,
+            disabled_at: None,
+            disabled_by: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -525,6 +528,9 @@ mod tests {
             pending_manifest: None,
             pending_review: None,
             pending_since: None,
+            disabled: false,
+            disabled_at: None,
+            disabled_by: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -558,6 +564,9 @@ mod tests {
             pending_manifest: None,
             pending_review: None,
             pending_since: None,
+            disabled: false,
+            disabled_at: None,
+            disabled_by: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

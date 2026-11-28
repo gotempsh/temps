@@ -27,9 +27,17 @@ export interface PendingPluginUpdate {
   difference: AccessDifference;
 }
 
+/** Memory and CPU limits; an absent value means that one is not capped. */
+export interface PluginResourceLimits {
+  deployment_id: number;
+  memory_limit_mb?: number | null;
+  /** 1,000,000 microcores are one core. */
+  cpu_limit_microcores?: number | null;
+}
+
 export interface ServicePlugin {
   name: string;
-  state: "running" | "asleep" | "update_waiting" | "unavailable";
+  state: "running" | "asleep" | "update_waiting" | "disabled" | "unavailable";
   detail?: string | null;
   project_id?: number | null;
   environment_id?: number | null;
@@ -46,6 +54,11 @@ export interface ServicePlugin {
   pinned_deployment_id?: number | null;
   /** A newer build that waits for approval and is never applied on its own. */
   pending_update?: PendingPluginUpdate | null;
+  /** When an administrator switched the plugin off, and their user id. */
+  disabled_at?: string | null;
+  disabled_by?: number | null;
+  /** The limits the plugin's container runs with: those of its service. */
+  resource_limits?: PluginResourceLimits | null;
 }
 
 /** A plugin an earlier version installed as an executable; it never runs. */
@@ -150,10 +163,12 @@ export function registerPluginServiceCommands(plugin: Command) {
       await requireAuth();
       await setupClient();
       try {
-        const result = await client.post<{ 200: RemovedPlugin }, unknown, true>({
-          url: `/x/plugins/${name}/uninstall`,
-          throwOnError: true,
-        });
+        const result = await client.post<{ 200: RemovedPlugin }, unknown, true>(
+          {
+            url: `/x/plugins/${name}/uninstall`,
+            throwOnError: true,
+          },
+        );
         console.log(result.data.message);
       } catch (error) {
         throw new PluginCommandError(getErrorMessage(error));

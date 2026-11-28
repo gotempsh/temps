@@ -55,7 +55,7 @@ use temps_plugin_protocol::channel::{
 use tower::ServiceExt;
 use tracing::{debug, warn};
 
-use crate::channel::HostApiBridge;
+use crate::channel::{DelegatedCall, HostApiBridge};
 
 /// Largest response body a plugin API call may return.
 ///
@@ -383,8 +383,9 @@ fn encode_multipart(parts: &[MultipartPart], boundary: &str) -> Vec<u8> {
 
 #[async_trait::async_trait]
 impl HostApiBridge for RouterHostApi {
-    async fn call(&self, plugin: &str, call: ApiCall) -> Result<ApiCallResult, ChannelError> {
+    async fn call(&self, plugin: &str, call: ApiCall) -> Result<DelegatedCall, ChannelError> {
         let auth = self.resolve_actor(plugin, &call).await?;
+        let acting_user_id = auth.user_id();
 
         let uri = match &call.query {
             Some(q) if !q.is_empty() => format!("/api{}?{}", call.path, q),
@@ -505,9 +506,12 @@ impl HostApiBridge for RouterHostApi {
             );
         }
 
-        Ok(ApiCallResult {
-            status,
-            body: JsonBody::from_raw(body),
+        Ok(DelegatedCall {
+            result: ApiCallResult {
+                status,
+                body: JsonBody::from_raw(body),
+            },
+            acting_user_id,
         })
     }
 }

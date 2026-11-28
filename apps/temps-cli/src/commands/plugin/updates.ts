@@ -74,7 +74,7 @@ export function updateLines(plugin: ServicePlugin): string[] {
 }
 
 /** The plugin `name` among the plugins that run as services. */
-async function servicePlugin(name: string): Promise<ServicePlugin> {
+export async function servicePlugin(name: string): Promise<ServicePlugin> {
   const result = await client.get<
     { 200: PluginServicesResponse },
     unknown,

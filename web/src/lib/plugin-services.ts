@@ -38,6 +38,14 @@ export function servicePluginSummary(plugin: ServicePluginResponse): {
           plugin.detail ??
           'The service runs a build that was not approved. The plugin stays disconnected until the update is approved.',
       }
+    case 'disabled':
+      return {
+        tone: 'idle',
+        label: 'Disabled',
+        detail:
+          plugin.detail ??
+          'An administrator disabled this plugin. Temps sends it nothing and takes no calls from it until it is enabled.',
+      }
     case 'unavailable':
       return {
         tone: 'error',
@@ -63,6 +71,43 @@ export function servicePluginStoragePath(
   return plugin.service_slug
     ? `/projects/${plugin.service_slug}/storage`
     : undefined
+}
+
+/** Where the limits of a plugin's service are changed. */
+export function servicePluginLimitsPath(
+  plugin: ServicePluginResponse
+): string | undefined {
+  return plugin.service_slug
+    ? `/projects/${plugin.service_slug}/environments`
+    : undefined
+}
+
+/**
+ * The memory and CPU a plugin's container is limited to, in words. `capped`
+ * is false when memory has no limit: such a plugin can use all the memory of
+ * the server.
+ */
+export function pluginLimitsSummary(
+  limits: NonNullable<ServicePluginResponse['resource_limits']>
+): { memory: string; cpu: string; capped: boolean } {
+  const megabytes = limits.memory_limit_mb
+  const microcores = limits.cpu_limit_microcores
+  // 1,000,000 microcores are one core; trailing zeros say nothing.
+  const cores =
+    microcores == null ? null : Number((microcores / 1_000_000).toFixed(2))
+  return {
+    memory:
+      megabytes == null
+        ? 'Memory not capped'
+        : megabytes >= 1024 && megabytes % 1024 === 0
+          ? `Memory ${megabytes / 1024} GB`
+          : `Memory ${megabytes} MB`,
+    cpu:
+      cores == null
+        ? 'CPU not capped'
+        : `CPU ${cores} ${cores === 1 ? 'core' : 'cores'}`,
+    capped: megabytes != null,
+  }
 }
 
 /** What a plugin's tier is called and what it means for what it can reach. */

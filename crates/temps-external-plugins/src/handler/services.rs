@@ -52,6 +52,40 @@ pub struct ServicePluginResponse {
     /// an administrator and is never applied on its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_update: Option<super::updates::PendingPluginUpdateResponse>,
+    /// Since when an administrator has the plugin switched off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The user who switched it off, while that user exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_by: Option<i32>,
+    /// The memory and CPU the plugin's container is limited to: the limits
+    /// of the deployment its service runs. Absent before it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_limits: Option<PluginResourceLimitsResponse>,
+}
+
+/// The limits a plugin's container runs with. They are the limits of its
+/// service, changed in the service's settings and applied by a deployment.
+#[derive(Debug, Serialize, ToSchema, PartialEq, Eq)]
+pub struct PluginResourceLimitsResponse {
+    /// The deployment these limits were applied to.
+    pub deployment_id: i32,
+    /// Megabytes of memory. Absent when memory is not capped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_limit_mb: Option<i32>,
+    /// Microcores of CPU: 1,000,000 is one core. Absent when not capped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_limit_microcores: Option<i32>,
+}
+
+impl From<crate::service::PluginResourceLimits> for PluginResourceLimitsResponse {
+    fn from(limits: crate::service::PluginResourceLimits) -> Self {
+        Self {
+            deployment_id: limits.deployment_id,
+            memory_limit_mb: limits.memory_limit_mb,
+            cpu_limit_microcores: limits.cpu_limit_microcores,
+        }
+    }
 }
 
 impl From<ServicePluginView> for ServicePluginResponse {
@@ -71,6 +105,9 @@ impl From<ServicePluginView> for ServicePluginResponse {
             own_storage: view.own_storage,
             pinned_deployment_id: view.pinned_deployment_id,
             pending_update: view.pending_update.map(Into::into),
+            disabled_at: view.disabled_at,
+            disabled_by: view.disabled_by,
+            resource_limits: view.resource_limits.map(Into::into),
         }
     }
 }
@@ -383,7 +420,13 @@ pub(super) mod tests {
         let schemas = &spec["components"]["schemas"];
         assert_eq!(
             schemas["ServicePluginState"]["enum"],
-            serde_json::json!(["running", "asleep", "update_waiting", "unavailable"])
+            serde_json::json!([
+                "running",
+                "asleep",
+                "update_waiting",
+                "disabled",
+                "unavailable"
+            ])
         );
         for schema in [
             "PluginServicesResponse",

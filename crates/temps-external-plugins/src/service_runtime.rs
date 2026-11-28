@@ -109,6 +109,8 @@ pub enum ServiceAttachError {
         service: String,
         deployment_id: i32,
     },
+    #[error("Plugin '{plugin}' was disabled by an administrator, so Temps is not connected to it. Enable it in Settings > Plugins to connect it again")]
+    Disabled { plugin: String },
     #[error("Plugin '{plugin}' did not accept the platform channel from this Temps instance")]
     ChannelRefused { plugin: String },
     #[error("A plugin named '{name}' is already installed from another source. Remove it before adding a service that declares the same plugin name")]

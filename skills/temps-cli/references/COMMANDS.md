@@ -24284,6 +24284,9 @@ Create TypeScript plugins, add a deployed service as a plugin and manage its per
 - `remove` - Remove a plugin and revoke its permissions; its service and the files it stored are kept
 - `update` - Show the build a plugin is pinned to and the update that waits for approval, with what it asks for
 - `approve-update` - Approve the update of a plugin that waits; an update is never applied without this, and it allows no new permissions
+- `disable` - Cut a plugin off from Temps at once: no requests, no events, no calls from it; its service, permissions and approved build are kept
+- `enable` - Let a disabled plugin connect again, with the permissions it had
+- `limits` - Show the memory and CPU a plugin's container is limited to: the limits of its service
 - `dev` - Run a plugin with a local simulated host, UI preview, and events (no Temps server)
 - `init` - Create a TypeScript plugin project
 - `build` - Build every platform selected in package.json; --all selects all six supported targets
@@ -24366,6 +24369,24 @@ Approve the update of a plugin that waits; an update is never applied without th
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--deployment <id>` | Id of the deployment you reviewed, as shown by temps plugin update | - | Yes |
+
+### `plugin disable`
+
+Cut a plugin off from Temps at once: no requests, no events, no calls from it; its service, permissions and approved build are kept
+
+**Usage:** `plugin disable <name>`
+
+### `plugin enable`
+
+Let a disabled plugin connect again, with the permissions it had
+
+**Usage:** `plugin enable <name>`
+
+### `plugin limits`
+
+Show the memory and CPU a plugin's container is limited to: the limits of its service
+
+**Usage:** `plugin limits <name>`
 
 ### `plugin dev`
 
