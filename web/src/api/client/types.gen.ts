@@ -794,6 +794,12 @@ export type AddProviderModelRequest = {
  */
 export type AddServicePlugin = {
     /**
+     * The deployment that was looked at. When given, the service is added
+     * only if this is the deployment it runs; another one is refused with
+     * 409 and nothing is added.
+     */
+    deployment_id?: number;
+    /**
      * The environment of that service whose deployment is the plugin.
      */
     environment_id: number;
@@ -113046,7 +113052,7 @@ export type AddServicePluginErrors = {
      */
     404: ProblemDetails;
     /**
-     * The service is stopped or not deployed, or its plugin name is already installed
+     * The service is stopped or not deployed, its plugin name is already installed, or it runs another deployment than the one named
      */
     409: ProblemDetails;
     /**

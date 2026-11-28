@@ -98,6 +98,12 @@ pub enum ServiceAttachError {
         expected: String,
         found: String,
     },
+    #[error("Service '{service}' now runs deployment {found}, not deployment {expected}, which is the one that was to be added. Nothing was added. Look at deployment {found} and add the service again")]
+    DeploymentChanged {
+        service: String,
+        expected: i32,
+        found: i32,
+    },
     #[error("Plugin '{plugin}' asks for {access}, which a community plugin is never given. Remove that request from its manifest; link a database to the service for the plugin's own data")]
     PrivilegedAccess {
         plugin: String,

@@ -53,6 +53,9 @@ pub(super) enum BuildApproval<'a> {
     /// An administrator approved the update with this review. A build or
     /// manifest that is not the one reviewed is held like any other.
     Approved(&'a str),
+    /// An administrator is adding the service as a plugin. When they name
+    /// the deployment they looked at, no other one is added in its place.
+    Adding(Option<i32>),
 }
 
 /// What a running service plugin is attached to.
@@ -203,6 +206,19 @@ impl ExternalPluginManager {
             .await
     }
 
+    /// Add the service `binding` names as a plugin. `deployment_id` is the
+    /// deployment the administrator looked at, when they named one: if the
+    /// service runs another by now, nothing is added.
+    pub async fn add_service(
+        &self,
+        binding: ServiceBinding,
+        deployment_id: Option<i32>,
+    ) -> Result<PluginManifest, ServiceAttachError> {
+        let _attaching = self.services.attach.lock().await;
+        self.attach_service_locked(binding, None, BuildApproval::Adding(deployment_id))
+            .await
+    }
+
     /// Attach to the update of `plugin_name` an administrator reviewed and
     /// approved. `review` names the build and manifest they saw; anything
     /// else the service runs by now is held for another review.
@@ -333,6 +349,15 @@ impl ExternalPluginManager {
             .clone()
             .ok_or(ServiceAttachError::Unavailable)?;
         let target = service_runtime::resolve_target(&self.db, &runtime.runtime, binding).await?;
+        if let BuildApproval::Adding(Some(expected)) = approval {
+            if target.deployment_id != expected {
+                return Err(ServiceAttachError::DeploymentChanged {
+                    service: target.service,
+                    expected,
+                    found: target.deployment_id,
+                });
+            }
+        }
         let token = runtime
             .tokens
             .deployment_token(binding.project_id, binding.environment_id)

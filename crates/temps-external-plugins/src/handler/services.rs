@@ -174,6 +174,12 @@ pub struct AddServicePlugin {
     pub project_id: i32,
     /// The environment of that service whose deployment is the plugin.
     pub environment_id: i32,
+    /// The deployment that was looked at. When given, the service is added
+    /// only if this is the deployment it runs; another one is refused with
+    /// 409 and nothing is added.
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub deployment_id: Option<i32>,
 }
 
 /// The plugin a service was added as.
@@ -280,7 +286,7 @@ pub(super) async fn get_plugin_services(
         (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
         (status = 404, description = "The service or environment does not exist", body = temps_core::ProblemDetails),
-        (status = 409, description = "The service is stopped or not deployed, or its plugin name is already installed", body = temps_core::ProblemDetails),
+        (status = 409, description = "The service is stopped or not deployed, its plugin name is already installed, or it runs another deployment than the one named", body = temps_core::ProblemDetails),
         (status = 415, description = "Request body is not JSON", body = temps_core::ProblemDetails),
         (status = 422, description = "Request body does not name a service and an environment", body = temps_core::ProblemDetails),
         (status = 428, description = "Recent sensitive-action verification required", body = temps_core::ProblemDetails),
@@ -336,7 +342,11 @@ pub(super) async fn add_service_plugin(
         &audit("EXTERNAL_PLUGIN_SERVICE_ADD_REQUESTED", None, None),
     )
     .await?;
-    let manifest = match state.service.add_service_plugin(binding).await {
+    let manifest = match state
+        .service
+        .add_service_plugin(binding, request.deployment_id)
+        .await
+    {
         Ok(manifest) => manifest,
         Err(error) => {
             record_audit(
@@ -386,6 +396,7 @@ pub(super) mod tests {
         Ok(Json(AddServicePlugin {
             project_id: binding.project_id,
             environment_id: binding.environment_id,
+            deployment_id: None,
         }))
     }
 
@@ -945,6 +956,64 @@ pub(super) mod tests {
         .expect("the permission screen");
         assert_eq!(closed.outbound_network.profile, "none");
         assert!(closed.outbound_network.detail.contains("cannot connect"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_is_added_only_at_the_deployment_that_was_named() {
+        let Some(platform) = platform("adding a service at a named deployment").await else {
+            return;
+        };
+        let first = serve_plugin("reports", TOKEN);
+        let binding = platform.service("reports-service").await;
+        let watched = platform.deploy(binding, first.port).await;
+        // Another deployment becomes current before the service is added.
+        let second = serve_plugin("reports", TOKEN);
+        let current = platform.deploy(binding, second.port).await;
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = state_on(&platform, audit.clone()).await;
+        let naming = |deployment_id| {
+            Ok(Json(AddServicePlugin {
+                project_id: binding.project_id,
+                environment_id: binding.environment_id,
+                deployment_id: Some(deployment_id),
+            }))
+        };
+
+        let error = add_service_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state.clone()),
+            metadata(),
+            naming(watched),
+        )
+        .await
+        .expect_err("the service runs another deployment");
+        assert_eq!(error.status_code, StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(error.into_response().into_body(), 1 << 20)
+            .await
+            .expect("body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem json");
+        assert_eq!(problem["title"], "Service Runs Another Deployment");
+        assert!(
+            problem["detail"].as_str().is_some_and(|detail| detail
+                .contains(&format!("deployment {current}, not deployment {watched}"))),
+            "{problem}"
+        );
+        let Json(listed) =
+            get_plugin_services(user_auth(Role::PlatformAdmin), State(state.clone()))
+                .await
+                .expect("list");
+        assert!(listed.plugins.is_empty(), "nothing was added");
+
+        let (status, Json(added)) = add_service_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state.clone()),
+            metadata(),
+            naming(current),
+        )
+        .await
+        .expect("the deployment that runs is added");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(added.name, "reports");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

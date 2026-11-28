@@ -134,15 +134,18 @@ impl ExternalPluginsService {
     /// container, read its manifest and route requests to it.
     ///
     /// The plugin starts with no grants. Nothing about the service changes.
+    /// `deployment_id` names the deployment the caller looked at; when the
+    /// service runs another by now, nothing is added.
     pub async fn add_service_plugin(
         &self,
         binding: ServiceBinding,
+        deployment_id: Option<i32>,
     ) -> Result<PluginManifest, ExternalPluginsError> {
         let _lifecycle = self.lifecycle.lock().await;
         if self.closing.load(Ordering::Acquire) {
             return Err(ExternalPluginsError::ShuttingDown);
         }
-        let manifest = self.manager.attach_service(binding, None).await?;
+        let manifest = self.manager.add_service(binding, deployment_id).await?;
         info!(
             plugin = %manifest.name,
             project_id = binding.project_id,

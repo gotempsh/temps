@@ -230,7 +230,12 @@ test("an image becomes a new service, is deployed like any image and is added as
       image_ref: IMAGE,
       health_check_path: "/health",
     });
-    expect(added?.body).toEqual({ project_id: 7, environment_id: 9 });
+    // The deployment that was watched is the one that is added.
+    expect(added?.body).toEqual({
+      project_id: 7,
+      environment_id: 9,
+      deployment_id: 42,
+    });
     expect(api.watched).toEqual([42]);
     const printed = api.printed();
     expect(printed).toContain("Created the service reports.");
@@ -277,7 +282,7 @@ test("an image deployed to a service that is a plugin is an update that waits", 
     expect(printed).toContain("Deployment 42");
     expect(printed).toContain("waits for approval");
     expect(printed).toContain(
-      "temps plugin approve-update reports --deployment 42",
+      "temps plugin approve-update reports --deployment 42 --review review-42",
     );
   } finally {
     api.restore();

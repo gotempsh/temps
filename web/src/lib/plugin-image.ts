@@ -255,7 +255,13 @@ export async function addPluginFromImage(
   report('add')
   const added = (
     await addServicePlugin({
-      body: { project_id: projectId, environment_id: environmentId },
+      // The deployment that was waited for: if another one became current
+      // meanwhile, the server adds nothing instead of pinning that one.
+      body: {
+        project_id: projectId,
+        environment_id: environmentId,
+        deployment_id: deploymentId,
+      },
       throwOnError: true,
     })
   ).data

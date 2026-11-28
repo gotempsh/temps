@@ -110,7 +110,7 @@ test("a waiting update that asks for nothing more is still called new code", () 
   );
   expect(lines).toContain("asks for no new access");
   expect(lines).toContain(
-    "temps plugin approve-update reports --deployment 42",
+    "temps plugin approve-update reports --deployment 42 --review review-42",
   );
   expect(lines).toContain("roll the service back");
 });
@@ -201,7 +201,14 @@ test("approving sends the review of the deployment that was named, and says what
   const api = server([waiting({ added_permissions: ["api_write"] })]);
   try {
     await commands().parseAsync(
-      ["approve-update", "reports", "--deployment", "42"],
+      [
+        "approve-update",
+        "reports",
+        "--deployment",
+        "42",
+        "--review",
+        "review-42",
+      ],
       { from: "user" },
     );
     expect(api.requests.map(({ method, url }) => [method, url])).toEqual([
@@ -221,25 +228,53 @@ test("nothing is approved when another deployment waits, none waits, or the plug
   try {
     await expect(
       commands().parseAsync(
-        ["approve-update", "reports", "--deployment", "40"],
+        [
+          "approve-update",
+          "reports",
+          "--deployment",
+          "40",
+          "--review",
+          "review-42",
+        ],
         { from: "user" },
       ),
     ).rejects.toThrow(/that waits is deployment 42, not 40/);
     await expect(
       commands().parseAsync(
-        ["approve-update", "audit-export", "--deployment", "42"],
+        [
+          "approve-update",
+          "audit-export",
+          "--deployment",
+          "42",
+          "--review",
+          "review-42",
+        ],
         { from: "user" },
       ),
     ).rejects.toThrow(/No update of plugin audit-export waits/);
     await expect(
       commands().parseAsync(
-        ["approve-update", "absent", "--deployment", "42"],
+        [
+          "approve-update",
+          "absent",
+          "--deployment",
+          "42",
+          "--review",
+          "review-42",
+        ],
         { from: "user" },
       ),
     ).rejects.toThrow(/No plugin named absent/);
     await expect(
       commands().parseAsync(
-        ["approve-update", "reports", "--deployment", "latest"],
+        [
+          "approve-update",
+          "reports",
+          "--deployment",
+          "latest",
+          "--review",
+          "review-42",
+        ],
         { from: "user" },
       ),
     ).rejects.toThrow(/deployment you reviewed/);
@@ -248,11 +283,40 @@ test("nothing is approved when another deployment waits, none waits, or the plug
     const before = api.requests.length;
     await expect(
       commands().parseAsync(
-        ["approve-update", "../reload", "--deployment", "42"],
+        [
+          "approve-update",
+          "../reload",
+          "--deployment",
+          "42",
+          "--review",
+          "review-42",
+        ],
         { from: "user" },
       ),
     ).rejects.toThrow(/plugin name/);
     expect(api.requests).toHaveLength(before);
+  } finally {
+    api.restore();
+  }
+});
+
+test("an update that is no longer the one that was shown is not approved", async () => {
+  const api = server([waiting()]);
+  try {
+    await expect(
+      commands().parseAsync(
+        [
+          "approve-update",
+          "reports",
+          "--deployment",
+          "42",
+          "--review",
+          "review-of-an-earlier-manifest",
+        ],
+        { from: "user" },
+      ),
+    ).rejects.toThrow(/no longer the one you reviewed/);
+    expect(api.requests.every(({ method }) => method === "GET")).toBe(true);
   } finally {
     api.restore();
   }
@@ -273,7 +337,14 @@ test("a refused approval reports the server's reason", async () => {
   try {
     await expect(
       commands().parseAsync(
-        ["approve-update", "reports", "--deployment", "42"],
+        [
+          "approve-update",
+          "reports",
+          "--deployment",
+          "42",
+          "--review",
+          "review-42",
+        ],
         { from: "user" },
       ),
     ).rejects.toThrow(/now deployment 43/);

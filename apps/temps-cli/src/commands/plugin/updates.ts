@@ -85,7 +85,7 @@ export function updateLines(plugin: ServicePlugin): string[] {
       `No longer asks for: ${difference.removed_permissions.join(", ")}`,
     );
   lines.push(
-    `Approve: temps plugin approve-update ${plugin.name} --deployment ${update.deployment_id}`,
+    `Approve: temps plugin approve-update ${plugin.name} --deployment ${update.deployment_id} --review ${update.review}`,
     "Or roll the service back to the approved deployment to keep that build.",
   );
   return lines;
@@ -150,43 +150,63 @@ export function registerPluginUpdateCommands(plugin: Command) {
       "--deployment <id>",
       "Id of the deployment you reviewed, as shown by temps plugin update",
     )
-    .action(async (name: string, options: { deployment?: string }) => {
-      pluginName(name);
-      const deployment = reviewedDeployment(options.deployment);
-      await requireAuth();
-      await setupClient();
-      try {
-        const found = await servicePlugin(name);
-        const update = found.pending_update;
-        if (!update)
+    .requiredOption(
+      "--review <review>",
+      "The review you were shown by temps plugin update: it names the build and what it asks for",
+    )
+    .action(
+      async (
+        name: string,
+        options: { deployment?: string; review?: string },
+      ) => {
+        pluginName(name);
+        const deployment = reviewedDeployment(options.deployment);
+        const review = options.review?.trim();
+        if (!review)
           throw new PluginCommandError(
-            `No update of plugin ${name} waits for approval: it runs the build that was approved.`,
+            'Enter the review you were shown, as printed by "temps plugin update <name>".',
           );
-        // The build that waits may have changed since it was reviewed.
-        if (update.deployment_id !== deployment)
-          throw new PluginCommandError(
-            `The update of plugin ${name} that waits is deployment ${update.deployment_id}, not ${deployment}. Review it with temps plugin update ${name} before approving.`,
-          );
-        const result = await client.post<
-          { 200: ApprovedPluginUpdate },
-          unknown,
-          true
-        >({
-          url: `/x/plugins/${name}/update/approve`,
-          headers: { "Content-Type": "application/json" },
-          body: { review: update.review },
-          throwOnError: true,
-        });
-        console.log(
-          `Plugin ${result.data.name} now runs deployment ${result.data.deployment_id} (version ${result.data.version}).`,
-        );
-        if (result.data.difference.added_permissions.length > 0)
+        await requireAuth();
+        await setupClient();
+        try {
+          const found = await servicePlugin(name);
+          const update = found.pending_update;
+          if (!update)
+            throw new PluginCommandError(
+              `No update of plugin ${name} waits for approval: it runs the build that was approved.`,
+            );
+          // The build that waits may have changed since it was reviewed.
+          if (update.deployment_id !== deployment)
+            throw new PluginCommandError(
+              `The update of plugin ${name} that waits is deployment ${update.deployment_id}, not ${deployment}. Review it with temps plugin update ${name} before approving.`,
+            );
+          // The same deployment may answer another manifest by now. Only what
+          // was shown is approved, never whatever waits at this moment.
+          if (update.review !== review)
+            throw new PluginCommandError(
+              `The update of plugin ${name} that waits is no longer the one you reviewed: what it asks for changed. Review it with temps plugin update ${name} before approving.`,
+            );
+          const result = await client.post<
+            { 200: ApprovedPluginUpdate },
+            unknown,
+            true
+          >({
+            url: `/x/plugins/${name}/update/approve`,
+            headers: { "Content-Type": "application/json" },
+            body: { review },
+            throwOnError: true,
+          });
           console.log(
-            `It asks for new permissions that are still off: ${result.data.difference.added_permissions.join(", ")}. Grant them with temps plugin grants set ${result.data.name}.`,
+            `Plugin ${result.data.name} now runs deployment ${result.data.deployment_id} (version ${result.data.version}).`,
           );
-      } catch (error) {
-        if (error instanceof PluginCommandError) throw error;
-        throw new PluginCommandError(getErrorMessage(error));
-      }
-    });
+          if (result.data.difference.added_permissions.length > 0)
+            console.log(
+              `It asks for new permissions that are still off: ${result.data.difference.added_permissions.join(", ")}. Grant them with temps plugin grants set ${result.data.name}.`,
+            );
+        } catch (error) {
+          if (error instanceof PluginCommandError) throw error;
+          throw new PluginCommandError(getErrorMessage(error));
+        }
+      },
+    );
 }

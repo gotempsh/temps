@@ -374,7 +374,13 @@ async function addFromImage(options: PluginImageOptions) {
       >({
         url: "/x/plugins/services",
         headers: { "Content-Type": "application/json" },
-        body: { project_id: found.id, environment_id: environment.id },
+        // The deployment that was watched: if another one became current
+        // meanwhile, the server adds nothing instead of pinning that one.
+        body: {
+          project_id: found.id,
+          environment_id: environment.id,
+          deployment_id: deployment.id,
+        },
         throwOnError: true,
       });
       console.log(

@@ -648,6 +648,9 @@ fn service_attach_status(
             (StatusCode::CONFLICT, "Service Has No Running Container")
         }
         Attach::NameChanged { .. } => (StatusCode::CONFLICT, "Plugin Name Changed"),
+        Attach::DeploymentChanged { .. } => {
+            (StatusCode::CONFLICT, "Service Runs Another Deployment")
+        }
         Attach::Disabled { .. } => (StatusCode::CONFLICT, "Plugin Is Disabled"),
         Attach::UpdateWaiting { .. } => (StatusCode::CONFLICT, "Plugin Update Waits For Approval"),
         Attach::NameTaken { .. } => (StatusCode::CONFLICT, "Plugin Name Already Installed"),

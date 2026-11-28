@@ -24457,6 +24457,7 @@ Approve the update of a plugin that waits; an update is never applied without th
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--deployment <id>` | Id of the deployment you reviewed, as shown by temps plugin update | - | Yes |
+| `--review <review>` | The review you were shown by temps plugin update: it names the build and what it asks for | - | Yes |
 
 ### `plugin disable`
 

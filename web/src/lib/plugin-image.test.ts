@@ -169,7 +169,12 @@ test('an image becomes a service, is deployed, waited for and added, in that ord
     health_check_path: '/health',
   })
   // The production environment, wherever it is listed.
-  expect(server.bodies.add).toEqual({ project_id: 7, environment_id: 9 })
+  // The deployment that was waited for is the one that is added.
+  expect(server.bodies.add).toEqual({
+    project_id: 7,
+    environment_id: 9,
+    deployment_id: 42,
+  })
 })
 
 test('an image is never deployed over a service that only shares its name', async () => {
