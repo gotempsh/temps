@@ -27,6 +27,8 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+# Replays a request body the NUL check read past its buffering limit (`json_body_guard`).
+futures-util = { workspace = true }
 axum = { workspace = true }
 utoipa = { workspace = true }
 tower-http = { workspace = true }
