@@ -214,11 +214,40 @@ where
 /// Result type where the error is always a `Problem`.
 pub type Result<T> = std::result::Result<T, Problem>;
 
+/// `type` of a problem that names none. RFC 7807 §4.2: `about:blank` says
+/// the problem has no semantics beyond its HTTP status.
+pub const ABOUT_BLANK_PROBLEM_TYPE: &str = "about:blank";
+
+/// Give a problem body the members RFC 7807 expects to be meaningful when
+/// present. `type` is a URI reference, so a missing or empty one becomes
+/// `about:blank` (the RFC's default) instead of `""`, which a client cannot
+/// dereference or match on. An empty `instance` says nothing and is left out.
+fn normalize_problem_body(body: &mut BTreeMap<String, Value>) {
+    let has_type = body
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+    if !has_type {
+        body.insert(
+            "type".to_string(),
+            Value::String(ABOUT_BLANK_PROBLEM_TYPE.to_string()),
+        );
+    }
+    if body
+        .get("instance")
+        .and_then(Value::as_str)
+        .is_some_and(str::is_empty)
+    {
+        body.remove("instance");
+    }
+}
+
 impl IntoResponse for Problem {
-    fn into_response(self) -> axum::response::Response {
+    fn into_response(mut self) -> axum::response::Response {
         let mut response = if self.body.is_empty() {
             self.status_code.into_response()
         } else {
+            normalize_problem_body(&mut self.body);
             let body = Json(self.body);
             let mut response = (self.status_code, body).into_response();
 
@@ -246,6 +275,43 @@ impl IntoResponse for Problem {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+
+    async fn body_of(problem: Problem) -> serde_json::Value {
+        let response = problem.into_response();
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_problem_without_a_type_is_about_blank_never_an_empty_string() {
+        let untyped = body_of(new(StatusCode::NOT_FOUND).with_title("Not Found")).await;
+        assert_eq!(untyped["type"], ABOUT_BLANK_PROBLEM_TYPE);
+
+        // What `ErrorBuilder::build` produced for a builder that set no type
+        // or instance: `"type": ""` and `"instance": ""`.
+        let empty = body_of(
+            crate::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .title("Provider not found")
+                .detail("Notification provider 9 not found")
+                .build(),
+        )
+        .await;
+        assert_eq!(empty["type"], ABOUT_BLANK_PROBLEM_TYPE);
+        assert!(empty.get("instance").is_none(), "{empty}");
+        assert_eq!(empty["detail"], "Notification provider 9 not found");
+    }
+
+    #[tokio::test]
+    async fn a_problem_type_and_instance_that_were_set_are_kept() {
+        let typed = body_of(
+            new(StatusCode::CONFLICT)
+                .with_type("https://temps.sh/probs/conflict")
+                .with_instance("/projects/7"),
+        )
+        .await;
+        assert_eq!(typed["type"], "https://temps.sh/probs/conflict");
+        assert_eq!(typed["instance"], "/projects/7");
+    }
 
     #[test]
     fn problem_schema_and_serialization_flatten_extension_members() {
